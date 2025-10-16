@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import bz2
-import json
+import io
+import os
 import logging
 import shutil
 import sys
 import subprocess
 import tarfile
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
@@ -25,9 +26,13 @@ except Exception:  # pragma: no cover
     def tqdm(iterable, **kwargs):  # type: ignore
         return iterable
 
-
 logger = logging.getLogger(__name__)
 
+try:  # Prefer orjson if available
+    import orjson as _json  # type: ignore
+except Exception:  # pragma: no cover
+    logger.warning("orjson not found, using json instead")
+    import json as _json  # type: ignore
 
 def _default_paths() -> tuple[Path, Path]:
     base = settings.BASE_DIR.parent
@@ -170,11 +175,20 @@ def find_bz2_files(root: Path) -> List[Path]:
 
 
 def iter_jsonl_bz2(file_path: Path) -> Iterator[dict]:
-    with bz2.open(file_path, mode="rt", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            yield json.loads(line)
+    # Wrap BZ2 in a buffered reader to increase throughput
+    with bz2.open(file_path, mode="rb") as raw:
+        with io.BufferedReader(raw, buffer_size=1024 * 1024) as buf:  # 1MB buffer
+            for line in buf:
+                if not line.strip():
+                    continue
+                try:
+                    yield _json.loads(line)
+                except Exception:
+                    # If orjson in binary mode returns bytes, try decode fallback
+                    try:
+                        yield _json.loads(line.decode("utf-8"))
+                    except Exception:
+                        continue
 
 
 class Command(BaseCommand):
@@ -184,7 +198,8 @@ class Command(BaseCommand):
         default_archive, default_processed = _default_paths()
         parser.add_argument("--archive", default=str(default_archive))
         parser.add_argument("--processed-dir", default=str(default_processed))
-        parser.add_argument("--batch-size", type=int, default=1000)
+        parser.add_argument("--batch-size", type=int, default=5000)
+        parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
         parser.add_argument("--limit", type=int)
         parser.add_argument("--force-decompress", action="store_true")
         parser.add_argument("--skip-decompress", action="store_true")
@@ -203,6 +218,7 @@ class Command(BaseCommand):
         force_decompress = bool(opts["force_decompress"])
         skip_decompress = bool(opts["skip_decompress"])
         fast_extract = not bool(opts["no_fast_extract"])  # default to fast extract
+        workers: int = max(1, int(opts["workers"]))
 
         if not skip_decompress:
             processed_dir = ensure_decompressed(archive, processed_dir, force=force_decompress, prefer_fast=fast_extract)
@@ -218,57 +234,9 @@ class Command(BaseCommand):
         if not bz2_files:
             raise CommandError(f"No wiki_*.bz2 files found under {processed_dir}")
 
-        logger.info("Found %d compressed shards", len(bz2_files))
+        logger.info("Found %d compressed shards; using %d workers", len(bz2_files), workers)
 
-        created_total = 0
-        processed_records = 0
-
-        for shard in tqdm(
-            bz2_files,
-            desc="Shards",
-            unit="file",
-            total=len(bz2_files),
-            leave=True,
-            dynamic_ncols=True,
-            ascii=True,
-            mininterval=0.5,
-            file=sys.stdout,
-        ):
-            logger.info("Processing shard: %s", shard)
-            batch: List[Article] = []
-            for rec in tqdm(
-                iter_jsonl_bz2(shard),
-                desc=f"Records {shard.name}",
-                unit="rec",
-                leave=False,
-                dynamic_ncols=True,
-                ascii=True,
-                mininterval=0.5,
-                file=sys.stdout,
-            ):
-                page_id_raw = rec.get("id")
-                title = rec.get("title")
-                text = rec.get("text") or []
-                try:
-                    page_id_int = int(page_id_raw)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Skip record with invalid id=%r: %s", page_id_raw, exc)
-                    continue
-
-                paragraphs = extract_plain_paragraphs(text)
-                batch.append(Article(page_id=page_id_int, title=title, plain_text_paragraphs=paragraphs))
-
-                processed_records += 1
-                if limit and processed_records >= limit:
-                    created_total += self._flush_batch(batch, batch_size)
-                    logger.info("Reached limit=%d. Stopping.", limit)
-                    self.stdout.write(self.style.SUCCESS(f"Created ~{created_total} articles"))
-                    return
-
-                if len(batch) >= batch_size:
-                    created_total += self._flush_batch(batch, batch_size)
-
-            created_total += self._flush_batch(batch, batch_size)
+        created_total = self._run_pipeline(bz2_files, batch_size, limit, workers)
 
         self.stdout.write(self.style.SUCCESS(f"Created ~{created_total} articles"))
 
@@ -280,5 +248,89 @@ class Command(BaseCommand):
         created = len(batch)
         batch.clear()
         return created
+
+    def _run_pipeline(self, shards: List[Path], batch_size: int, limit: Optional[int], workers: int) -> int:
+        """Run a multi-process pipeline: parser workers -> single writer.
+
+        Workers parse shards and emit tuples (page_id:int, title:str, paragraphs:List[str]).
+        The writer constructs Article instances and bulk inserts.
+        """
+        from multiprocessing import Process, Queue
+
+        shard_q: Queue = Queue()
+        out_q: Queue = Queue(maxsize=10000)
+
+        def put_shards() -> None:
+            for s in shards:
+                shard_q.put(s)
+            for _ in range(workers):
+                shard_q.put(None)
+
+        def worker_loop() -> None:
+            while True:
+                shard = shard_q.get()
+                if shard is None:
+                    break
+                for rec in iter_jsonl_bz2(shard):
+                    page_id_raw = rec.get("id")
+                    title = rec.get("title")
+                    text = rec.get("text") or []
+                    try:
+                        page_id_int = int(page_id_raw)
+                    except Exception:
+                        continue
+                    paragraphs = extract_plain_paragraphs(text)
+                    out_q.put((page_id_int, title, paragraphs))
+
+        # Start shard feeder
+        feeder = Process(target=put_shards)
+        feeder.start()
+
+        # Start workers
+        procs = [Process(target=worker_loop) for _ in range(workers)]
+        for p in procs:
+            p.daemon = True
+            p.start()
+
+        # Writer loop in main process (owns Django ORM)
+        created_total = 0
+        batch: List[Article] = []
+        processed_records = 0
+        alive = workers
+        while True:
+            if limit and processed_records >= limit:
+                break
+            try:
+                item = out_q.get(timeout=0.5)
+            except Exception:
+                # Check if workers are done
+                alive = sum(1 for p in procs if p.is_alive())
+                if alive == 0 and out_q.empty():
+                    break
+                continue
+            page_id_int, title, paragraphs = item
+            batch.append(Article(page_id=page_id_int, title=title, plain_text_paragraphs=paragraphs))
+            processed_records += 1
+            if len(batch) >= batch_size or (limit and processed_records >= limit):
+                created_total += self._flush_batch(batch, batch_size)
+
+        # Final flush
+        created_total += self._flush_batch(batch, batch_size)
+
+        # If we exited due to limit, stop workers quickly
+        if limit and processed_records >= limit:
+            try:
+                for p in procs:
+                    if p.is_alive():
+                        p.terminate()
+                if feeder.is_alive():
+                    feeder.terminate()
+            except Exception:
+                pass
+        for p in procs:
+            p.join(timeout=5)
+        feeder.join(timeout=5)
+
+        return created_total
 
 

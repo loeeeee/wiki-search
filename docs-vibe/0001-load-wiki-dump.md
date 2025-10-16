@@ -17,10 +17,18 @@ Options:
 
 - `--archive PATH` override archive
 - `--processed-dir PATH` override processed root
-- `--batch-size N` default 1000
+- `--batch-size N` default 5000
+- `--workers N` number of parser workers (default: CPU-1)
 - `--limit N` stop after N records
 - `--force-decompress` re-extract even if folder exists
 - `--skip-decompress` skip extraction step
+- `--no-fast-extract` disable system tar fast extractor
+
+### Performance
+
+- Install optional deps for speed: `uv pip install .[perf]` (adds orjson, lxml)
+- Default batch size is 5000; tune via `--batch-size`
+- Fast extractor is default; ensure `lbzip2` or `pbzip2` is installed
 
 ## Database summary
 
