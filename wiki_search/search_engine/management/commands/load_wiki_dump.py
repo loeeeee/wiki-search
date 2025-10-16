@@ -59,10 +59,43 @@ def _fast_extract_with_system_tar(archive: Path, target_dir: Path) -> bool:
     return False
 
 
-def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False, prefer_fast: bool = False) -> None:
+def _detect_top_dir_name(archive: Path) -> Optional[str]:
+    """Best-effort: read a few headers to infer the top-level directory name."""
+    try:
+        with tarfile.open(archive, mode="r:bz2") as tf:
+            for _ in range(32):  # read up to 32 members to find a name
+                member = tf.next()
+                if member is None:
+                    break
+                if member.name:
+                    return member.name.split("/")[0]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to detect top dir name: %s", exc)
+    return None
+
+
+def _choose_extracted_dir(target_dir: Path, archive: Path) -> Path:
+    """Resolve the actual extracted directory, falling back to heuristics."""
+    if target_dir.exists():
+        return target_dir
+    # Try by reading top dir name from archive
+    name = _detect_top_dir_name(archive)
+    if name:
+        candidate = target_dir.parent / name
+        if candidate.exists():
+            return candidate
+    # Fallback: pick the only directory matching prefix
+    prefix = "enwiki-20171001-pages-meta-current-withlinks"
+    for child in target_dir.parent.iterdir():
+        if child.is_dir() and child.name.startswith(prefix):
+            return child
+    return target_dir
+
+
+def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False, prefer_fast: bool = False) -> Path:
     if target_dir.exists() and not force:
         logger.info("Processed directory exists: %s", target_dir)
-        return
+        return target_dir
     if not archive.exists():
         raise CommandError(f"Archive not found: {archive}")
 
@@ -73,9 +106,10 @@ def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False, pr
     if prefer_fast:
         used_fast = _fast_extract_with_system_tar(archive, target_dir)
         if used_fast:
-            if not target_dir.exists():
-                logger.warning("Expected processed directory not found after fast extraction: %s", target_dir)
-            return
+            resolved = _choose_extracted_dir(target_dir, archive)
+            if not resolved.exists():
+                logger.warning("Expected processed directory not found after fast extraction: %s", resolved)
+            return resolved
 
     with tarfile.open(archive, mode="r:bz2") as tf:
         # Basic disk space check: require at least 2x archive size free
@@ -110,14 +144,23 @@ def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False, pr
             extracted_any = True
         if not extracted_any:
             logger.warning("No members extracted from archive: %s", archive)
-        if not target_dir.exists():
-            logger.warning("Expected processed directory not found after extraction: %s", target_dir)
+        resolved = _choose_extracted_dir(target_dir, archive)
+        if not resolved.exists():
+            logger.warning("Expected processed directory not found after extraction: %s", resolved)
+        return resolved
 
 
 def find_bz2_files(root: Path) -> List[Path]:
     results: List[Path] = []
     if not root.exists():
         return results
+    # If the expected root doesn't contain shards, try a common alternative
+    # folder name ending with "-processed" (as seen in some dumps)
+    if not any(root.glob("*/wiki_*.bz2")):
+        alt = root.parent / f"{root.name}-processed"
+        if alt.exists():
+            root = alt
+    
     for sub in sorted(root.iterdir()):
         if not sub.is_dir():
             continue
@@ -162,8 +205,14 @@ class Command(BaseCommand):
         fast_extract = not bool(opts["no_fast_extract"])  # default to fast extract
 
         if not skip_decompress:
-            ensure_decompressed(archive, processed_dir, force=force_decompress, prefer_fast=fast_extract)
+            processed_dir = ensure_decompressed(archive, processed_dir, force=force_decompress, prefer_fast=fast_extract)
             logger.info("Decompressed archive: %s", archive)
+        else:
+            # When skipping decompression, still try to resolve the actual
+            # extracted directory location by checking for an "-processed" suffix
+            alt = processed_dir.parent / f"{processed_dir.name}-processed"
+            if alt.exists():
+                processed_dir = alt
 
         bz2_files = find_bz2_files(processed_dir)
         if not bz2_files:

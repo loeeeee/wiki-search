@@ -22,4 +22,12 @@ Options:
 - `--force-decompress` re-extract even if folder exists
 - `--skip-decompress` skip extraction step
 
+## Database summary
+
+To summarize current DB contents:
+
+```bash
+python wiki_search/manage.py db_summary
+```
+
 
