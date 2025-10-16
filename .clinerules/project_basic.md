@@ -8,5 +8,4 @@ All the wikipedia information should be from the HotpotQA project. [HotPot QA Wi
 
 The wikipedia is a 2017 dump with non-standard structure.
 
-## Wikipedia format
-
+The project should start with SQLite database, located in data/db.sqlite3
