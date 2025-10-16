@@ -20,10 +20,10 @@ The raw data is a 2017 wikipedia dump with non-standard structure.
 
 The raw data is a compressed file named "enwiki-20171001-pages-meta-current-withlinks-processed.tar.bz2"
 
-When decompressed, it has the following file structure.
+When decompressed, it has the following file structure. The decompressed folder should be put into data/processed/
 
 ```tree
-enwiki-20171001-pages-meta-current-withlinks-processed/
+enwiki-20171001-pages-meta-current-withlinks/
 ├── AA
 │   ├── wiki_00.bz2
 │   ├── wiki_01.bz2
