@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import sys
+import subprocess
 import tarfile
 from pathlib import Path
 from typing import Iterator, List, Optional
@@ -35,7 +36,30 @@ def _default_paths() -> tuple[Path, Path]:
     return archive, processed
 
 
-def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False) -> None:
+def _fast_extract_with_system_tar(archive: Path, target_dir: Path) -> bool:
+    """Try to extract using system tar with parallel bzip2 (lbzip2/pbzip2).
+
+    Returns True if extraction was performed, False if not available.
+    """
+    tar_path = shutil.which("tar")
+    if not tar_path:
+        return False
+    # Prefer lbzip2, then pbzip2
+    for prog in ("lbzip2", "pbzip2"):
+        if shutil.which(prog):
+            try:
+                target_dir.parent.mkdir(parents=True, exist_ok=True)
+                cmd = [tar_path, "-I", prog, "-xf", str(archive), "-C", str(target_dir.parent)]
+                logger.info("Using fast extractor: %s", " ".join(cmd))
+                subprocess.run(cmd, check=True)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Fast extraction failed with %s: %s. Falling back.", prog, exc)
+                return False
+    return False
+
+
+def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False, prefer_fast: bool = False) -> None:
     if target_dir.exists() and not force:
         logger.info("Processed directory exists: %s", target_dir)
         return
@@ -44,6 +68,14 @@ def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False) ->
 
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Decompressing %s -> %s", archive, target_dir.parent)
+
+    # Attempt fast multi-core extraction via system tar if requested/available
+    if prefer_fast:
+        used_fast = _fast_extract_with_system_tar(archive, target_dir)
+        if used_fast:
+            if not target_dir.exists():
+                logger.warning("Expected processed directory not found after fast extraction: %s", target_dir)
+            return
 
     with tarfile.open(archive, mode="r:bz2") as tf:
         # Basic disk space check: require at least 2x archive size free
@@ -113,6 +145,11 @@ class Command(BaseCommand):
         parser.add_argument("--limit", type=int)
         parser.add_argument("--force-decompress", action="store_true")
         parser.add_argument("--skip-decompress", action="store_true")
+        parser.add_argument(
+            "--no-fast-extract",
+            action="store_true",
+            help="Disable fast extractor; use Python tarfile streaming",
+        )
 
     def handle(self, *args, **opts):
         logging.basicConfig(level=logging.INFO)
@@ -122,9 +159,10 @@ class Command(BaseCommand):
         limit: Optional[int] = opts.get("limit")
         force_decompress = bool(opts["force_decompress"])
         skip_decompress = bool(opts["skip_decompress"])
+        fast_extract = not bool(opts["no_fast_extract"])  # default to fast extract
 
         if not skip_decompress:
-            ensure_decompressed(archive, processed_dir, force=force_decompress)
+            ensure_decompressed(archive, processed_dir, force=force_decompress, prefer_fast=fast_extract)
             logger.info("Decompressed archive: %s", archive)
 
         bz2_files = find_bz2_files(processed_dir)
