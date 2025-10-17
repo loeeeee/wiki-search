@@ -23,9 +23,23 @@ Based on sampling, the dump contains approximately **5,357,970 articles** across
 
 ## Load data
 
+The loader supports resuming from checkpoints, graceful shutdown, and configurable parallelism.
+
 ```bash
-python wiki_search/manage.py load_wiki_dump --limit 10000
+# Typical ingest run with six workers
+python wiki_search/manage.py load_wiki_dump --workers 6 --batch-size 5000
 ```
+
+### Useful options
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--limit N` | Stop after processing N articles (useful for smoke tests). |
+| `--clear-checkpoint` | Delete the checkpoint file and start from scratch. |
+| `--force-decompress` | Re-extract the raw archive even if processed data exists. |
+| `--no-fast-extract` | Disable the system tar + lbzip2 path and use Python extraction. |
+
+The command stores progress in `data/.load_checkpoint.json`, tracking completed, partial, and deferred shards so reruns pick up where they stopped.
 
 ## Summarize database
 
@@ -33,10 +47,10 @@ python wiki_search/manage.py load_wiki_dump --limit 10000
 python wiki_search/manage.py db_summary
 ```
 
-To monitor loading progress, one can
+To monitor loading progress continuously:
 
 ```bash
-watch --interval python wiki_search/manage.py db_summary
+watch --interval 30 python wiki_search/manage.py db_summary
 ```
 
 ## Random Article

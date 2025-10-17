@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import bz2
-import io
 import json
 import os
 import logging
@@ -10,9 +9,13 @@ import signal
 import sys
 import subprocess
 import tarfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from queue import Empty
 from typing import Dict, Iterator, List, Optional, Set, Tuple
+
+from multiprocessing import Event, JoinableQueue, Process, Queue
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
@@ -26,10 +29,42 @@ try:
     _tqdm_available = True
 except Exception:  # pragma: no cover
     _tqdm_available = False
-    def tqdm(iterable, **kwargs):  # type: ignore
-        return iterable
+
+    class _DummyTqdm:
+        def __init__(self, iterable=None, **kwargs):
+            self.iterable = iterable
+
+        def __iter__(self):
+            if self.iterable is None:
+                return iter([])
+            return iter(self.iterable)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def update(self, _=1):
+            return None
+
+        def close(self):
+            return None
+
+    def tqdm(iterable=None, **kwargs):  # type: ignore
+        wrapper = _DummyTqdm(iterable, **kwargs)
+        if iterable is None:
+            return wrapper
+        return wrapper
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ShardStatus:
+    completed: List[str]
+    partial: List[str]
+    deferred: List[str]
 
 try:  # Prefer orjson if available
     import orjson as _json  # type: ignore
@@ -168,7 +203,7 @@ def find_bz2_files(root: Path) -> List[Path]:
         alt = root.parent / f"{root.name}-processed"
         if alt.exists():
             root = alt
-    
+
     for sub in sorted(root.iterdir()):
         if not sub.is_dir():
             continue
@@ -178,20 +213,17 @@ def find_bz2_files(root: Path) -> List[Path]:
 
 
 def iter_jsonl_bz2(file_path: Path) -> Iterator[dict]:
-    # Wrap BZ2 in a buffered reader to increase throughput
     with bz2.open(file_path, mode="rb") as raw:
-        with io.BufferedReader(raw, buffer_size=1024 * 1024) as buf:  # 1MB buffer
-            for line in buf:
-                if not line.strip():
-                    continue
+        for line in raw:
+            if not line.strip():
+                continue
+            try:
+                yield _json.loads(line)
+            except Exception:
                 try:
-                    yield _json.loads(line)
+                    yield _json.loads(line.decode("utf-8"))
                 except Exception:
-                    # If orjson in binary mode returns bytes, try decode fallback
-                    try:
-                        yield _json.loads(line.decode("utf-8"))
-                    except Exception:
-                        continue
+                    continue
 
 
 class Command(BaseCommand):
@@ -218,9 +250,11 @@ class Command(BaseCommand):
                 "completed_shards": [],
                 "total_articles_created": 0,
                 "total_articles_skipped": 0,
-                "last_updated": None
+                "last_updated": None,
+                "partial_shards": [],
+                "deferred_shards": [],
             }
-        
+
         try:
             with open(checkpoint_path, 'r') as f:
                 data = json.load(f)
@@ -229,7 +263,9 @@ class Command(BaseCommand):
                     "completed_shards": data.get("completed_shards", []),
                     "total_articles_created": data.get("total_articles_created", 0),
                     "total_articles_skipped": data.get("total_articles_skipped", 0),
-                    "last_updated": data.get("last_updated")
+                    "last_updated": data.get("last_updated"),
+                    "partial_shards": data.get("partial_shards", []),
+                    "deferred_shards": data.get("deferred_shards", []),
                 }
         except Exception as exc:
             logger.warning("Failed to load checkpoint: %s. Starting fresh.", exc)
@@ -237,21 +273,25 @@ class Command(BaseCommand):
                 "completed_shards": [],
                 "total_articles_created": 0,
                 "total_articles_skipped": 0,
-                "last_updated": None
+                "last_updated": None,
+                "partial_shards": [],
+                "deferred_shards": [],
             }
 
-    def _save_checkpoint(self, completed_shards: List[str], articles_created: int, articles_skipped: int) -> None:
+    def _save_checkpoint(self, status: ShardStatus, articles_created: int, articles_skipped: int) -> None:
         """Save checkpoint data to file."""
         checkpoint_path = self._get_checkpoint_path()
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         self.checkpoint_data.update({
-            "completed_shards": completed_shards,
+            "completed_shards": status.completed,
             "total_articles_created": articles_created,
             "total_articles_skipped": articles_skipped,
-            "last_updated": datetime.now().isoformat()
+            "last_updated": datetime.now().isoformat(),
+            "partial_shards": status.partial,
+            "deferred_shards": status.deferred,
         })
-        
+
         try:
             with open(checkpoint_path, 'w') as f:
                 json.dump(self.checkpoint_data, f, indent=2)
@@ -309,11 +349,11 @@ class Command(BaseCommand):
         # Load checkpoint data
         self.checkpoint_data = self._load_checkpoint()
         completed_shards_set = set(self.checkpoint_data["completed_shards"])
-        
+
         # Show resume info
         if completed_shards_set:
             logger.info("Resuming from checkpoint: %d shards already processed", len(completed_shards_set))
-            logger.info("Previous run created %d articles, skipped %d duplicates", 
+            logger.info("Previous run created %d articles, skipped %d duplicates",
                        self.checkpoint_data["total_articles_created"],
                        self.checkpoint_data["total_articles_skipped"])
             if self.checkpoint_data["last_updated"]:
@@ -349,14 +389,27 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS("All shards already processed"))
             return
 
-        logger.info("Found %d total shards, %d remaining to process; using %d workers", 
+        logger.info("Found %d total shards, %d remaining to process; using %d workers",
                    len(all_bz2_files), len(bz2_files), workers)
 
         # Set up signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
-        created_total, skipped_total = self._run_pipeline(bz2_files, batch_size, limit, workers, completed_shards_set)
+        initial_status = ShardStatus(
+            completed=list(completed_shards_set),
+            partial=list(self.checkpoint_data.get("partial_shards", [])),
+            deferred=list(self.checkpoint_data.get("deferred_shards", [])),
+        )
+
+        created_total, skipped_total = self._run_pipeline(
+            bz2_files,
+            batch_size,
+            limit,
+            workers,
+            completed_shards_set,
+            initial_status,
+        )
 
         self.stdout.write(self.style.SUCCESS(f"Created {created_total} new articles, skipped {skipped_total} duplicates"))
 
@@ -364,154 +417,229 @@ class Command(BaseCommand):
         """Flush batch to database and return (created_count, skipped_count)."""
         if not batch:
             return 0, 0
-        
+
         # Count existing articles to determine how many were actually created
         page_ids = [article.page_id for article in batch]
         existing_count = Article.objects.filter(page_id__in=page_ids).count()
-        
+
         with transaction.atomic():
             Article.objects.bulk_create(batch, batch_size=batch_size, ignore_conflicts=True)
-        
+
         created_count = len(batch) - existing_count
         skipped_count = existing_count
         batch.clear()
         return created_count, skipped_count
 
-    def _run_pipeline(self, shards: List[Path], batch_size: int, limit: Optional[int], workers: int, completed_shards_set: Set[str]) -> Tuple[int, int]:
-        """Run a multi-process pipeline: parser workers -> single writer.
+    def _run_pipeline(
+        self,
+        shards: List[Path],
+        batch_size: int,
+        limit: Optional[int],
+        workers: int,
+        completed_shards_set: Set[str],
+        initial_status: ShardStatus,
+    ) -> Tuple[int, int]:
+        """Run a multi-process pipeline with explicit worker signalling and graceful shutdown."""
+        base_dir = shards[0].parent.parent if shards else None
 
-        Workers parse shards and emit tuples (shard_path, page_id:int, title:str, paragraphs:List[str]).
-        The writer constructs Article instances and bulk inserts, tracking shard completion.
-        """
-        from multiprocessing import Process, Queue
+        shard_queue: JoinableQueue = JoinableQueue()
+        result_queue: Queue = Queue(maxsize=5000)
+        stop_event = Event()
 
-        shard_q: Queue = Queue()
-        out_q: Queue = Queue(maxsize=10000)
+        for shard in shards:
+            shard_queue.put(shard)
+        for _ in range(workers):
+            shard_queue.put(None)
 
-        def put_shards() -> None:
-            for s in shards:
-                shard_q.put(s)
-            for _ in range(workers):
-                shard_q.put(None)
+        def make_shard_key(path_str: str) -> str:
+            shard_path = Path(path_str)
+            if base_dir:
+                try:
+                    return str(shard_path.relative_to(base_dir))
+                except ValueError:
+                    pass
+            return shard_path.name
 
-        def worker_loop() -> None:
+        def worker_loop(worker_id: int) -> None:
             while True:
-                shard = shard_q.get()
+                shard = shard_queue.get()
                 if shard is None:
+                    shard_queue.task_done()
                     break
-                for rec in iter_jsonl_bz2(shard):
-                    page_id_raw = rec.get("id")
-                    title = rec.get("title")
-                    text = rec.get("text") or []
-                    try:
-                        page_id_int = int(page_id_raw)
-                    except Exception:
+
+                shard_str = str(shard)
+                try:
+                    if stop_event.is_set():
+                        result_queue.put(("shard_deferred", shard_str, 0))
                         continue
-                    paragraphs = extract_plain_paragraphs(text)
-                    # Include shard path for tracking completion
-                    out_q.put((shard, page_id_int, title, paragraphs))
 
-        # Start shard feeder
-        feeder = Process(target=put_shards)
-        feeder.start()
+                    records_emitted = 0
+                    finished_normally = True
 
-        # Start workers
-        procs = [Process(target=worker_loop) for _ in range(workers)]
-        for p in procs:
-            p.daemon = True
-            p.start()
+                    for rec in iter_jsonl_bz2(shard):
+                        if stop_event.is_set():
+                            finished_normally = False
+                            break
 
-        # Writer loop in main process (owns Django ORM)
+                        page_id_raw = rec.get("id")
+                        if page_id_raw is None:
+                            continue
+                        try:
+                            page_id_int = int(page_id_raw)
+                        except Exception:
+                            continue
+                        title = rec.get("title")
+                        text = rec.get("text") or []
+                        paragraphs = extract_plain_paragraphs(text)
+
+                        result_queue.put(("record", shard_str, page_id_int, title, paragraphs))
+                        records_emitted += 1
+
+                    completion_type = "shard_done" if finished_normally else "partial_shard"
+                    result_queue.put((completion_type, shard_str, records_emitted))
+                finally:
+                    shard_queue.task_done()
+
+                if stop_event.is_set():
+                    continue
+
+            result_queue.put(("worker_done", worker_id))
+
+        procs = [Process(target=worker_loop, args=(idx,)) for idx in range(workers)]
+        for proc in procs:
+            proc.daemon = True
+            proc.start()
+
         created_total = 0
         skipped_total = 0
         batch: List[Article] = []
         processed_records = 0
-        alive = workers
-        current_shard: Optional[Path] = None
-        completed_shards_list = list(completed_shards_set)
-        
-        # Progress tracking
+
+        completed_shards_list = list(initial_status.completed)
+        completed_shards_seen: Set[str] = set(completed_shards_list)
+        partial_shards: Set[str] = set(initial_status.partial or [])
+        deferred_shards: Set[str] = set(initial_status.deferred or [])
+
+        for shard_key in list(partial_shards) + list(deferred_shards):
+            if shard_key in completed_shards_seen:
+                completed_shards_seen.remove(shard_key)
+                completed_shards_list = [s for s in completed_shards_list if s != shard_key]
+
+        workers_remaining = workers
+
         total_shards = len(shards)
-        processed_shards = len(completed_shards_set)
-        
-        with tqdm(total=total_shards, desc="Processing shards", unit="shard", 
-                 initial=processed_shards, leave=True, dynamic_ncols=True) as pbar:
-            
-            while True:
-                # Check for shutdown signal
-                if self.shutdown_requested:
-                    logger.info("Shutdown requested, saving checkpoint...")
-                    break
-                    
-                if limit and processed_records >= limit:
-                    break
-                    
-                try:
-                    item = out_q.get(timeout=0.5)
-                except Exception:
-                    # Check if workers are done
-                    alive = sum(1 for p in procs if p.is_alive())
-                    if alive == 0 and out_q.empty():
-                        break
-                    continue
-                    
-                shard_path, page_id_int, title, paragraphs = item
-                
-                # Track shard completion
-                if current_shard != shard_path:
-                    if current_shard is not None:
-                        # Mark previous shard as completed
-                        relative_path = current_shard.relative_to(current_shard.parent.parent)
-                        shard_key = str(relative_path)
-                        if shard_key not in completed_shards_list:
-                            completed_shards_list.append(shard_key)
-                        pbar.update(1)
-                        
-                        # Save checkpoint periodically (every 10 shards)
-                        if len(completed_shards_list) % 10 == 0:
-                            self._save_checkpoint(completed_shards_list, created_total, skipped_total)
-                    
-                    current_shard = shard_path
-                
-                batch.append(Article(page_id=page_id_int, title=title, plain_text_paragraphs=paragraphs))
-                processed_records += 1
-                
-                if len(batch) >= batch_size or (limit and processed_records >= limit):
-                    created, skipped = self._flush_batch(batch, batch_size)
-                    created_total += created
-                    skipped_total += skipped
+        processed_shards = 0
 
-        # Final flush
-        if batch:
-            created, skipped = self._flush_batch(batch, batch_size)
-            created_total += created
-            skipped_total += skipped
+        def flush_batch() -> None:
+            nonlocal created_total, skipped_total
+            if batch:
+                created, skipped = self._flush_batch(batch, batch_size)
+                created_total += created
+                skipped_total += skipped
 
-        # Mark final shard as completed if we were processing it
-        if current_shard is not None:
-            relative_path = current_shard.relative_to(current_shard.parent.parent)
-            shard_key = str(relative_path)
-            if shard_key not in completed_shards_list:
-                completed_shards_list.append(shard_key)
-            pbar.update(1)
-
-        # Save final checkpoint
-        self._save_checkpoint(completed_shards_list, created_total, skipped_total)
-
-        # Graceful shutdown of workers
+        pbar = tqdm(
+            total=total_shards,
+            desc="Processing shards",
+            unit="shard",
+            initial=processed_shards,
+            leave=True,
+            dynamic_ncols=True,
+        )
         try:
-            for p in procs:
-                if p.is_alive():
-                    p.terminate()
-            if feeder.is_alive():
-                feeder.terminate()
-        except Exception:
-            pass
-            
-        for p in procs:
-            p.join(timeout=5)
-        feeder.join(timeout=5)
+            while workers_remaining > 0:
+                if self.shutdown_requested and not stop_event.is_set():
+                    logger.info("Shutdown requested, signalling workers to stop...")
+                    stop_event.set()
+                if limit is not None and processed_records >= limit and not stop_event.is_set():
+                    logger.info("Limit %s reached; signalling workers to stop...", limit)
+                    stop_event.set()
+
+                try:
+                    message = result_queue.get(timeout=0.5)
+                except Empty:
+                    continue
+
+                kind = message[0]
+
+                if kind == "record":
+                    if limit is not None and processed_records >= limit:
+                        continue
+                    _, shard_str, page_id_int, title, paragraphs = message
+                    batch.append(
+                        Article(
+                            page_id=page_id_int,
+                            title=title,
+                            plain_text_paragraphs=paragraphs,
+                        )
+                    )
+                    processed_records += 1
+                    if len(batch) >= batch_size:
+                        flush_batch()
+                elif kind == "shard_done":
+                    _, shard_str, _count = message
+                    shard_key = make_shard_key(shard_str)
+                    partial_shards.discard(shard_key)
+                    deferred_shards.discard(shard_key)
+                    if shard_key not in completed_shards_seen:
+                        completed_shards_seen.add(shard_key)
+                        completed_shards_list.append(shard_key)
+                        pbar.update(1)
+                        if completed_shards_list and len(completed_shards_list) % 10 == 0:
+                            self._save_checkpoint(
+                                ShardStatus(
+                                    completed=list(completed_shards_list),
+                                    partial=sorted(list(partial_shards)),
+                                    deferred=sorted(list(deferred_shards)),
+                                ),
+                                created_total,
+                                skipped_total,
+                            )
+                elif kind == "partial_shard":
+                    _, shard_str, _count = message
+                    shard_key = make_shard_key(shard_str)
+                    partial_shards.add(shard_key)
+                    deferred_shards.discard(shard_key)
+                    if shard_key in completed_shards_seen:
+                        completed_shards_seen.remove(shard_key)
+                        completed_shards_list = [s for s in completed_shards_list if s != shard_key]
+                elif kind == "shard_deferred":
+                    _, shard_str, _count = message
+                    shard_key = make_shard_key(shard_str)
+                    deferred_shards.add(shard_key)
+                    partial_shards.discard(shard_key)
+                    if shard_key in completed_shards_seen:
+                        completed_shards_seen.remove(shard_key)
+                        completed_shards_list = [s for s in completed_shards_list if s != shard_key]
+                elif kind == "worker_done":
+                    workers_remaining -= 1
+                else:
+                    logger.debug("Received unexpected message type from worker: %s", kind)
+        finally:
+            pbar.close()
+
+        flush_batch()
+
+        if partial_shards:
+            logger.info("Partial shards detected (will remain pending): %s", sorted(list(partial_shards)))
+        if deferred_shards:
+            logger.info("Deferred shards due to cancellation: %s", sorted(list(deferred_shards)))
+
+        self._save_checkpoint(
+            ShardStatus(
+                completed=list(completed_shards_list),
+                partial=sorted(list(partial_shards)),
+                deferred=sorted(list(deferred_shards)),
+            ),
+            created_total,
+            skipped_total,
+        )
+
+        stop_event.set()
+        shard_queue.join()
+
+        for proc in procs:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
 
         return created_total, skipped_total
-
-
