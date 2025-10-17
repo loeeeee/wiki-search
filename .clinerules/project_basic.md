@@ -53,7 +53,14 @@ enwiki-20171001-pages-meta-current-withlinks/
 157 directories, 15517 files
 ```
 
-When a wiki_00.bz2 is extracted, it will look like .clinerules/example_wikipedia_dump.md.
+When a wiki_00.bz2 is extracted, part of it is .clinerules/example_wikipedia_dump-small.md.
+
+InternalLink:
+
+- <a href=\"Pierre-Joseph%20Proudhon\">Pierre-Joseph Proudhon</a>
+- <a href=\"individualist%20anarchism\">individualist anarchism</a>
+- Various factions within the <a href=\"French%20Revolution\">French Revolution</a> labelled opponents as anarchists (as <a href=\"Maximilien%20de%20Robespierre\">Robespierre</a> did the <a href=\"H%C3%A9bertists\">H\u00e9bertists</a>) although few shared many views of later anarchists.
+- the anarcho-syndicalist trade union <a href=\"Unione%20Sindacale%20Italiana\">Unione Sindacale Italiana</a> \"grew to 800,000 members and the influence of the Italian Anarchist Union (20,000 members plus \"<a href=\"Umanita%20Nova\">Umanita Nova</a>\", its daily paper) grew accordingly\u00a0... Anarchists were the first to suggest occupying workplaces.
 
 #### Processing
 
