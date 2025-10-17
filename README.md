@@ -42,8 +42,11 @@ python wiki_search/manage.py resolve_links --resolve-to-article
 | `--force-decompress` | Re-extract the raw archive even if processed data exists. |
 | `--skip-decompress` | Skip decompression entirely and use existing decompressed data. |
 | `--no-fast-extract` | Disable the system tar + lbzip2 path and use Python extraction. |
+| `--worker-batch-size N` | Max records per worker emission (reduces IPC overhead). |
 
 The command stores progress in `data/.load_checkpoint.json`, tracking completed, partial, and deferred shards so reruns pick up where they stopped. It also extracts and stores internal Wikipedia links during the loading process.
+
+Note: When using SQLite, the loader now enables ingest-friendly PRAGMA settings (WAL, synchronous=NORMAL, etc.) for faster bulk writes.
 
 ### Useful options for resolve_links
 

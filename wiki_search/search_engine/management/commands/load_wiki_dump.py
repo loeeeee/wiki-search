@@ -19,6 +19,7 @@ from multiprocessing import Event, JoinableQueue, Process, Queue
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import connection
 from django.db import transaction
 
 from search_engine.ingest.parser import extract_plain_paragraphs, extract_internal_links
@@ -115,7 +116,7 @@ def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False, pr
     if target_dir.exists() and not force:
         logger.info("Processed directory exists: %s", target_dir)
         return target_dir
-    if not archive.qexists():
+    if not archive.exists():
         raise CommandError(f"Archive not found: {archive}")
 
     target_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -312,6 +313,12 @@ class Command(BaseCommand):
             help="Disable fast extractor; use Python tarfile streaming",
         )
         parser.add_argument(
+            "--worker-batch-size",
+            type=int,
+            default=2048,
+            help="Max records per worker emission (reduces IPC overhead)",
+        )
+        parser.add_argument(
             "--clear-checkpoint",
             action="store_true",
             help="Clear checkpoint and start fresh",
@@ -319,6 +326,21 @@ class Command(BaseCommand):
 
     def handle(self, *args, **opts):
         logging.basicConfig(level=logging.INFO)
+
+        def _enable_sqlite_ingest_pragmas() -> None:
+            if connection.vendor != "sqlite":
+                return
+            try:
+                with connection.cursor() as cur:
+                    cur.execute("PRAGMA journal_mode=WAL;")
+                    cur.execute("PRAGMA synchronous=NORMAL;")
+                    cur.execute("PRAGMA temp_store=MEMORY;")
+                    cur.execute("PRAGMA mmap_size=30000000000;")
+                    cur.execute("PRAGMA cache_size=-200000;")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to apply SQLite PRAGMAs: %s", exc)
+
+        _enable_sqlite_ingest_pragmas()
         archive = Path(opts["archive"]).expanduser()
         processed_dir = Path(opts["processed_dir"]).expanduser()
         batch_size: int = opts["batch_size"]
@@ -390,6 +412,8 @@ class Command(BaseCommand):
             deferred=list(self.checkpoint_data.get("deferred_shards", [])),
         )
 
+        worker_batch_size: int = int(opts.get("worker_batch_size") or 2048)
+
         created_total, skipped_total, links_total = self._run_pipeline(
             bz2_files,
             batch_size,
@@ -397,6 +421,7 @@ class Command(BaseCommand):
             workers,
             completed_shards_set,
             initial_status,
+            worker_batch_size,
         )
 
         self.stdout.write(self.style.SUCCESS(f"Created {created_total} new articles, skipped {skipped_total} duplicates, created {links_total} links"))
@@ -406,18 +431,13 @@ class Command(BaseCommand):
         if not batch:
             return 0, 0
 
-        page_ids = [article.page_id for article in batch]
-        existing_ids = set(
-            Article.objects.filter(page_id__in=page_ids).values_list("page_id", flat=True)
-        )
-
         to_insert: List[Article] = []
         seen_new_ids: Set[int] = set()
         skipped_count = 0
 
         for article in batch:
             page_id = article.page_id
-            if page_id in existing_ids or page_id in seen_new_ids:
+            if page_id in seen_new_ids:
                 skipped_count += 1
                 continue
             seen_new_ids.add(page_id)
@@ -464,14 +484,20 @@ class Command(BaseCommand):
         workers: int,
         completed_shards_set: Set[str],
         initial_status: ShardStatus,
-    ) -> Tuple[int, int]:
+        worker_batch_size: int,
+    ) -> Tuple[int, int, int]:
         """Run a multi-process pipeline with explicit worker signalling and graceful shutdown."""
         base_dir = shards[0].parent.parent if shards else None
 
         shard_queue: JoinableQueue = JoinableQueue()
-        result_queue: Queue = Queue(maxsize=5000)
+        # Prefer SimpleQueue for lower overhead (no size checks)
+        try:
+            from multiprocessing import SimpleQueue  # type: ignore
+            result_queue = SimpleQueue()
+        except Exception:  # pragma: no cover
+            result_queue = Queue(maxsize=0)
         stop_event = Event()
-        record_batch_size = max(1, min(batch_size, 128))
+        record_batch_size = max(1, min(batch_size, worker_batch_size))
 
         for shard in shards:
             shard_queue.put(shard)
@@ -574,6 +600,8 @@ class Command(BaseCommand):
         links_total = 0
         batch: List[Article] = []
         processed_records = 0
+        link_accumulator: List[InternalLink] = []
+        LINK_FLUSH_THRESHOLD = max(50_000, batch_size * 20)
 
         completed_shards_list = list(initial_status.completed)
         completed_shards_seen: Set[str] = set(completed_shards_list)
@@ -641,21 +669,16 @@ class Command(BaseCommand):
                             flush_batch()
                 elif kind == "link_batch":
                     _, shard_str, link_payload = message
-                    # Convert to InternalLink objects without DB lookup
-                    # Store raw page_id values for later resolution
-                    internal_links = []
                     for page_id, target_title, anchor_text in link_payload:
-                        internal_links.append(
+                        link_accumulator.append(
                             InternalLink(
                                 from_page_id=page_id,
                                 to_title=target_title,
                                 anchor_text=anchor_text,
                             )
                         )
-                    
-                    if internal_links:
-                        links_created = self._flush_link_batch(internal_links, batch_size)
-                        links_total += links_created
+                    if len(link_accumulator) >= LINK_FLUSH_THRESHOLD:
+                        links_total += self._flush_link_batch(link_accumulator, batch_size)
                 elif kind == "shard_done":
                     _, shard_str, _count = message
                     shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
@@ -665,7 +688,8 @@ class Command(BaseCommand):
                         completed_shards_seen.add(shard_key)
                         completed_shards_list.append(shard_key)
                         pbar.update(1)
-                        if completed_shards_list and len(completed_shards_list) % 10 == 0:
+                        # Periodic checkpointing
+                        if completed_shards_list and len(completed_shards_list) % 50 == 0:
                             self._save_checkpoint(
                                 ShardStatus(
                                     completed=list(completed_shards_list),
@@ -676,6 +700,9 @@ class Command(BaseCommand):
                                 skipped_total,
                                 links_total,
                             )
+                        # Opportunistically flush accumulated links at shard boundaries
+                        if link_accumulator and len(link_accumulator) >= LINK_FLUSH_THRESHOLD:
+                            links_total += self._flush_link_batch(link_accumulator, batch_size)
                 elif kind == "partial_shard":
                     _, shard_str, _count = message
                     shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
@@ -700,6 +727,8 @@ class Command(BaseCommand):
             pbar.close()
 
         flush_batch()
+        if link_accumulator:
+            links_total += self._flush_link_batch(link_accumulator, batch_size)
 
         if partial_shards:
             logger.info("Partial shards detected (will remain pending): %s", sorted(list(partial_shards)))
