@@ -84,9 +84,32 @@ The `InternalLink` model includes:
 - Anchor text (`anchor_text`)
 - Indexes on `from_article`, `to_article`, and `to_title` for efficient querying
 
+## Performance Optimization
+
+### Link Processing Optimization (2024)
+
+The initial implementation caused the main process to become overloaded (100% CPU) because it was accumulating and processing thousands of links sequentially. This was optimized by:
+
+1. **Separate Link Processing**: Workers now emit separate `link_batch` messages containing link data
+2. **Parallel Link Handling**: Links are processed independently in the main loop without blocking article processing
+3. **Reduced Main Process Load**: Main process no longer accumulates large link lists in memory
+4. **Better Throughput**: Workers can continue processing while links are being inserted
+
+**Key Changes**:
+- Workers maintain separate `batch_buffer` (articles) and `link_buffer` (links)
+- Links are emitted when buffer reaches threshold (typically 1000 links)
+- Main process handles `link_batch` messages independently from `record_batch`
+- Database queries for article IDs happen only when processing link batches
+
+**Performance Impact**:
+- Main process CPU usage significantly reduced
+- Better parallelization across worker processes
+- Improved overall pipeline throughput
+- Same data integrity maintained
+
 ## Future Enhancements
 
 1. **Link resolution**: Implement a second pass to resolve `to_article` references
 2. **Duplicate handling**: Consider deduplicating links within articles
 3. **Link validation**: Add validation for malformed or invalid links
-4. **Performance optimization**: Consider parallel link processing for very large datasets
+4. **Further optimization**: Consider link-specific worker processes for very large datasets

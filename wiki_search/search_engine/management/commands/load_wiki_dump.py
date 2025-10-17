@@ -502,9 +502,12 @@ class Command(BaseCommand):
 
                     records_emitted = 0
                     finished_normally = True
-                    batch_buffer: list[tuple[int, Optional[str], list[str], list[tuple[str, str]]]] = []
+                    batch_buffer: list[tuple[int, Optional[str], list[str]]] = []
+                    link_buffer: list[tuple[int, str, str]] = []
 
                     try:
+                        link_batch_size = max(100, record_batch_size * 10)  # Links are smaller
+                        
                         for rec in iter_jsonl_bz2(shard):
                             if stop_event.is_set():
                                 finished_normally = False
@@ -522,15 +525,31 @@ class Command(BaseCommand):
                             paragraphs = extract_plain_paragraphs(text)
                             links = extract_internal_links(text)
 
-                            batch_buffer.append((page_id_int, title, paragraphs, links))
+                            # Add article to batch
+                            batch_buffer.append((page_id_int, title, paragraphs))
+                            
+                            # Add links to link buffer
+                            for target_title, anchor_text in links:
+                                link_buffer.append((page_id_int, target_title, anchor_text))
+                            
+                            # Emit article batch when full
                             if len(batch_buffer) >= record_batch_size:
                                 result_queue.put(("record_batch", shard_str, batch_buffer))
                                 records_emitted += len(batch_buffer)
                                 batch_buffer = []
+                            
+                            # Emit link batch when full
+                            if len(link_buffer) >= link_batch_size:
+                                result_queue.put(("link_batch", shard_str, link_buffer))
+                                link_buffer = []
 
+                        # Emit remaining buffers
                         if batch_buffer:
                             result_queue.put(("record_batch", shard_str, batch_buffer))
                             records_emitted += len(batch_buffer)
+                        
+                        if link_buffer:
+                            result_queue.put(("link_batch", shard_str, link_buffer))
                     except Exception as e:
                         logger.error("Error processing shard %s: %s", shard, e)
                         finished_normally = False
@@ -554,7 +573,6 @@ class Command(BaseCommand):
         skipped_total = 0
         links_total = 0
         batch: List[Article] = []
-        link_batch: List[Tuple[int, str, str]] = []  # (page_id, target_title, anchor_text)
         processed_records = 0
 
         completed_shards_list = list(initial_status.completed)
@@ -574,37 +592,11 @@ class Command(BaseCommand):
         shard_key_cache: Dict[str, str] = {}
 
         def flush_batch() -> None:
-            nonlocal created_total, skipped_total, links_total
+            nonlocal created_total, skipped_total
             if batch:
                 created, skipped = self._flush_batch(batch, batch_size)
                 created_total += created
                 skipped_total += skipped
-                
-                # Process link batch with article IDs
-                if link_batch:
-                    # Get the page_ids that were just created
-                    page_ids = [article.page_id for article in batch]
-                    # Query for the created articles to get their IDs
-                    created_articles = Article.objects.filter(page_id__in=page_ids)
-                    page_id_to_article_id = {article.page_id: article.id for article in created_articles}
-                    
-                    # Create InternalLink objects with correct from_article_id
-                    internal_links = []
-                    for page_id, target_title, anchor_text in link_batch:
-                        if page_id in page_id_to_article_id:
-                            internal_links.append(
-                                InternalLink(
-                                    from_article_id=page_id_to_article_id[page_id],
-                                    to_title=target_title,
-                                    anchor_text=anchor_text,
-                                )
-                            )
-                    
-                    if internal_links:
-                        links_created = self._flush_link_batch(internal_links, batch_size)
-                        links_total += links_created
-                    
-                    link_batch.clear()
 
         pbar = tqdm(
             total=total_shards,
@@ -634,7 +626,7 @@ class Command(BaseCommand):
                     if limit is not None and processed_records >= limit:
                         continue
                     _, shard_str, payload = message
-                    for page_id_int, title, paragraphs, links in payload:
+                    for page_id_int, title, paragraphs in payload:
                         if limit is not None and processed_records >= limit:
                             break
                         batch.append(
@@ -644,14 +636,31 @@ class Command(BaseCommand):
                                 plain_text_paragraphs=paragraphs,
                             )
                         )
-                        
-                        # Add links to link batch (will be processed after articles are created)
-                        for target_title, anchor_text in links:
-                            link_batch.append((page_id_int, target_title, anchor_text))
-                        
                         processed_records += 1
                         if len(batch) >= batch_size:
                             flush_batch()
+                elif kind == "link_batch":
+                    _, shard_str, link_payload = message
+                    # Convert to InternalLink objects with DB lookup
+                    page_ids = list(set(page_id for page_id, _, _ in link_payload))
+                    page_id_to_article_id = dict(
+                        Article.objects.filter(page_id__in=page_ids).values_list('page_id', 'id')
+                    )
+                    
+                    internal_links = []
+                    for page_id, target_title, anchor_text in link_payload:
+                        if page_id in page_id_to_article_id:
+                            internal_links.append(
+                                InternalLink(
+                                    from_article_id=page_id_to_article_id[page_id],
+                                    to_title=target_title,
+                                    anchor_text=anchor_text,
+                                )
+                            )
+                    
+                    if internal_links:
+                        links_created = self._flush_link_batch(internal_links, batch_size)
+                        links_total += links_created
                 elif kind == "shard_done":
                     _, shard_str, _count = message
                     shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
