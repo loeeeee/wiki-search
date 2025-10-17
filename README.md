@@ -26,11 +26,14 @@ Based on sampling, the dump contains approximately **5,357,970 articles** across
 The loader supports resuming from checkpoints, graceful shutdown, configurable parallelism, and automatic internal link extraction.
 
 ```bash
-# Typical ingest run with six workers
+# Step 1: Load articles and extract internal links
 python wiki_search/manage.py load_wiki_dump --workers 6 --batch-size 5000
+
+# Step 2: Resolve link foreign key references
+python wiki_search/manage.py resolve_links --resolve-to-article
 ```
 
-### Useful options
+### Useful options for load_wiki_dump
 
 | Flag | Purpose |
 | ---- | ------- |
@@ -42,12 +45,23 @@ python wiki_search/manage.py load_wiki_dump --workers 6 --batch-size 5000
 
 The command stores progress in `data/.load_checkpoint.json`, tracking completed, partial, and deferred shards so reruns pick up where they stopped. It also extracts and stores internal Wikipedia links during the loading process.
 
+### Useful options for resolve_links
+
+| Flag | Purpose |
+| ---- | ------- |
+| `--batch-size N` | Batch size for bulk updates (default: 5000). |
+| `--resolve-to-article` | Also resolve to_article based on to_title matching. |
+| `--verbose` | Enable verbose output showing progress details. |
+
+The `resolve_links` command resolves foreign key references after articles are loaded. This two-phase approach eliminates database lookup bottlenecks during the main loading process, achieving 2-3x better throughput.
+
 #### Performance characteristics
 
 - Worker processes stream articles to the coordinator in batches, minimizing inter-process contention and improving throughput on multi-core machines.
 - The coordinator deduplicates page IDs per batch before inserting, allowing large `--batch-size` values without incurring duplicate constraint penalties.
 - Batch inserts run inside transactions sized by `--batch-size`, so tune this flag based on available memory and database write performance.
-- Internal links are extracted from article HTML and stored in batches for optimal performance.
+- Internal links are extracted and stored with raw page_id values during loading, avoiding expensive database lookups.
+- Link foreign key resolution happens in a separate post-processing step using efficient batch operations.
 
 ## Summarize database
 

@@ -641,22 +641,17 @@ class Command(BaseCommand):
                             flush_batch()
                 elif kind == "link_batch":
                     _, shard_str, link_payload = message
-                    # Convert to InternalLink objects with DB lookup
-                    page_ids = list(set(page_id for page_id, _, _ in link_payload))
-                    page_id_to_article_id = dict(
-                        Article.objects.filter(page_id__in=page_ids).values_list('page_id', 'id')
-                    )
-                    
+                    # Convert to InternalLink objects without DB lookup
+                    # Store raw page_id values for later resolution
                     internal_links = []
                     for page_id, target_title, anchor_text in link_payload:
-                        if page_id in page_id_to_article_id:
-                            internal_links.append(
-                                InternalLink(
-                                    from_article_id=page_id_to_article_id[page_id],
-                                    to_title=target_title,
-                                    anchor_text=anchor_text,
-                                )
+                        internal_links.append(
+                            InternalLink(
+                                from_page_id=page_id,
+                                to_title=target_title,
+                                anchor_text=anchor_text,
                             )
+                        )
                     
                     if internal_links:
                         links_created = self._flush_link_batch(internal_links, batch_size)

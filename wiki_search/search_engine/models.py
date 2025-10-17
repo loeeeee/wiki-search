@@ -41,7 +41,8 @@ class Redirect(models.Model):
 
 
 class InternalLink(models.Model):
-    from_article = models.ForeignKey('Article', on_delete=models.CASCADE, related_name='out_links')
+    from_article = models.ForeignKey('Article', on_delete=models.CASCADE, related_name='out_links', null=True, blank=True)
+    from_page_id = models.PositiveBigIntegerField(null=True, db_index=True)
     to_article = models.ForeignKey('Article', on_delete=models.CASCADE, related_name='in_links', null=True, blank=True)
     to_title = models.CharField(max_length=512)
     anchor_text = models.CharField(max_length=512, blank=True)
@@ -49,6 +50,7 @@ class InternalLink(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=['from_article']),
+            models.Index(fields=['from_page_id']),
             models.Index(fields=['to_article']),
             models.Index(fields=['to_title']),
         ]
