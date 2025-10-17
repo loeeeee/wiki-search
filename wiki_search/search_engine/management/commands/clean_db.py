@@ -16,7 +16,6 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser) -> None:
         parser.add_argument("--yes", action="store_true", help="Run non-interactively and skip confirmation")
-        parser.add_argument("--chunk-size", type=int, default=100_000, help="Rows per delete chunk")
 
     def handle(self, *args, **options):
         confirm = options["yes"]
@@ -33,31 +32,33 @@ class Command(BaseCommand):
                 self.stdout.write("Aborted.")
                 return
 
-        # Chunked raw SQL deletes to keep memory usage low
-        def chunked_delete(table: str, pk: str = "id", chunk_size: int = 100_000) -> int:
-            deleted_total = 0
+        def truncate_all_tables():
+            """Fast truncate using DELETE without WHERE and disabled FK checks."""
             with connection.cursor() as cur:
-                cur.execute(f"SELECT MIN({pk}), MAX({pk}) FROM {table}")
-                row = cur.fetchone()
-                if not row or row[0] is None:
-                    return 0
-                min_id, max_id = int(row[0]), int(row[1])
-                start = min_id
-                while start <= max_id:
-                    end = start + chunk_size - 1
-                    # Inline numeric bounds to avoid SQLite debug_sql formatting issues
-                    cur.execute(f"DELETE FROM {table} WHERE {pk} BETWEEN {start} AND {end}")
-                    deleted_total += cur.rowcount if cur.rowcount is not None else 0
-                    # Commit per chunk to release resources early
-                    connection.commit()
-                    start = end + 1
-            return deleted_total
+                # Disable foreign key constraints temporarily
+                cur.execute("PRAGMA foreign_keys = OFF")
+                
+                # Delete all rows (equivalent to TRUNCATE in SQLite)
+                # Order matters: delete children before parents to avoid issues
+                cur.execute(f"DELETE FROM {InternalLink._meta.db_table}")
+                links_deleted = cur.rowcount or 0
+                
+                cur.execute(f"DELETE FROM {Redirect._meta.db_table}")
+                redirects_deleted = cur.rowcount or 0
+                
+                cur.execute(f"DELETE FROM {Article._meta.db_table}")
+                articles_deleted = cur.rowcount or 0
+                
+                # Re-enable foreign key constraints
+                cur.execute("PRAGMA foreign_keys = ON")
+                
+                # Commit once at the end
+                connection.commit()
+                
+            return articles_deleted, redirects_deleted, links_deleted
 
-        # Respect FK dependencies: delete children first
-        chunk_size = int(options.get("chunk_size") or 100_000)
-        links_deleted = chunked_delete(InternalLink._meta.db_table, chunk_size=chunk_size)
-        redirects_deleted = chunked_delete(Redirect._meta.db_table, chunk_size=chunk_size)
-        articles_deleted = chunked_delete(Article._meta.db_table, chunk_size=chunk_size)
+        # Fast truncate approach
+        articles_deleted, redirects_deleted, links_deleted = truncate_all_tables()
 
         # VACUUM to reclaim space (SQLite only)
         try:
