@@ -11,6 +11,26 @@ class Article(models.Model):
         return self.title
 
 
+class Vocabulary(models.Model):
+    term = models.CharField(max_length=128, unique=True, db_index=True)
+    document_frequency = models.PositiveIntegerField(default=0)
+    idf_value = models.FloatField(default=0.0)
+
+    def __str__(self) -> str:
+        return self.term
+
+
+class TFIDFIndex(models.Model):
+    article = models.OneToOneField('Article', on_delete=models.CASCADE, related_name='tfidf')
+    tfidf_vector = models.JSONField(default=dict)
+    l2_norm = models.FloatField(default=0.0)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['article']),
+        ]
+
+
 class Redirect(models.Model):
     source_page_id = models.PositiveBigIntegerField(unique=True, db_index=True)
     source_title = models.CharField(max_length=512, unique=True, db_index=True)
