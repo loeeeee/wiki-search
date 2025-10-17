@@ -490,12 +490,8 @@ class Command(BaseCommand):
         base_dir = shards[0].parent.parent if shards else None
 
         shard_queue: JoinableQueue = JoinableQueue()
-        # Prefer SimpleQueue for lower overhead (no size checks)
-        try:
-            from multiprocessing import SimpleQueue  # type: ignore
-            result_queue = SimpleQueue()
-        except Exception:  # pragma: no cover
-            result_queue = Queue(maxsize=0)
+        # Use an unbounded Queue to support get(timeout=...) semantics reliably
+        result_queue: Queue = Queue(maxsize=0)
         stop_event = Event()
         record_batch_size = max(1, min(batch_size, worker_batch_size))
 
