@@ -394,15 +394,30 @@ class Command(BaseCommand):
         if not batch:
             return 0, 0
 
-        # Count existing articles to determine how many were actually created
         page_ids = [article.page_id for article in batch]
-        existing_count = Article.objects.filter(page_id__in=page_ids).count()
+        existing_ids = set(
+            Article.objects.filter(page_id__in=page_ids).values_list("page_id", flat=True)
+        )
 
-        with transaction.atomic():
-            Article.objects.bulk_create(batch, batch_size=batch_size, ignore_conflicts=True)
+        to_insert: List[Article] = []
+        seen_new_ids: Set[int] = set()
+        skipped_count = 0
 
-        created_count = len(batch) - existing_count
-        skipped_count = existing_count
+        for article in batch:
+            page_id = article.page_id
+            if page_id in existing_ids or page_id in seen_new_ids:
+                skipped_count += 1
+                continue
+            seen_new_ids.add(page_id)
+            to_insert.append(article)
+
+        created_count = 0
+
+        if to_insert:
+            with transaction.atomic():
+                Article.objects.bulk_create(to_insert, batch_size=batch_size)
+            created_count = len(to_insert)
+
         batch.clear()
         return created_count, skipped_count
 
@@ -421,6 +436,7 @@ class Command(BaseCommand):
         shard_queue: JoinableQueue = JoinableQueue()
         result_queue: Queue = Queue(maxsize=5000)
         stop_event = Event()
+        record_batch_size = max(1, min(batch_size, 128))
 
         for shard in shards:
             shard_queue.put(shard)
@@ -451,6 +467,7 @@ class Command(BaseCommand):
 
                     records_emitted = 0
                     finished_normally = True
+                    batch_buffer: list[tuple[int, Optional[str], list[str]]] = []
 
                     for rec in iter_jsonl_bz2(shard):
                         if stop_event.is_set():
@@ -468,8 +485,15 @@ class Command(BaseCommand):
                         text = rec.get("text") or []
                         paragraphs = extract_plain_paragraphs(text)
 
-                        result_queue.put(("record", shard_str, page_id_int, title, paragraphs))
-                        records_emitted += 1
+                        batch_buffer.append((page_id_int, title, paragraphs))
+                        if len(batch_buffer) >= record_batch_size:
+                            result_queue.put(("record_batch", shard_str, batch_buffer))
+                            records_emitted += len(batch_buffer)
+                            batch_buffer = []
+
+                    if batch_buffer:
+                        result_queue.put(("record_batch", shard_str, batch_buffer))
+                        records_emitted += len(batch_buffer)
 
                     completion_type = "shard_done" if finished_normally else "partial_shard"
                     result_queue.put((completion_type, shard_str, records_emitted))
@@ -505,6 +529,7 @@ class Command(BaseCommand):
 
         total_shards = len(shards)
         processed_shards = 0
+        shard_key_cache: Dict[str, str] = {}
 
         def flush_batch() -> None:
             nonlocal created_total, skipped_total
@@ -537,23 +562,26 @@ class Command(BaseCommand):
 
                 kind = message[0]
 
-                if kind == "record":
+                if kind == "record_batch":
                     if limit is not None and processed_records >= limit:
                         continue
-                    _, shard_str, page_id_int, title, paragraphs = message
-                    batch.append(
-                        Article(
-                            page_id=page_id_int,
-                            title=title,
-                            plain_text_paragraphs=paragraphs,
+                    _, shard_str, payload = message
+                    for page_id_int, title, paragraphs in payload:
+                        if limit is not None and processed_records >= limit:
+                            break
+                        batch.append(
+                            Article(
+                                page_id=page_id_int,
+                                title=title,
+                                plain_text_paragraphs=paragraphs,
+                            )
                         )
-                    )
-                    processed_records += 1
-                    if len(batch) >= batch_size:
-                        flush_batch()
+                        processed_records += 1
+                        if len(batch) >= batch_size:
+                            flush_batch()
                 elif kind == "shard_done":
                     _, shard_str, _count = message
-                    shard_key = make_shard_key(shard_str)
+                    shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
                     partial_shards.discard(shard_key)
                     deferred_shards.discard(shard_key)
                     if shard_key not in completed_shards_seen:
@@ -572,7 +600,7 @@ class Command(BaseCommand):
                             )
                 elif kind == "partial_shard":
                     _, shard_str, _count = message
-                    shard_key = make_shard_key(shard_str)
+                    shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
                     partial_shards.add(shard_key)
                     deferred_shards.discard(shard_key)
                     if shard_key in completed_shards_seen:
@@ -580,7 +608,7 @@ class Command(BaseCommand):
                         completed_shards_list = [s for s in completed_shards_list if s != shard_key]
                 elif kind == "shard_deferred":
                     _, shard_str, _count = message
-                    shard_key = make_shard_key(shard_str)
+                    shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
                     deferred_shards.add(shard_key)
                     partial_shards.discard(shard_key)
                     if shard_key in completed_shards_seen:

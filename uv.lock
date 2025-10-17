@@ -171,19 +171,10 @@ dependencies = [
     { name = "tqdm" },
 ]
 
-[package.optional-dependencies]
-perf = [
-    { name = "lxml" },
-    { name = "orjson" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "django", specifier = ">=5.2.7" },
     { name = "lxml", specifier = ">=6.0.2" },
-    { name = "lxml", marker = "extra == 'perf'", specifier = ">=5.2.0" },
     { name = "orjson", specifier = ">=3.11.3" },
-    { name = "orjson", marker = "extra == 'perf'", specifier = ">=3.10.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
 ]
-provides-extras = ["perf"]

@@ -42,6 +42,12 @@ python wiki_search/manage.py load_wiki_dump --workers 6 --batch-size 5000
 
 The command stores progress in `data/.load_checkpoint.json`, tracking completed, partial, and deferred shards so reruns pick up where they stopped.
 
+#### Performance characteristics
+
+- Worker processes stream articles to the coordinator in batches, minimizing inter-process contention and improving throughput on multi-core machines.
+- The coordinator deduplicates page IDs per batch before inserting, allowing large `--batch-size` values without incurring duplicate constraint penalties.
+- Batch inserts run inside transactions sized by `--batch-size`, so tune this flag based on available memory and database write performance.
+
 ## Summarize database
 
 ```bash
