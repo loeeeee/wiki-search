@@ -32,6 +32,8 @@ Always follow the existing code structure.
 
 Always import python module on top of the file.
 
+Always exam the existing code logic first with a global view of the code, and state how the implementation would change the code logic.
+
 ## Documentation
 
 Always document concise implementation details and basic usage in docs-vibe/ with a sequential file name.
