@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from tqdm import tqdm
 from django.db import connection
@@ -97,6 +99,12 @@ class Command(BaseCommand):
 
         # Fast truncate approach
         articles_deleted, redirects_deleted, links_deleted = truncate_all_tables()
+
+        # Delete loading progress checkpoint file
+        checkpoint_path = settings.BASE_DIR.parent / "data" / ".load_checkpoint.json"
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+            self.stdout.write("Deleted loading progress checkpoint file")
 
         # VACUUM to reclaim space (SQLite only)
         try:
