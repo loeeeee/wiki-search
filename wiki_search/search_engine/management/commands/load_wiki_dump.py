@@ -21,8 +21,8 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-from search_engine.ingest.parser import extract_plain_paragraphs
-from search_engine.models import Article
+from search_engine.ingest.parser import extract_plain_paragraphs, extract_internal_links
+from search_engine.models import Article, InternalLink
 
 from tqdm import tqdm
 
@@ -189,17 +189,24 @@ def find_bz2_files(root: Path) -> List[Path]:
 
 
 def iter_jsonl_bz2(file_path: Path) -> Iterator[dict]:
-    with bz2.open(file_path, mode="rb") as raw:
-        for line in raw:
-            if not line.strip():
-                continue
-            try:
-                yield _json.loads(line)
-            except Exception:
-                try:
-                    yield _json.loads(line.decode("utf-8"))
-                except Exception:
+    try:
+        with bz2.open(file_path, mode="rb") as raw:
+            for line in raw:
+                if not line.strip():
                     continue
+                try:
+                    yield _json.loads(line)
+                except Exception:
+                    try:
+                        yield _json.loads(line.decode("utf-8"))
+                    except Exception:
+                        continue
+    except (EOFError, OSError) as e:
+        logger.warning("Skipping corrupted file %s: %s", file_path, e)
+        return
+    except Exception as e:
+        logger.error("Unexpected error reading file %s: %s", file_path, e)
+        return
 
 
 class Command(BaseCommand):
@@ -226,6 +233,7 @@ class Command(BaseCommand):
                 "completed_shards": [],
                 "total_articles_created": 0,
                 "total_articles_skipped": 0,
+                "total_links_created": 0,
                 "last_updated": None,
                 "partial_shards": [],
                 "deferred_shards": [],
@@ -239,6 +247,7 @@ class Command(BaseCommand):
                     "completed_shards": data.get("completed_shards", []),
                     "total_articles_created": data.get("total_articles_created", 0),
                     "total_articles_skipped": data.get("total_articles_skipped", 0),
+                    "total_links_created": data.get("total_links_created", 0),
                     "last_updated": data.get("last_updated"),
                     "partial_shards": data.get("partial_shards", []),
                     "deferred_shards": data.get("deferred_shards", []),
@@ -249,12 +258,13 @@ class Command(BaseCommand):
                 "completed_shards": [],
                 "total_articles_created": 0,
                 "total_articles_skipped": 0,
+                "total_links_created": 0,
                 "last_updated": None,
                 "partial_shards": [],
                 "deferred_shards": [],
             }
 
-    def _save_checkpoint(self, status: ShardStatus, articles_created: int, articles_skipped: int) -> None:
+    def _save_checkpoint(self, status: ShardStatus, articles_created: int, articles_skipped: int, links_created: int = 0) -> None:
         """Save checkpoint data to file."""
         checkpoint_path = self._get_checkpoint_path()
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +273,7 @@ class Command(BaseCommand):
             "completed_shards": status.completed,
             "total_articles_created": articles_created,
             "total_articles_skipped": articles_skipped,
+            "total_links_created": links_created,
             "last_updated": datetime.now().isoformat(),
             "partial_shards": status.partial,
             "deferred_shards": status.deferred,
@@ -329,9 +340,10 @@ class Command(BaseCommand):
         # Show resume info
         if completed_shards_set:
             logger.info("Resuming from checkpoint: %d shards already processed", len(completed_shards_set))
-            logger.info("Previous run created %d articles, skipped %d duplicates",
+            logger.info("Previous run created %d articles, skipped %d duplicates, created %d links",
                        self.checkpoint_data["total_articles_created"],
-                       self.checkpoint_data["total_articles_skipped"])
+                       self.checkpoint_data["total_articles_skipped"],
+                       self.checkpoint_data["total_links_created"])
             if self.checkpoint_data["last_updated"]:
                 logger.info("Last checkpoint: %s", self.checkpoint_data["last_updated"])
         else:
@@ -378,7 +390,7 @@ class Command(BaseCommand):
             deferred=list(self.checkpoint_data.get("deferred_shards", [])),
         )
 
-        created_total, skipped_total = self._run_pipeline(
+        created_total, skipped_total, links_total = self._run_pipeline(
             bz2_files,
             batch_size,
             limit,
@@ -387,7 +399,7 @@ class Command(BaseCommand):
             initial_status,
         )
 
-        self.stdout.write(self.style.SUCCESS(f"Created {created_total} new articles, skipped {skipped_total} duplicates"))
+        self.stdout.write(self.style.SUCCESS(f"Created {created_total} new articles, skipped {skipped_total} duplicates, created {links_total} links"))
 
     def _flush_batch(self, batch: List[Article], batch_size: int) -> Tuple[int, int]:
         """Flush batch to database and return (created_count, skipped_count)."""
@@ -420,6 +432,29 @@ class Command(BaseCommand):
 
         batch.clear()
         return created_count, skipped_count
+
+    def _flush_link_batch(self, link_batch: List[InternalLink], batch_size: int) -> int:
+        """Flush link batch to database and return created_count."""
+        if not link_batch:
+            return 0
+
+        created_count = 0
+        try:
+            with transaction.atomic():
+                InternalLink.objects.bulk_create(link_batch, batch_size=batch_size, ignore_conflicts=True)
+            created_count = len(link_batch)
+        except Exception as exc:
+            logger.error("Failed to bulk create links: %s", exc)
+            # Try individual inserts as fallback
+            for link in link_batch:
+                try:
+                    link.save()
+                    created_count += 1
+                except Exception:
+                    continue
+
+        link_batch.clear()
+        return created_count
 
     def _run_pipeline(
         self,
@@ -467,33 +502,38 @@ class Command(BaseCommand):
 
                     records_emitted = 0
                     finished_normally = True
-                    batch_buffer: list[tuple[int, Optional[str], list[str]]] = []
+                    batch_buffer: list[tuple[int, Optional[str], list[str], list[tuple[str, str]]]] = []
 
-                    for rec in iter_jsonl_bz2(shard):
-                        if stop_event.is_set():
-                            finished_normally = False
-                            break
+                    try:
+                        for rec in iter_jsonl_bz2(shard):
+                            if stop_event.is_set():
+                                finished_normally = False
+                                break
 
-                        page_id_raw = rec.get("id")
-                        if page_id_raw is None:
-                            continue
-                        try:
-                            page_id_int = int(page_id_raw)
-                        except Exception:
-                            continue
-                        title = rec.get("title")
-                        text = rec.get("text") or []
-                        paragraphs = extract_plain_paragraphs(text)
+                            page_id_raw = rec.get("id")
+                            if page_id_raw is None:
+                                continue
+                            try:
+                                page_id_int = int(page_id_raw)
+                            except Exception:
+                                continue
+                            title = rec.get("title")
+                            text = rec.get("text") or []
+                            paragraphs = extract_plain_paragraphs(text)
+                            links = extract_internal_links(text)
 
-                        batch_buffer.append((page_id_int, title, paragraphs))
-                        if len(batch_buffer) >= record_batch_size:
+                            batch_buffer.append((page_id_int, title, paragraphs, links))
+                            if len(batch_buffer) >= record_batch_size:
+                                result_queue.put(("record_batch", shard_str, batch_buffer))
+                                records_emitted += len(batch_buffer)
+                                batch_buffer = []
+
+                        if batch_buffer:
                             result_queue.put(("record_batch", shard_str, batch_buffer))
                             records_emitted += len(batch_buffer)
-                            batch_buffer = []
-
-                    if batch_buffer:
-                        result_queue.put(("record_batch", shard_str, batch_buffer))
-                        records_emitted += len(batch_buffer)
+                    except Exception as e:
+                        logger.error("Error processing shard %s: %s", shard, e)
+                        finished_normally = False
 
                     completion_type = "shard_done" if finished_normally else "partial_shard"
                     result_queue.put((completion_type, shard_str, records_emitted))
@@ -512,7 +552,9 @@ class Command(BaseCommand):
 
         created_total = 0
         skipped_total = 0
+        links_total = 0
         batch: List[Article] = []
+        link_batch: List[Tuple[int, str, str]] = []  # (page_id, target_title, anchor_text)
         processed_records = 0
 
         completed_shards_list = list(initial_status.completed)
@@ -532,11 +574,37 @@ class Command(BaseCommand):
         shard_key_cache: Dict[str, str] = {}
 
         def flush_batch() -> None:
-            nonlocal created_total, skipped_total
+            nonlocal created_total, skipped_total, links_total
             if batch:
                 created, skipped = self._flush_batch(batch, batch_size)
                 created_total += created
                 skipped_total += skipped
+                
+                # Process link batch with article IDs
+                if link_batch:
+                    # Get the page_ids that were just created
+                    page_ids = [article.page_id for article in batch]
+                    # Query for the created articles to get their IDs
+                    created_articles = Article.objects.filter(page_id__in=page_ids)
+                    page_id_to_article_id = {article.page_id: article.id for article in created_articles}
+                    
+                    # Create InternalLink objects with correct from_article_id
+                    internal_links = []
+                    for page_id, target_title, anchor_text in link_batch:
+                        if page_id in page_id_to_article_id:
+                            internal_links.append(
+                                InternalLink(
+                                    from_article_id=page_id_to_article_id[page_id],
+                                    to_title=target_title,
+                                    anchor_text=anchor_text,
+                                )
+                            )
+                    
+                    if internal_links:
+                        links_created = self._flush_link_batch(internal_links, batch_size)
+                        links_total += links_created
+                    
+                    link_batch.clear()
 
         pbar = tqdm(
             total=total_shards,
@@ -566,7 +634,7 @@ class Command(BaseCommand):
                     if limit is not None and processed_records >= limit:
                         continue
                     _, shard_str, payload = message
-                    for page_id_int, title, paragraphs in payload:
+                    for page_id_int, title, paragraphs, links in payload:
                         if limit is not None and processed_records >= limit:
                             break
                         batch.append(
@@ -576,6 +644,11 @@ class Command(BaseCommand):
                                 plain_text_paragraphs=paragraphs,
                             )
                         )
+                        
+                        # Add links to link batch (will be processed after articles are created)
+                        for target_title, anchor_text in links:
+                            link_batch.append((page_id_int, target_title, anchor_text))
+                        
                         processed_records += 1
                         if len(batch) >= batch_size:
                             flush_batch()
@@ -597,6 +670,7 @@ class Command(BaseCommand):
                                 ),
                                 created_total,
                                 skipped_total,
+                                links_total,
                             )
                 elif kind == "partial_shard":
                     _, shard_str, _count = message
@@ -636,6 +710,7 @@ class Command(BaseCommand):
             ),
             created_total,
             skipped_total,
+            links_total,
         )
 
         stop_event.set()
@@ -646,4 +721,4 @@ class Command(BaseCommand):
             if proc.is_alive():
                 proc.terminate()
 
-        return created_total, skipped_total
+        return created_total, skipped_total, links_total
