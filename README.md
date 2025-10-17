@@ -37,6 +37,7 @@ python wiki_search/manage.py load_wiki_dump --workers 6 --batch-size 5000
 | `--limit N` | Stop after processing N articles (useful for smoke tests). |
 | `--clear-checkpoint` | Delete the checkpoint file and start from scratch. |
 | `--force-decompress` | Re-extract the raw archive even if processed data exists. |
+| `--skip-decompress` | Skip decompression entirely and use existing decompressed data. |
 | `--no-fast-extract` | Disable the system tar + lbzip2 path and use Python extraction. |
 
 The command stores progress in `data/.load_checkpoint.json`, tracking completed, partial, and deferred shards so reruns pick up where they stopped.

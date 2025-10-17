@@ -136,10 +136,17 @@ def _choose_extracted_dir(target_dir: Path, archive: Path) -> Path:
 
 
 def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False, prefer_fast: bool = False) -> Path:
+    # First, check if there's already a decompressed folder
+    if not force:
+        candidate = _choose_extracted_dir(target_dir, archive)
+        if candidate.exists() and find_bz2_files(candidate):
+            logger.info("Found existing decompressed directory: %s", candidate)
+            return candidate
+
     if target_dir.exists() and not force:
         logger.info("Processed directory exists: %s", target_dir)
         return target_dir
-    if not archive.exists():
+    if not archive.qexists():
         raise CommandError(f"Archive not found: {archive}")
 
     target_dir.parent.mkdir(parents=True, exist_ok=True)

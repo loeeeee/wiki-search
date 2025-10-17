@@ -21,7 +21,7 @@ Options:
 - `--workers N` number of parser workers (default: CPU-1)
 - `--limit N` stop after N records
 - `--force-decompress` re-extract even if folder exists
-- `--skip-decompress` skip extraction step
+- `--skip-decompress` skip extraction step entirely and use existing decompressed data
 - `--no-fast-extract` disable system tar fast extractor
 
 ### Performance
@@ -37,5 +37,3 @@ To summarize current DB contents:
 ```bash
 python wiki_search/manage.py db_summary
 ```
-
-
