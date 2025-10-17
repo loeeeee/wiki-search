@@ -23,7 +23,7 @@ Based on sampling, the dump contains approximately **5,357,970 articles** across
 
 ## Load data
 
-The loader supports resuming from checkpoints, graceful shutdown, and configurable parallelism.
+The loader supports resuming from checkpoints, graceful shutdown, configurable parallelism, and automatic internal link extraction.
 
 ```bash
 # Typical ingest run with six workers
@@ -40,13 +40,14 @@ python wiki_search/manage.py load_wiki_dump --workers 6 --batch-size 5000
 | `--skip-decompress` | Skip decompression entirely and use existing decompressed data. |
 | `--no-fast-extract` | Disable the system tar + lbzip2 path and use Python extraction. |
 
-The command stores progress in `data/.load_checkpoint.json`, tracking completed, partial, and deferred shards so reruns pick up where they stopped.
+The command stores progress in `data/.load_checkpoint.json`, tracking completed, partial, and deferred shards so reruns pick up where they stopped. It also extracts and stores internal Wikipedia links during the loading process.
 
 #### Performance characteristics
 
 - Worker processes stream articles to the coordinator in batches, minimizing inter-process contention and improving throughput on multi-core machines.
 - The coordinator deduplicates page IDs per batch before inserting, allowing large `--batch-size` values without incurring duplicate constraint penalties.
 - Batch inserts run inside transactions sized by `--batch-size`, so tune this flag based on available memory and database write performance.
+- Internal links are extracted from article HTML and stored in batches for optimal performance.
 
 ## Summarize database
 
