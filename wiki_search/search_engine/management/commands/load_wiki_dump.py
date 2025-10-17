@@ -415,7 +415,7 @@ class Command(BaseCommand):
 
         if to_insert:
             with transaction.atomic():
-                Article.objects.bulk_create(to_insert, batch_size=batch_size)
+                Article.objects.bulk_create(to_insert, batch_size=batch_size, ignore_conflicts=True)
             created_count = len(to_insert)
 
         batch.clear()
