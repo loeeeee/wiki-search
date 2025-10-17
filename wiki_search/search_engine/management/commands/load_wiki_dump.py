@@ -24,38 +24,7 @@ from django.db import transaction
 from search_engine.ingest.parser import extract_plain_paragraphs
 from search_engine.models import Article
 
-try:
-    from tqdm import tqdm  # type: ignore
-    _tqdm_available = True
-except Exception:  # pragma: no cover
-    _tqdm_available = False
-
-    class _DummyTqdm:
-        def __init__(self, iterable=None, **kwargs):
-            self.iterable = iterable
-
-        def __iter__(self):
-            if self.iterable is None:
-                return iter([])
-            return iter(self.iterable)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def update(self, _=1):
-            return None
-
-        def close(self):
-            return None
-
-    def tqdm(iterable=None, **kwargs):  # type: ignore
-        wrapper = _DummyTqdm(iterable, **kwargs)
-        if iterable is None:
-            return wrapper
-        return wrapper
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
