@@ -46,11 +46,11 @@ def find_bz2_files(root: Path) -> List[Path]:
 def iter_jsonl_bz2(file_path: Path) -> Iterator[dict]:
     with bz2.open(file_path, mode="rt", encoding="utf-8", errors="strict") as f:
         for line_number, line in enumerate(f, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    yield _json.loads(line)
-            except Exception as exc:  # Strict: surface the error with context
+            if not line.strip():
+                continue
+            try:
+                yield _json.loads(line)
+            except Exception as exc:
                 logger.error("Invalid JSON at %s:%d: %s", file_path, line_number, exc)
                 raise
 
@@ -70,28 +70,24 @@ class Command(BaseCommand):
     def handle(self, *args, **opts):
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-        # 1) Always clean the database at startup
+        # Always clean the DB first
         logger.info("Cleaning database tables before ingestion")
         call_command("clean_db", yes=True, no_progress=True, drop_recreate=True)
 
-        # 2) Locate shards (pre-decompressed)
         processed_dir = Path(opts["processed_dir"]).expanduser()
         if not processed_dir.exists():
             raise CommandError(f"Processed directory not found: {processed_dir}")
 
-        all_shards = find_bz2_files(processed_dir)
-        if not all_shards:
+        shards = find_bz2_files(processed_dir)
+        if not shards:
             raise CommandError(f"No wiki_*.bz2 files found under {processed_dir}")
 
         batch_size: int = int(opts["batch_size"]) or 5000
         workers: int = max(1, int(opts["workers"]))
         limit: Optional[int] = opts.get("limit")
 
-        logger.info("Found %d shards; starting %d workers", len(all_shards), workers)
-
-        created_total, skipped_total, links_total = self._run_pipeline(
-            all_shards, batch_size, limit, workers
-        )
+        logger.info("Found %d shards; starting %d workers", len(shards), workers)
+        created_total, skipped_total, links_total = self._run_pipeline(shards, batch_size, limit, workers)
 
         logger.info(
             "Ingest complete: articles created=%d, duplicates skipped(in-batch)=%d, links created=%d",
@@ -100,7 +96,6 @@ class Command(BaseCommand):
             links_total,
         )
 
-        # 3) Resolve links (both directions) in-place
         updated_from = self._resolve_from_article(batch_size)
         updated_to = self._resolve_to_article(batch_size)
 
@@ -111,9 +106,6 @@ class Command(BaseCommand):
             )
         )
 
-    # -------------------------
-    # Ingestion pipeline
-    # -------------------------
     def _run_pipeline(
         self,
         shards: List[Path],
@@ -123,8 +115,6 @@ class Command(BaseCommand):
     ) -> Tuple[int, int, int]:
         shard_queue: JoinableQueue = JoinableQueue()
         result_queue: Queue = Queue(maxsize=0)
-
-        # Smaller emission size from workers to reduce IPC latency and memory
         record_batch_size = max(1, min(batch_size, 2048))
 
         for shard in shards:
@@ -133,57 +123,57 @@ class Command(BaseCommand):
             shard_queue.put(None)
 
         def worker_loop(worker_id: int) -> None:
-                while True:
-                    shard = shard_queue.get()
-                    if shard is None:
-                        shard_queue.task_done()
-                        break
+            while True:
+                shard = shard_queue.get()
+                if shard is None:
+                    shard_queue.task_done()
+                    break
 
-                    shard_str = str(shard)
-                        records_emitted = 0
+                shard_str = str(shard)
+                records_emitted = 0
                 batch_buffer: List[Tuple[int, Optional[str], List[str]]] = []
                 link_buffer: List[Tuple[int, str, str]] = []
                 link_batch_size = max(100, record_batch_size * 10)
-                            
-                            for rec in iter_jsonl_bz2(shard):
-                                page_id_raw = rec.get("id")
-                                if page_id_raw is None:
+
+                for rec in iter_jsonl_bz2(shard):
+                    page_id_raw = rec.get("id")
+                    if page_id_raw is None:
                         logger.error("Record missing 'id' in %s", shard_str)
                         raise ValueError(f"Missing id in record from {shard_str}")
-                                try:
-                                    page_id_int = int(page_id_raw)
+                    try:
+                        page_id_int = int(page_id_raw)
                     except Exception as exc:
                         logger.error("Non-integer id in %s: %r (%s)", shard_str, page_id_raw, exc)
                         raise
 
-                                title = rec.get("title")
-                                text = rec.get("text") or []
-                                paragraphs = extract_plain_paragraphs(text)
-                                links = extract_internal_links(text)
+                    title = rec.get("title")
+                    text = rec.get("text") or []
+                    paragraphs = extract_plain_paragraphs(text)
+                    links = extract_internal_links(text)
 
-                                batch_buffer.append((page_id_int, title, paragraphs))
-                                for target_title, anchor_text in links:
-                                    link_buffer.append((page_id_int, target_title, anchor_text))
-                                
-                                if len(batch_buffer) >= record_batch_size:
-                                    result_queue.put(("record_batch", shard_str, batch_buffer))
-                                    records_emitted += len(batch_buffer)
-                                    batch_buffer = []
-                                
-                                if len(link_buffer) >= link_batch_size:
-                                    result_queue.put(("link_batch", shard_str, link_buffer))
-                                    link_buffer = []
+                    batch_buffer.append((page_id_int, title, paragraphs))
+                    for target_title, anchor_text in links:
+                        link_buffer.append((page_id_int, target_title, anchor_text))
+
+                    if len(batch_buffer) >= record_batch_size:
+                        result_queue.put(("record_batch", shard_str, batch_buffer))
+                        records_emitted += len(batch_buffer)
+                        batch_buffer = []
+
+                    if len(link_buffer) >= link_batch_size:
+                        result_queue.put(("link_batch", shard_str, link_buffer))
+                        link_buffer = []
 
                 if batch_buffer:
-                                result_queue.put(("record_batch", shard_str, batch_buffer))
-                                records_emitted += len(batch_buffer)
+                    result_queue.put(("record_batch", shard_str, batch_buffer))
+                    records_emitted += len(batch_buffer)
                 if link_buffer:
-                                result_queue.put(("link_batch", shard_str, link_buffer))
+                    result_queue.put(("link_batch", shard_str, link_buffer))
 
                 result_queue.put(("shard_done", shard_str, records_emitted))
-                        shard_queue.task_done()
+                shard_queue.task_done()
 
-                result_queue.put(("worker_done", worker_id))
+            result_queue.put(("worker_done", worker_id))
 
         procs = [Process(target=worker_loop, args=(idx,)) for idx in range(workers)]
         for proc in procs:
@@ -229,7 +219,6 @@ class Command(BaseCommand):
 
         try:
             while remaining_workers > 0:
-                # Periodically detect worker crashes to fail-fast
                 for proc in procs:
                     if proc.exitcode is not None and proc.exitcode != 0:
                         raise CommandError(f"Worker process {proc.pid} exited with code {proc.exitcode}")
@@ -272,7 +261,7 @@ class Command(BaseCommand):
                         flush_links()
 
                 elif kind == "shard_done":
-                        pbar.update(1)
+                    pbar.update(1)
                 elif kind == "worker_done":
                     remaining_workers -= 1
                 else:
@@ -285,9 +274,6 @@ class Command(BaseCommand):
 
         return created_total, skipped_total, links_total
 
-    # -------------------------
-    # Link resolution
-    # -------------------------
     def _resolve_from_article(self, batch_size: int) -> int:
         unresolved_qs = InternalLink.objects.filter(from_article__isnull=True, from_page_id__isnull=False)
         unresolved_count = unresolved_qs.count()
@@ -297,7 +283,6 @@ class Command(BaseCommand):
 
         logger.info("Resolving from_article for %d links", unresolved_count)
 
-        # Build mapping page_id -> article.id
         page_ids = list(
             unresolved_qs.values_list("from_page_id", flat=True).distinct()
         )
@@ -364,3 +349,5 @@ class Command(BaseCommand):
 
         logger.info("Resolved to_article for %d links", updated_total)
         return updated_total
+
+
