@@ -9,6 +9,7 @@ import signal
 import sys
 import subprocess
 import tarfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -323,6 +324,16 @@ class Command(BaseCommand):
             action="store_true",
             help="Clear checkpoint and start fresh",
         )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help="Enable performance profiling and write a JSON report",
+        )
+        parser.add_argument(
+            "--profile-output",
+            type=str,
+            help="Path to write profiling JSON (default under data/profiles)",
+        )
 
     def handle(self, *args, **opts):
         logging.basicConfig(level=logging.INFO)
@@ -350,6 +361,17 @@ class Command(BaseCommand):
         fast_extract = not bool(opts["no_fast_extract"])  # default to fast extract
         workers: int = max(1, int(opts["workers"]))
         clear_checkpoint = bool(opts["clear_checkpoint"])
+        profile_enabled: bool = bool(opts.get("profile"))
+
+        profile_output_path: Optional[Path] = None
+        if profile_enabled:
+            if opts.get("profile_output"):
+                profile_output_path = Path(str(opts["profile_output"]).strip()).expanduser()
+            else:
+                base = settings.BASE_DIR.parent
+                prof_dir = base / "data" / "profiles"
+                prof_dir.mkdir(parents=True, exist_ok=True)
+                profile_output_path = prof_dir / f"load_wiki_dump_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
         # Handle checkpoint clearing
         if clear_checkpoint:
@@ -422,6 +444,8 @@ class Command(BaseCommand):
             completed_shards_set,
             initial_status,
             worker_batch_size,
+            profile_enabled,
+            profile_output_path,
         )
 
         self.stdout.write(self.style.SUCCESS(f"Created {created_total} new articles, skipped {skipped_total} duplicates, created {links_total} links"))
@@ -485,6 +509,8 @@ class Command(BaseCommand):
         completed_shards_set: Set[str],
         initial_status: ShardStatus,
         worker_batch_size: int,
+        profile_enabled: bool,
+        profile_output_path: Optional[Path],
     ) -> Tuple[int, int, int]:
         """Run a multi-process pipeline with explicit worker signalling and graceful shutdown."""
         base_dir = shards[0].parent.parent if shards else None
@@ -598,6 +624,26 @@ class Command(BaseCommand):
         processed_records = 0
         link_accumulator: List[InternalLink] = []
         LINK_FLUSH_THRESHOLD = max(50_000, batch_size * 20)
+        # Profiling accumulators
+        profile_data: Dict[str, object] = {}
+        if profile_enabled:
+            profile_data = {
+                "start_time": time.time(),
+                "workers": workers,
+                "batch_size": batch_size,
+                "worker_batch_size": worker_batch_size,
+                "shards_total": len(shards),
+                "stats": {
+                    "queue_wait_s": 0.0,
+                    "queue_polls": 0,
+                    "flush_article_s": 0.0,
+                    "flush_article_calls": 0,
+                    "flush_links_s": 0.0,
+                    "flush_links_calls": 0,
+                    "shard_done": 0,
+                    "partial_shard": 0,
+                },
+            }
 
         completed_shards_list = list(initial_status.completed)
         completed_shards_seen: Set[str] = set(completed_shards_list)
@@ -640,9 +686,16 @@ class Command(BaseCommand):
                     stop_event.set()
 
                 try:
+                    q_t0 = time.time() if profile_enabled else 0.0
                     message = result_queue.get(timeout=0.5)
                 except Empty:
                     continue
+                finally:
+                    if profile_enabled:
+                        stats = profile_data["stats"]  # type: ignore[index]
+                        stats["queue_polls"] = int(stats.get("queue_polls", 0)) + 1
+                        if 'q_t0' in locals():
+                            stats["queue_wait_s"] = float(stats.get("queue_wait_s", 0.0)) + (time.time() - q_t0)
 
                 kind = message[0]
 
@@ -662,7 +715,12 @@ class Command(BaseCommand):
                         )
                         processed_records += 1
                         if len(batch) >= batch_size:
+                            t0 = time.time() if profile_enabled else 0.0
                             flush_batch()
+                            if profile_enabled:
+                                stats = profile_data["stats"]  # type: ignore[index]
+                                stats["flush_article_calls"] = int(stats.get("flush_article_calls", 0)) + 1
+                                stats["flush_article_s"] = float(stats.get("flush_article_s", 0.0)) + (time.time() - t0)
                 elif kind == "link_batch":
                     _, shard_str, link_payload = message
                     for page_id, target_title, anchor_text in link_payload:
@@ -674,7 +732,12 @@ class Command(BaseCommand):
                             )
                         )
                     if len(link_accumulator) >= LINK_FLUSH_THRESHOLD:
+                        t0 = time.time() if profile_enabled else 0.0
                         links_total += self._flush_link_batch(link_accumulator, batch_size)
+                        if profile_enabled:
+                            stats = profile_data["stats"]  # type: ignore[index]
+                            stats["flush_links_calls"] = int(stats.get("flush_links_calls", 0)) + 1
+                            stats["flush_links_s"] = float(stats.get("flush_links_s", 0.0)) + (time.time() - t0)
                 elif kind == "shard_done":
                     _, shard_str, _count = message
                     shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
@@ -698,7 +761,12 @@ class Command(BaseCommand):
                             )
                         # Opportunistically flush accumulated links at shard boundaries
                         if link_accumulator and len(link_accumulator) >= LINK_FLUSH_THRESHOLD:
+                            t0 = time.time() if profile_enabled else 0.0
                             links_total += self._flush_link_batch(link_accumulator, batch_size)
+                            if profile_enabled:
+                                stats = profile_data["stats"]  # type: ignore[index]
+                                stats["flush_links_calls"] = int(stats.get("flush_links_calls", 0)) + 1
+                                stats["flush_links_s"] = float(stats.get("flush_links_s", 0.0)) + (time.time() - t0)
                 elif kind == "partial_shard":
                     _, shard_str, _count = message
                     shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
@@ -722,9 +790,20 @@ class Command(BaseCommand):
         finally:
             pbar.close()
 
+        t0_flush = time.time() if profile_enabled else 0.0
         flush_batch()
+        if profile_enabled:
+            stats = profile_data["stats"]  # type: ignore[index]
+            stats["flush_article_calls"] = int(stats.get("flush_article_calls", 0)) + 1
+            stats["flush_article_s"] = float(stats.get("flush_article_s", 0.0)) + (time.time() - t0_flush)
+
         if link_accumulator:
+            t0_links = time.time() if profile_enabled else 0.0
             links_total += self._flush_link_batch(link_accumulator, batch_size)
+            if profile_enabled:
+                stats = profile_data["stats"]  # type: ignore[index]
+                stats["flush_links_calls"] = int(stats.get("flush_links_calls", 0)) + 1
+                stats["flush_links_s"] = float(stats.get("flush_links_s", 0.0)) + (time.time() - t0_links)
 
         if partial_shards:
             logger.info("Partial shards detected (will remain pending): %s", sorted(list(partial_shards)))
@@ -749,5 +828,19 @@ class Command(BaseCommand):
             proc.join(timeout=5)
             if proc.is_alive():
                 proc.terminate()
+
+        if profile_enabled:
+            try:
+                profile_data["end_time"] = time.time()
+                profile_data["articles_created"] = created_total
+                profile_data["articles_skipped"] = skipped_total
+                profile_data["links_created"] = links_total
+                if profile_output_path:
+                    profile_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(profile_output_path, "w") as f:
+                        json.dump(profile_data, f, indent=2)
+                    logger.info("Wrote profile report to %s", profile_output_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to write profile report: %s", exc)
 
         return created_total, skipped_total, links_total
