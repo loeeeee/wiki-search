@@ -1,28 +1,17 @@
 from __future__ import annotations
 
-import atexit
 import bz2
-import json
-import os
 import logging
-import shutil
-import signal
-import sys
-import subprocess
-import tarfile
-import threading
-import time
-from dataclasses import dataclass
-from datetime import datetime
+import os
 from pathlib import Path
 from queue import Empty
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
-from multiprocessing import Event, JoinableQueue, Process, Queue
+from multiprocessing import JoinableQueue, Process, Queue
 
 from django.conf import settings
+from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError
-from django.db import connection
 from django.db import transaction
 
 from search_engine.ingest.parser import extract_plain_paragraphs, extract_internal_links
@@ -32,851 +21,233 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class ShardStatus:
-    completed: List[str]
-    partial: List[str]
-    deferred: List[str]
-
 try:  # Prefer orjson if available
     import orjson as _json  # type: ignore
 except Exception:  # pragma: no cover
-    logger.warning("orjson not found, using json instead")
     import json as _json  # type: ignore
 
-def _default_paths() -> tuple[Path, Path]:
+
+def _default_processed_dir() -> Path:
     base = settings.BASE_DIR.parent
-    archive = base / "data" / "raw" / "enwiki-20171001-pages-meta-current-withlinks-processed.tar.bz2"
-    processed = base / "data" / "processed" / "enwiki-20171001-pages-meta-current-withlinks"
-    return archive, processed
-
-
-def _fast_extract_with_system_tar(archive: Path, target_dir: Path, command_instance=None) -> bool:
-    """Try to extract using system tar with parallel bzip2 (lbzip2/pbzip2).
-
-    Returns True if extraction was performed, False if not available.
-    """
-    tar_path = shutil.which("tar")
-    if not tar_path:
-        return False
-    # Prefer lbzip2, then pbzip2
-    for prog in ("lbzip2", "pbzip2"):
-        if shutil.which(prog):
-            try:
-                target_dir.parent.mkdir(parents=True, exist_ok=True)
-                cmd = [tar_path, "-I", prog, "-xf", str(archive), "-C", str(target_dir.parent)]
-                logger.info("Using fast extractor: %s", " ".join(cmd))
-                
-                # Use Popen for better signal handling
-                def set_process_group():
-                    """Set process group for subprocess to enable proper signal propagation."""
-                    os.setpgrp()
-                
-                process = subprocess.Popen(
-                    cmd,
-                    preexec_fn=set_process_group if os.name != 'nt' else None,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                
-                # Store process reference for cleanup if command instance provided
-                if command_instance:
-                    command_instance.extraction_subprocess = process
-                
-                try:
-                    stdout, stderr = process.communicate(timeout=3600)  # 1 hour timeout
-                    if process.returncode != 0:
-                        logger.warning("Fast extraction failed with %s (exit code %d): %s", 
-                                     prog, process.returncode, stderr.decode('utf-8', errors='ignore'))
-                        return False
-                    return True
-                except subprocess.TimeoutExpired:
-                    logger.warning("Fast extraction timed out with %s", prog)
-                    process.kill()
-                    process.wait()
-                    return False
-                finally:
-                    if command_instance:
-                        command_instance.extraction_subprocess = None
-                        
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Fast extraction failed with %s: %s. Falling back.", prog, exc)
-                return False
-    return False
-
-
-def _detect_top_dir_name(archive: Path) -> Optional[str]:
-    """Best-effort: read a few headers to infer the top-level directory name."""
-    try:
-        with tarfile.open(archive, mode="r:bz2") as tf:
-            for _ in range(32):  # read up to 32 members to find a name
-                member = tf.next()
-                if member is None:
-                    break
-                if member.name:
-                    return member.name.split("/")[0]
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Failed to detect top dir name: %s", exc)
-    return None
-
-
-def _choose_extracted_dir(target_dir: Path, archive: Path) -> Path:
-    """Resolve the actual extracted directory, falling back to heuristics."""
-    if target_dir.exists():
-        return target_dir
-    # Try by reading top dir name from archive
-    name = _detect_top_dir_name(archive)
-    if name:
-        candidate = target_dir.parent / name
-        if candidate.exists():
-            return candidate
-    # Fallback: pick the only directory matching prefix
-    prefix = "enwiki-20171001-pages-meta-current-withlinks"
-    for child in target_dir.parent.iterdir():
-        if child.is_dir() and child.name.startswith(prefix):
-            return child
-    return target_dir
-
-
-def ensure_decompressed(archive: Path, target_dir: Path, force: bool = False, prefer_fast: bool = False, command_instance=None) -> Path:
-    # First, check if there's already a decompressed folder
-    if not force:
-        candidate = _choose_extracted_dir(target_dir, archive)
-        if candidate.exists() and find_bz2_files(candidate):
-            logger.info("Found existing decompressed directory: %s", candidate)
-            return candidate
-
-    if target_dir.exists() and not force:
-        logger.info("Processed directory exists: %s", target_dir)
-        return target_dir
-    if not archive.exists():
-        raise CommandError(f"Archive not found: {archive}")
-
-    target_dir.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Decompressing %s -> %s", archive, target_dir.parent)
-
-    # Attempt fast multi-core extraction via system tar if requested/available
-    if prefer_fast:
-        used_fast = _fast_extract_with_system_tar(archive, target_dir, command_instance)
-        if used_fast:
-            resolved = _choose_extracted_dir(target_dir, archive)
-            if not resolved.exists():
-                logger.warning("Expected processed directory not found after fast extraction: %s", resolved)
-            return resolved
-
-    with tarfile.open(archive, mode="r:bz2") as tf:
-        # Basic disk space check: require at least 2x archive size free
-        try:
-            free_bytes = shutil.disk_usage(str(target_dir.parent)).free
-            archive_size = archive.stat().st_size
-            if free_bytes < 2 * archive_size:
-                logger.warning(
-                    "Low free space: %s bytes free, archive %s bytes. Extraction may fail.",
-                    free_bytes,
-                    archive_size,
-                )
-            else:
-                logger.info("Enough free space: %s bytes free, archive %s bytes.", free_bytes, archive_size)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Disk space check failed: %s", exc)
-
-        # Stream extraction to avoid loading all members (getmembers) which is
-        # very slow for large bz2 archives
-        extracted_any = False
-        for member in tqdm(
-            tf,
-            desc="Extracting",
-            unit="files",
-            leave=True,
-            dynamic_ncols=True,
-            ascii=True,
-            mininterval=0.5,
-            file=sys.stdout,
-        ):
-            tf.extract(member, path=target_dir.parent)
-            extracted_any = True
-        if not extracted_any:
-            logger.warning("No members extracted from archive: %s", archive)
-        resolved = _choose_extracted_dir(target_dir, archive)
-        if not resolved.exists():
-            logger.warning("Expected processed directory not found after extraction: %s", resolved)
-        return resolved
+    return base / "data" / "processed" / "enwiki-20171001-pages-meta-current-withlinks-processed"
 
 
 def find_bz2_files(root: Path) -> List[Path]:
     results: List[Path] = []
     if not root.exists():
         return results
-    # If the expected root doesn't contain shards, try a common alternative
-    # folder name ending with "-processed" (as seen in some dumps)
-    if not any(root.glob("*/wiki_*.bz2")):
-        alt = root.parent / f"{root.name}-processed"
-        if alt.exists():
-            root = alt
-
     for sub in sorted(root.iterdir()):
         if not sub.is_dir():
             continue
-        for p in sorted(sub.glob("wiki_*.bz2")):
-            results.append(p)
+        results.extend(sorted(sub.glob("wiki_*.bz2")))
     return results
 
 
 def iter_jsonl_bz2(file_path: Path) -> Iterator[dict]:
-    try:
-        with bz2.open(file_path, mode="rb") as raw:
-            for line in raw:
+    with bz2.open(file_path, mode="rt", encoding="utf-8", errors="strict") as f:
+        for line_number, line in enumerate(f, start=1):
                 if not line.strip():
                     continue
                 try:
                     yield _json.loads(line)
-                except Exception:
-                    try:
-                        yield _json.loads(line.decode("utf-8"))
-                    except Exception:
-                        continue
-    except (EOFError, OSError) as e:
-        logger.warning("Skipping corrupted file %s: %s", file_path, e)
-        return
-    except Exception as e:
-        logger.error("Unexpected error reading file %s: %s", file_path, e)
-        return
+            except Exception as exc:  # Strict: surface the error with context
+                logger.error("Invalid JSON at %s:%d: %s", file_path, line_number, exc)
+                raise
 
 
 class Command(BaseCommand):
-    help = "Load Wikipedia dump into SQLite"
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.checkpoint_file: Optional[Path] = None
-        self.checkpoint_data: Dict = {}
-        self.shutdown_requested = False
-        self.extraction_subprocess: Optional[subprocess.Popen] = None
-        self.worker_processes: List[Process] = []
-        self.signal_count = 0
-        self.shutdown_lock = threading.Lock()
-        self._cleanup_registered = False
-
-    def _get_checkpoint_path(self) -> Path:
-        """Get the checkpoint file path."""
-        if self.checkpoint_file is None:
-            base = settings.BASE_DIR.parent
-            self.checkpoint_file = base / "data" / ".load_checkpoint.json"
-        return self.checkpoint_file
-
-    def _load_checkpoint(self) -> Dict:
-        """Load checkpoint data from file."""
-        checkpoint_path = self._get_checkpoint_path()
-        if not checkpoint_path.exists():
-            return {
-                "completed_shards": [],
-                "total_articles_created": 0,
-                "total_articles_skipped": 0,
-                "total_links_created": 0,
-                "last_updated": None,
-                "partial_shards": [],
-                "deferred_shards": [],
-            }
-
-        try:
-            with open(checkpoint_path, 'r') as f:
-                data = json.load(f)
-                # Ensure all required keys exist
-                return {
-                    "completed_shards": data.get("completed_shards", []),
-                    "total_articles_created": data.get("total_articles_created", 0),
-                    "total_articles_skipped": data.get("total_articles_skipped", 0),
-                    "total_links_created": data.get("total_links_created", 0),
-                    "last_updated": data.get("last_updated"),
-                    "partial_shards": data.get("partial_shards", []),
-                    "deferred_shards": data.get("deferred_shards", []),
-                }
-        except Exception as exc:
-            logger.warning("Failed to load checkpoint: %s. Starting fresh.", exc)
-            return {
-                "completed_shards": [],
-                "total_articles_created": 0,
-                "total_articles_skipped": 0,
-                "total_links_created": 0,
-                "last_updated": None,
-                "partial_shards": [],
-                "deferred_shards": [],
-            }
-
-    def _save_checkpoint(self, status: ShardStatus, articles_created: int, articles_skipped: int, links_created: int = 0) -> None:
-        """Save checkpoint data to file."""
-        checkpoint_path = self._get_checkpoint_path()
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self.checkpoint_data.update({
-            "completed_shards": status.completed,
-            "total_articles_created": articles_created,
-            "total_articles_skipped": articles_skipped,
-            "total_links_created": links_created,
-            "last_updated": datetime.now().isoformat(),
-            "partial_shards": status.partial,
-            "deferred_shards": status.deferred,
-        })
-
-        try:
-            with open(checkpoint_path, 'w') as f:
-                json.dump(self.checkpoint_data, f, indent=2)
-        except Exception as exc:
-            logger.error("Failed to save checkpoint: %s", exc)
-
-    def _clear_checkpoint(self) -> None:
-        """Clear the checkpoint file."""
-        checkpoint_path = self._get_checkpoint_path()
-        if checkpoint_path.exists():
-            checkpoint_path.unlink()
-            logger.info("Cleared checkpoint file: %s", checkpoint_path)
-
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals with multi-level response."""
-        with self.shutdown_lock:
-            self.signal_count += 1
-            
-            if self.signal_count == 1:
-                logger.info("Received signal %d, initiating graceful shutdown...", signum)
-                self.shutdown_requested = True
-            elif self.signal_count == 2:
-                logger.warning("Received second signal %d, forcing immediate termination...", signum)
-                self._force_cleanup()
-            else:
-                logger.error("Received third signal %d, emergency exit!", signum)
-                os._exit(1)
-
-    def _cleanup_processes(self, stop_event: Event, graceful_timeout: int = 5) -> None:
-        """Clean up all processes with graceful shutdown sequence."""
-        logger.info("Starting process cleanup...")
-        
-        # Phase 1: Graceful shutdown
-        if stop_event and not stop_event.is_set():
-            logger.info("Setting stop event for graceful worker shutdown...")
-            stop_event.set()
-            
-            # Wait for workers to finish current work
-            logger.info("Waiting %d seconds for graceful shutdown...", graceful_timeout)
-            time.sleep(graceful_timeout)
-        
-        # Phase 2: Terminate extraction subprocess
-        if self.extraction_subprocess and self.extraction_subprocess.poll() is None:
-            logger.info("Terminating extraction subprocess...")
-            try:
-                self.extraction_subprocess.terminate()
-                self.extraction_subprocess.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                logger.warning("Extraction subprocess did not terminate, killing...")
-                self.extraction_subprocess.kill()
-                self.extraction_subprocess.wait()
-            except Exception as exc:
-                logger.warning("Error terminating extraction subprocess: %s", exc)
-            finally:
-                self.extraction_subprocess = None
-        
-        # Phase 3: Terminate worker processes
-        if self.worker_processes:
-            logger.info("Terminating %d worker processes...", len(self.worker_processes))
-            
-            # Send SIGTERM to all workers
-            for proc in self.worker_processes:
-                if proc.is_alive():
-                    try:
-                        proc.terminate()
-                    except Exception as exc:
-                        logger.warning("Error terminating worker process %d: %s", proc.pid, exc)
-            
-            # Wait for graceful termination
-            for proc in self.worker_processes:
-                try:
-                    proc.join(timeout=2)
-                except Exception as exc:
-                    logger.warning("Error waiting for worker process %d: %s", proc.pid, exc)
-            
-            # Force kill any remaining processes
-            for proc in self.worker_processes:
-                if proc.is_alive():
-                    logger.warning("Force killing worker process %d", proc.pid)
-                    try:
-                        proc.kill()
-                        proc.join(timeout=1)
-                    except Exception as exc:
-                        logger.warning("Error force killing worker process %d: %s", proc.pid, exc)
-            
-            self.worker_processes.clear()
-        
-        logger.info("Process cleanup completed")
-
-    def _force_cleanup(self) -> None:
-        """Force immediate cleanup of all processes."""
-        logger.warning("Force cleanup initiated...")
-        
-        # Kill extraction subprocess immediately
-        if self.extraction_subprocess and self.extraction_subprocess.poll() is None:
-            try:
-                self.extraction_subprocess.kill()
-                self.extraction_subprocess.wait(timeout=1)
-            except Exception as exc:
-                logger.warning("Error force killing extraction subprocess: %s", exc)
-            finally:
-                self.extraction_subprocess = None
-        
-        # Kill all worker processes immediately
-        for proc in self.worker_processes:
-            if proc.is_alive():
-                try:
-                    proc.kill()
-                    proc.join(timeout=1)
-                except Exception as exc:
-                    logger.warning("Error force killing worker process %d: %s", proc.pid, exc)
-        
-        self.worker_processes.clear()
-        logger.warning("Force cleanup completed")
-
-    def _register_cleanup(self) -> None:
-        """Register cleanup handler to prevent orphaned processes."""
-        if not self._cleanup_registered:
-            atexit.register(self._cleanup_processes, None, 0)  # Force cleanup on exit
-            self._cleanup_registered = True
+    help = (
+        "Load Wikipedia dump into SQLite (assumes pre-decompressed shards). "
+        "This command wipes the DB, ingests articles and internal links, and resolves link FKs."
+    )
 
     def add_arguments(self, parser) -> None:
-        default_archive, default_processed = _default_paths()
-        parser.add_argument("--archive", default=str(default_archive))
-        parser.add_argument("--processed-dir", default=str(default_processed))
+        parser.add_argument("--processed-dir", default=str(_default_processed_dir()))
         parser.add_argument("--batch-size", type=int, default=5000)
         parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
         parser.add_argument("--limit", type=int)
-        parser.add_argument("--force-decompress", action="store_true")
-        parser.add_argument("--skip-decompress", action="store_true")
-        parser.add_argument(
-            "--no-fast-extract",
-            action="store_true",
-            help="Disable fast extractor; use Python tarfile streaming",
-        )
-        parser.add_argument(
-            "--worker-batch-size",
-            type=int,
-            default=2048,
-            help="Max records per worker emission (reduces IPC overhead)",
-        )
-        parser.add_argument(
-            "--clear-checkpoint",
-            action="store_true",
-            help="Clear checkpoint and start fresh",
-        )
-        parser.add_argument(
-            "--profile",
-            action="store_true",
-            help="Enable performance profiling and write a JSON report",
-        )
-        parser.add_argument(
-            "--profile-output",
-            type=str,
-            help="Path to write profiling JSON (default under data/profiles)",
-        )
 
     def handle(self, *args, **opts):
-        logging.basicConfig(level=logging.INFO)
-        
-        # Register cleanup handler to prevent orphaned processes
-        self._register_cleanup()
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-        def _enable_sqlite_ingest_pragmas() -> None:
-            if connection.vendor != "sqlite":
-                return
-            try:
-                with connection.cursor() as cur:
-                    cur.execute("PRAGMA journal_mode=WAL;")
-                    cur.execute("PRAGMA synchronous=NORMAL;")
-                    cur.execute("PRAGMA temp_store=MEMORY;")
-                    cur.execute("PRAGMA mmap_size=30000000000;")
-                    cur.execute("PRAGMA cache_size=-200000;")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to apply SQLite PRAGMAs: %s", exc)
+        # 1) Always clean the database at startup
+        logger.info("Cleaning database tables before ingestion")
+        call_command("clean_db", yes=True, no_progress=True, drop_recreate=True)
 
-        _enable_sqlite_ingest_pragmas()
-        archive = Path(opts["archive"]).expanduser()
+        # 2) Locate shards (pre-decompressed)
         processed_dir = Path(opts["processed_dir"]).expanduser()
-        batch_size: int = opts["batch_size"]
-        limit: Optional[int] = opts.get("limit")
-        force_decompress = bool(opts["force_decompress"])
-        skip_decompress = bool(opts["skip_decompress"])
-        fast_extract = not bool(opts["no_fast_extract"])  # default to fast extract
-        workers: int = max(1, int(opts["workers"]))
-        clear_checkpoint = bool(opts["clear_checkpoint"])
-        profile_enabled: bool = bool(opts.get("profile"))
+        if not processed_dir.exists():
+            raise CommandError(f"Processed directory not found: {processed_dir}")
 
-        profile_output_path: Optional[Path] = None
-        if profile_enabled:
-            if opts.get("profile_output"):
-                profile_output_path = Path(str(opts["profile_output"]).strip()).expanduser()
-            else:
-                base = settings.BASE_DIR.parent
-                prof_dir = base / "data" / "profiles"
-                prof_dir.mkdir(parents=True, exist_ok=True)
-                profile_output_path = prof_dir / f"load_wiki_dump_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-
-        # Handle checkpoint clearing
-        if clear_checkpoint:
-            self._clear_checkpoint()
-
-        # Load checkpoint data
-        self.checkpoint_data = self._load_checkpoint()
-        completed_shards_set = set(self.checkpoint_data["completed_shards"])
-
-        # Show resume info
-        if completed_shards_set:
-            logger.info("Resuming from checkpoint: %d shards already processed", len(completed_shards_set))
-            logger.info("Previous run created %d articles, skipped %d duplicates, created %d links",
-                       self.checkpoint_data["total_articles_created"],
-                       self.checkpoint_data["total_articles_skipped"],
-                       self.checkpoint_data["total_links_created"])
-            if self.checkpoint_data["last_updated"]:
-                logger.info("Last checkpoint: %s", self.checkpoint_data["last_updated"])
-        else:
-            logger.info("Starting fresh - no previous checkpoint found")
-
-        if not skip_decompress:
-            processed_dir = ensure_decompressed(archive, processed_dir, force=force_decompress, prefer_fast=fast_extract, command_instance=self)
-            logger.info("Decompressed archive: %s", archive)
-        else:
-            # When skipping decompression, still try to resolve the actual
-            # extracted directory location by checking for an "-processed" suffix
-            alt = processed_dir.parent / f"{processed_dir.name}-processed"
-            if alt.exists():
-                processed_dir = alt
-
-        all_bz2_files = find_bz2_files(processed_dir)
-        if not all_bz2_files:
+        all_shards = find_bz2_files(processed_dir)
+        if not all_shards:
             raise CommandError(f"No wiki_*.bz2 files found under {processed_dir}")
 
-        # Filter out already processed shards
-        bz2_files = []
-        for shard_path in all_bz2_files:
-            # Create relative path for checkpoint tracking (e.g., "AA/wiki_00.bz2")
-            relative_path = shard_path.relative_to(processed_dir)
-            shard_key = str(relative_path)
-            if shard_key not in completed_shards_set:
-                bz2_files.append(shard_path)
+        batch_size: int = int(opts["batch_size"]) or 5000
+        workers: int = max(1, int(opts["workers"]))
+        limit: Optional[int] = opts.get("limit")
 
-        if not bz2_files:
-            logger.info("All shards already processed! Nothing to do.")
-            self.stdout.write(self.style.SUCCESS("All shards already processed"))
-            return
-
-        logger.info("Found %d total shards, %d remaining to process; using %d workers",
-                   len(all_bz2_files), len(bz2_files), workers)
-
-        # Set up signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-        initial_status = ShardStatus(
-            completed=list(completed_shards_set),
-            partial=list(self.checkpoint_data.get("partial_shards", [])),
-            deferred=list(self.checkpoint_data.get("deferred_shards", [])),
-        )
-
-        worker_batch_size: int = int(opts.get("worker_batch_size") or 2048)
+        logger.info("Found %d shards; starting %d workers", len(all_shards), workers)
 
         created_total, skipped_total, links_total = self._run_pipeline(
-            bz2_files,
-            batch_size,
-            limit,
-            workers,
-            completed_shards_set,
-            initial_status,
-            worker_batch_size,
-            profile_enabled,
-            profile_output_path,
+            all_shards, batch_size, limit, workers
         )
 
-        self.stdout.write(self.style.SUCCESS(f"Created {created_total} new articles, skipped {skipped_total} duplicates, created {links_total} links"))
+        logger.info(
+            "Ingest complete: articles created=%d, duplicates skipped(in-batch)=%d, links created=%d",
+            created_total,
+            skipped_total,
+            links_total,
+        )
 
-    def _flush_batch(self, batch: List[Article], batch_size: int) -> Tuple[int, int]:
-        """Flush batch to database and return (created_count, skipped_count)."""
-        if not batch:
-            return 0, 0
+        # 3) Resolve links (both directions) in-place
+        updated_from = self._resolve_from_article(batch_size)
+        updated_to = self._resolve_to_article(batch_size)
 
-        to_insert: List[Article] = []
-        seen_new_ids: Set[int] = set()
-        skipped_count = 0
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"Created {created_total} new articles, skipped {skipped_total} dups, created {links_total} links; "
+                f"resolved from_article={updated_from}, to_article={updated_to}"
+            )
+        )
 
-        for article in batch:
-            page_id = article.page_id
-            if page_id in seen_new_ids:
-                skipped_count += 1
-                continue
-            seen_new_ids.add(page_id)
-            to_insert.append(article)
-
-        created_count = 0
-
-        if to_insert:
-            with transaction.atomic():
-                Article.objects.bulk_create(to_insert, batch_size=batch_size, ignore_conflicts=True)
-            created_count = len(to_insert)
-
-        batch.clear()
-        return created_count, skipped_count
-
-    def _flush_link_batch(self, link_batch: List[InternalLink], batch_size: int) -> int:
-        """Flush link batch to database and return created_count."""
-        if not link_batch:
-            return 0
-
-        created_count = 0
-        try:
-            with transaction.atomic():
-                InternalLink.objects.bulk_create(link_batch, batch_size=batch_size, ignore_conflicts=True)
-            created_count = len(link_batch)
-        except Exception as exc:
-            logger.error("Failed to bulk create links: %s", exc)
-            # Try individual inserts as fallback
-            for link in link_batch:
-                try:
-                    link.save()
-                    created_count += 1
-                except Exception:
-                    continue
-
-        link_batch.clear()
-        return created_count
-
+    # -------------------------
+    # Ingestion pipeline
+    # -------------------------
     def _run_pipeline(
         self,
         shards: List[Path],
         batch_size: int,
         limit: Optional[int],
         workers: int,
-        completed_shards_set: Set[str],
-        initial_status: ShardStatus,
-        worker_batch_size: int,
-        profile_enabled: bool,
-        profile_output_path: Optional[Path],
     ) -> Tuple[int, int, int]:
-        """Run a multi-process pipeline with explicit worker signalling and graceful shutdown."""
-        base_dir = shards[0].parent.parent if shards else None
-
         shard_queue: JoinableQueue = JoinableQueue()
-        # Use an unbounded Queue to support get(timeout=...) semantics reliably
         result_queue: Queue = Queue(maxsize=0)
-        stop_event = Event()
-        record_batch_size = max(1, min(batch_size, worker_batch_size))
+
+        # Smaller emission size from workers to reduce IPC latency and memory
+        record_batch_size = max(1, min(batch_size, 2048))
 
         for shard in shards:
             shard_queue.put(shard)
         for _ in range(workers):
             shard_queue.put(None)
 
-        def make_shard_key(path_str: str) -> str:
-            shard_path = Path(path_str)
-            if base_dir:
-                try:
-                    return str(shard_path.relative_to(base_dir))
-                except ValueError:
-                    pass
-            return shard_path.name
-
         def worker_loop(worker_id: int) -> None:
-            # Set up signal handler for worker process
-            def worker_signal_handler(signum, frame):
-                logger.info("Worker %d received signal %d, setting stop event", worker_id, signum)
-                stop_event.set()
-            
-            # Register signal handlers for worker
-            signal.signal(signal.SIGTERM, worker_signal_handler)
-            signal.signal(signal.SIGINT, worker_signal_handler)
-            
-            try:
                 while True:
-                    # Check for stop event before getting next shard
-                    if stop_event.is_set():
-                        break
-                        
                     shard = shard_queue.get()
                     if shard is None:
                         shard_queue.task_done()
                         break
 
                     shard_str = str(shard)
-                    try:
-                        if stop_event.is_set():
-                            result_queue.put(("shard_deferred", shard_str, 0))
-                            continue
-
                         records_emitted = 0
-                        finished_normally = True
-                        batch_buffer: list[tuple[int, Optional[str], list[str]]] = []
-                        link_buffer: list[tuple[int, str, str]] = []
-
-                        try:
-                            link_batch_size = max(100, record_batch_size * 10)  # Links are smaller
+                batch_buffer: List[Tuple[int, Optional[str], List[str]]] = []
+                link_buffer: List[Tuple[int, str, str]] = []
+                link_batch_size = max(100, record_batch_size * 10)
                             
                             for rec in iter_jsonl_bz2(shard):
-                                # More frequent stop event checks during processing
-                                if stop_event.is_set():
-                                    finished_normally = False
-                                    break
-
                                 page_id_raw = rec.get("id")
                                 if page_id_raw is None:
-                                    continue
+                        logger.error("Record missing 'id' in %s", shard_str)
+                        raise ValueError(f"Missing id in record from {shard_str}")
                                 try:
                                     page_id_int = int(page_id_raw)
-                                except Exception:
-                                    continue
+                    except Exception as exc:
+                        logger.error("Non-integer id in %s: %r (%s)", shard_str, page_id_raw, exc)
+                        raise
+
                                 title = rec.get("title")
                                 text = rec.get("text") or []
                                 paragraphs = extract_plain_paragraphs(text)
                                 links = extract_internal_links(text)
 
-                                # Add article to batch
                                 batch_buffer.append((page_id_int, title, paragraphs))
-                                
-                                # Add links to link buffer
                                 for target_title, anchor_text in links:
                                     link_buffer.append((page_id_int, target_title, anchor_text))
                                 
-                                # Emit article batch when full (with stop check)
                                 if len(batch_buffer) >= record_batch_size:
-                                    if stop_event.is_set():
-                                        finished_normally = False
-                                        break
                                     result_queue.put(("record_batch", shard_str, batch_buffer))
                                     records_emitted += len(batch_buffer)
                                     batch_buffer = []
                                 
-                                # Emit link batch when full (with stop check)
                                 if len(link_buffer) >= link_batch_size:
-                                    if stop_event.is_set():
-                                        finished_normally = False
-                                        break
                                     result_queue.put(("link_batch", shard_str, link_buffer))
                                     link_buffer = []
 
-                            # Emit remaining buffers (with stop check)
-                            if batch_buffer and not stop_event.is_set():
+                if batch_buffer:
                                 result_queue.put(("record_batch", shard_str, batch_buffer))
                                 records_emitted += len(batch_buffer)
-                            
-                            if link_buffer and not stop_event.is_set():
+                if link_buffer:
                                 result_queue.put(("link_batch", shard_str, link_buffer))
-                        except Exception as e:
-                            logger.error("Error processing shard %s: %s", shard, e)
-                            finished_normally = False
 
-                        completion_type = "shard_done" if finished_normally else "partial_shard"
-                        result_queue.put((completion_type, shard_str, records_emitted))
-                    finally:
+                result_queue.put(("shard_done", shard_str, records_emitted))
                         shard_queue.task_done()
 
-                    # Check stop event after each shard
-                    if stop_event.is_set():
-                        break
-
-            except Exception as e:
-                logger.error("Worker %d encountered unexpected error: %s", worker_id, e)
-            finally:
                 result_queue.put(("worker_done", worker_id))
 
         procs = [Process(target=worker_loop, args=(idx,)) for idx in range(workers)]
         for proc in procs:
-            # Don't set daemon=True to have explicit control over process lifecycle
             proc.start()
-            self.worker_processes.append(proc)
 
         created_total = 0
         skipped_total = 0
         links_total = 0
-        batch: List[Article] = []
         processed_records = 0
+
+        article_batch: List[Article] = []
         link_accumulator: List[InternalLink] = []
         LINK_FLUSH_THRESHOLD = max(50_000, batch_size * 20)
-        # Profiling accumulators
-        profile_data: Dict[str, object] = {}
-        if profile_enabled:
-            profile_data = {
-                "start_time": time.time(),
-                "workers": workers,
-                "batch_size": batch_size,
-                "worker_batch_size": worker_batch_size,
-                "shards_total": len(shards),
-                "stats": {
-                    "queue_wait_s": 0.0,
-                    "queue_polls": 0,
-                    "flush_article_s": 0.0,
-                    "flush_article_calls": 0,
-                    "flush_links_s": 0.0,
-                    "flush_links_calls": 0,
-                    "shard_done": 0,
-                    "partial_shard": 0,
-                },
-            }
 
-        completed_shards_list = list(initial_status.completed)
-        completed_shards_seen: Set[str] = set(completed_shards_list)
-        partial_shards: Set[str] = set(initial_status.partial or [])
-        deferred_shards: Set[str] = set(initial_status.deferred or [])
+        remaining_workers = workers
+        pbar = tqdm(total=len(shards), desc="Processing shards", unit="shard", dynamic_ncols=True)
 
-        for shard_key in list(partial_shards) + list(deferred_shards):
-            if shard_key in completed_shards_seen:
-                completed_shards_seen.remove(shard_key)
-                completed_shards_list = [s for s in completed_shards_list if s != shard_key]
-
-        workers_remaining = workers
-
-        total_shards = len(shards)
-        processed_shards = 0
-        shard_key_cache: Dict[str, str] = {}
-
-        def flush_batch() -> None:
+        def flush_articles() -> None:
             nonlocal created_total, skipped_total
-            if batch:
-                created, skipped = self._flush_batch(batch, batch_size)
-                created_total += created
-                skipped_total += skipped
+            if not article_batch:
+                return
+            to_insert: List[Article] = []
+            seen_new_ids: Set[int] = set()
+            for a in article_batch:
+                if a.page_id in seen_new_ids:
+                    skipped_total += 1
+                    continue
+                seen_new_ids.add(a.page_id)
+                to_insert.append(a)
+            with transaction.atomic():
+                Article.objects.bulk_create(to_insert, batch_size=batch_size, ignore_conflicts=True)
+            created_total += len(to_insert)
+            article_batch.clear()
 
-        pbar = tqdm(
-            total=total_shards,
-            desc="Processing shards",
-            unit="shard",
-            initial=processed_shards,
-            leave=True,
-            dynamic_ncols=True,
-        )
+        def flush_links() -> None:
+            nonlocal links_total
+            if not link_accumulator:
+                return
+            with transaction.atomic():
+                InternalLink.objects.bulk_create(link_accumulator, batch_size=batch_size, ignore_conflicts=True)
+            links_total += len(link_accumulator)
+            link_accumulator.clear()
+
         try:
-            while workers_remaining > 0:
-                if self.shutdown_requested and not stop_event.is_set():
-                    logger.info("Shutdown requested, signalling workers to stop...")
-                    stop_event.set()
-                if limit is not None and processed_records >= limit and not stop_event.is_set():
-                    logger.info("Limit %s reached; signalling workers to stop...", limit)
-                    stop_event.set()
+            while remaining_workers > 0:
+                # Periodically detect worker crashes to fail-fast
+                for proc in procs:
+                    if proc.exitcode is not None and proc.exitcode != 0:
+                        raise CommandError(f"Worker process {proc.pid} exited with code {proc.exitcode}")
 
                 try:
-                    q_t0 = time.time() if profile_enabled else 0.0
-                    message = result_queue.get(timeout=0.5)
+                    message = result_queue.get(timeout=1.0)
                 except Empty:
                     continue
-                finally:
-                    if profile_enabled:
-                        stats = profile_data["stats"]  # type: ignore[index]
-                        stats["queue_polls"] = int(stats.get("queue_polls", 0)) + 1
-                        if 'q_t0' in locals():
-                            stats["queue_wait_s"] = float(stats.get("queue_wait_s", 0.0)) + (time.time() - q_t0)
 
                 kind = message[0]
-
                 if kind == "record_batch":
                     if limit is not None and processed_records >= limit:
                         continue
-                    _, shard_str, payload = message
+                    _, _shard, payload = message
                     for page_id_int, title, paragraphs in payload:
                         if limit is not None and processed_records >= limit:
                             break
-                        batch.append(
+                        article_batch.append(
                             Article(
                                 page_id=page_id_int,
                                 title=title,
@@ -884,129 +255,112 @@ class Command(BaseCommand):
                             )
                         )
                         processed_records += 1
-                        if len(batch) >= batch_size:
-                            t0 = time.time() if profile_enabled else 0.0
-                            flush_batch()
-                            if profile_enabled:
-                                stats = profile_data["stats"]  # type: ignore[index]
-                                stats["flush_article_calls"] = int(stats.get("flush_article_calls", 0)) + 1
-                                stats["flush_article_s"] = float(stats.get("flush_article_s", 0.0)) + (time.time() - t0)
+                        if len(article_batch) >= batch_size:
+                            flush_articles()
+
                 elif kind == "link_batch":
-                    _, shard_str, link_payload = message
-                    for page_id, target_title, anchor_text in link_payload:
+                    _, _shard, payload = message
+                    for page_id_int, to_title, anchor_text in payload:
                         link_accumulator.append(
                             InternalLink(
-                                from_page_id=page_id,
-                                to_title=target_title,
+                                from_page_id=page_id_int,
+                                to_title=to_title,
                                 anchor_text=anchor_text,
                             )
                         )
                     if len(link_accumulator) >= LINK_FLUSH_THRESHOLD:
-                        t0 = time.time() if profile_enabled else 0.0
-                        links_total += self._flush_link_batch(link_accumulator, batch_size)
-                        if profile_enabled:
-                            stats = profile_data["stats"]  # type: ignore[index]
-                            stats["flush_links_calls"] = int(stats.get("flush_links_calls", 0)) + 1
-                            stats["flush_links_s"] = float(stats.get("flush_links_s", 0.0)) + (time.time() - t0)
+                        flush_links()
+
                 elif kind == "shard_done":
-                    _, shard_str, _count = message
-                    shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
-                    partial_shards.discard(shard_key)
-                    deferred_shards.discard(shard_key)
-                    if shard_key not in completed_shards_seen:
-                        completed_shards_seen.add(shard_key)
-                        completed_shards_list.append(shard_key)
                         pbar.update(1)
-                        # Periodic checkpointing
-                        if completed_shards_list and len(completed_shards_list) % 50 == 0:
-                            self._save_checkpoint(
-                                ShardStatus(
-                                    completed=list(completed_shards_list),
-                                    partial=sorted(list(partial_shards)),
-                                    deferred=sorted(list(deferred_shards)),
-                                ),
-                                created_total,
-                                skipped_total,
-                                links_total,
-                            )
-                        # Opportunistically flush accumulated links at shard boundaries
-                        if link_accumulator and len(link_accumulator) >= LINK_FLUSH_THRESHOLD:
-                            t0 = time.time() if profile_enabled else 0.0
-                            links_total += self._flush_link_batch(link_accumulator, batch_size)
-                            if profile_enabled:
-                                stats = profile_data["stats"]  # type: ignore[index]
-                                stats["flush_links_calls"] = int(stats.get("flush_links_calls", 0)) + 1
-                                stats["flush_links_s"] = float(stats.get("flush_links_s", 0.0)) + (time.time() - t0)
-                elif kind == "partial_shard":
-                    _, shard_str, _count = message
-                    shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
-                    partial_shards.add(shard_key)
-                    deferred_shards.discard(shard_key)
-                    if shard_key in completed_shards_seen:
-                        completed_shards_seen.remove(shard_key)
-                        completed_shards_list = [s for s in completed_shards_list if s != shard_key]
-                elif kind == "shard_deferred":
-                    _, shard_str, _count = message
-                    shard_key = shard_key_cache.setdefault(shard_str, make_shard_key(shard_str))
-                    deferred_shards.add(shard_key)
-                    partial_shards.discard(shard_key)
-                    if shard_key in completed_shards_seen:
-                        completed_shards_seen.remove(shard_key)
-                        completed_shards_list = [s for s in completed_shards_list if s != shard_key]
                 elif kind == "worker_done":
-                    workers_remaining -= 1
+                    remaining_workers -= 1
                 else:
-                    logger.debug("Received unexpected message type from worker: %s", kind)
+                    logger.warning("Unexpected message kind: %s", kind)
         finally:
             pbar.close()
 
-        t0_flush = time.time() if profile_enabled else 0.0
-        flush_batch()
-        if profile_enabled:
-            stats = profile_data["stats"]  # type: ignore[index]
-            stats["flush_article_calls"] = int(stats.get("flush_article_calls", 0)) + 1
-            stats["flush_article_s"] = float(stats.get("flush_article_s", 0.0)) + (time.time() - t0_flush)
-
-        if link_accumulator:
-            t0_links = time.time() if profile_enabled else 0.0
-            links_total += self._flush_link_batch(link_accumulator, batch_size)
-            if profile_enabled:
-                stats = profile_data["stats"]  # type: ignore[index]
-                stats["flush_links_calls"] = int(stats.get("flush_links_calls", 0)) + 1
-                stats["flush_links_s"] = float(stats.get("flush_links_s", 0.0)) + (time.time() - t0_links)
-
-        if partial_shards:
-            logger.info("Partial shards detected (will remain pending): %s", sorted(list(partial_shards)))
-        if deferred_shards:
-            logger.info("Deferred shards due to cancellation: %s", sorted(list(deferred_shards)))
-
-        self._save_checkpoint(
-            ShardStatus(
-                completed=list(completed_shards_list),
-                partial=sorted(list(partial_shards)),
-                deferred=sorted(list(deferred_shards)),
-            ),
-            created_total,
-            skipped_total,
-            links_total,
-        )
-
-        # Use robust cleanup instead of simple terminate
-        self._cleanup_processes(stop_event, graceful_timeout=5)
-        shard_queue.join()
-
-        if profile_enabled:
-            try:
-                profile_data["end_time"] = time.time()
-                profile_data["articles_created"] = created_total
-                profile_data["articles_skipped"] = skipped_total
-                profile_data["links_created"] = links_total
-                if profile_output_path:
-                    profile_output_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(profile_output_path, "w") as f:
-                        json.dump(profile_data, f, indent=2)
-                    logger.info("Wrote profile report to %s", profile_output_path)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to write profile report: %s", exc)
+        flush_articles()
+        flush_links()
 
         return created_total, skipped_total, links_total
+
+    # -------------------------
+    # Link resolution
+    # -------------------------
+    def _resolve_from_article(self, batch_size: int) -> int:
+        unresolved_qs = InternalLink.objects.filter(from_article__isnull=True, from_page_id__isnull=False)
+        unresolved_count = unresolved_qs.count()
+        if unresolved_count == 0:
+            logger.info("No from_article links to resolve")
+            return 0
+
+        logger.info("Resolving from_article for %d links", unresolved_count)
+
+        # Build mapping page_id -> article.id
+        page_ids = list(
+            unresolved_qs.values_list("from_page_id", flat=True).distinct()
+        )
+        page_id_to_article_id: Dict[int, int] = {}
+        for i in tqdm(range(0, len(page_ids), batch_size), desc="Mapping page_ids", unit="batch", dynamic_ncols=True):
+            batch = page_ids[i : i + batch_size]
+            page_id_to_article_id.update(
+                dict(Article.objects.filter(page_id__in=batch).values_list("page_id", "id"))
+            )
+
+        updated_total = 0
+        for _ in tqdm(range(0, unresolved_count, batch_size), desc="Updating from_article", unit="batch", dynamic_ncols=True):
+            links = list(unresolved_qs[:batch_size])
+            if not links:
+                break
+            to_update: List[InternalLink] = []
+            for link in links:
+                aid = page_id_to_article_id.get(link.from_page_id)
+                if aid is not None:
+                    link.from_article_id = aid
+                    to_update.append(link)
+            if to_update:
+                with transaction.atomic():
+                    InternalLink.objects.bulk_update(to_update, ["from_article"], batch_size=batch_size)
+                updated_total += len(to_update)
+
+        logger.info("Resolved from_article for %d links", updated_total)
+        return updated_total
+
+    def _resolve_to_article(self, batch_size: int) -> int:
+        unresolved_qs = InternalLink.objects.filter(to_article__isnull=True)
+        unresolved_count = unresolved_qs.count()
+        if unresolved_count == 0:
+            logger.info("No to_article links to resolve")
+            return 0
+
+        logger.info("Resolving to_article for %d links", unresolved_count)
+
+        titles = list(
+            unresolved_qs.values_list("to_title", flat=True).distinct()
+        )
+        title_to_article_id: Dict[str, int] = {}
+        for i in tqdm(range(0, len(titles), batch_size), desc="Mapping titles", unit="batch", dynamic_ncols=True):
+            batch = titles[i : i + batch_size]
+            title_to_article_id.update(
+                dict(Article.objects.filter(title__in=batch).values_list("title", "id"))
+            )
+
+        updated_total = 0
+        for _ in tqdm(range(0, unresolved_count, batch_size), desc="Updating to_article", unit="batch", dynamic_ncols=True):
+            links = list(unresolved_qs[:batch_size])
+            if not links:
+                break
+            to_update: List[InternalLink] = []
+            for link in links:
+                aid = title_to_article_id.get(link.to_title)
+                if aid is not None:
+                    link.to_article_id = aid
+                    to_update.append(link)
+            if to_update:
+                with transaction.atomic():
+                    InternalLink.objects.bulk_update(to_update, ["to_article"], batch_size=batch_size)
+                updated_total += len(to_update)
+
+        logger.info("Resolved to_article for %d links", updated_total)
+        return updated_total

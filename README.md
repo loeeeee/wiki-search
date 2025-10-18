@@ -23,48 +23,39 @@ Based on sampling, the dump contains approximately **5,357,970 articles** across
 
 ## Load data
 
-The loader supports resuming from checkpoints, graceful shutdown, configurable parallelism, and automatic internal link extraction.
+The loader is now a single-step command that wipes the DB, ingests the pre-decompressed dump, extracts internal links, and resolves link foreign keys.
+
+Requirements:
+- The HotpotQA 2017 dump must be pre-decompressed into `data/processed/enwiki-20171001-pages-meta-current-withlinks-processed/` (decompression is handled by a separate script).
 
 ```bash
-# Step 1: Load articles and extract internal links
+# One-step load + link resolution
 python wiki_search/manage.py load_wiki_dump --workers 6 --batch-size 5000
 
-# Step 2: Resolve link foreign key references
-python wiki_search/manage.py resolve_links --resolve-to-article
+# Optional: process only a subset
+python wiki_search/manage.py load_wiki_dump --limit 200000
 ```
 
-### Useful options for load_wiki_dump
+### Options for load_wiki_dump
 
 | Flag | Purpose |
 | ---- | ------- |
-| `--limit N` | Stop after processing N articles (useful for smoke tests). |
-| `--clear-checkpoint` | Delete the checkpoint file and start from scratch. |
-| `--force-decompress` | Re-extract the raw archive even if processed data exists. |
-| `--skip-decompress` | Skip decompression entirely and use existing decompressed data. |
-| `--no-fast-extract` | Disable the system tar + lbzip2 path and use Python extraction. |
-| `--worker-batch-size N` | Max records per worker emission (reduces IPC overhead). |
+| `--processed-dir PATH` | Root of pre-decompressed shards (default path under data/processed). |
+| `--batch-size N` | DB flush size for articles (default: 5000). |
+| `--workers N` | Number of worker processes (default: CPU-1). |
+| `--limit N` | Stop after processing N articles (smoke tests). |
 
-The command stores progress in `data/.load_checkpoint.json`, tracking completed, partial, and deferred shards so reruns pick up where they stopped. It also extracts and stores internal Wikipedia links during the loading process.
-
-Note: When using SQLite, the loader now enables ingest-friendly PRAGMA settings (WAL, synchronous=NORMAL, etc.) for faster bulk writes.
-
-### Useful options for resolve_links
-
-| Flag | Purpose |
-| ---- | ------- |
-| `--batch-size N` | Batch size for bulk updates (default: 5000). |
-| `--resolve-to-article` | Also resolve to_article based on to_title matching. |
-| `--verbose` | Enable verbose output showing progress details. |
-
-The `resolve_links` command resolves foreign key references after articles are loaded. This two-phase approach eliminates database lookup bottlenecks during the main loading process, achieving 2-3x better throughput.
+Notes:
+- This command always drops data at start by calling `clean_db` (non-interactive, fastest drop+recreate on SQLite).
+- It no longer performs decompression, checkpointing, signal handling, or profiling.
+- Internal link resolution (both from_article via page_id and to_article via title) happens automatically at the end.
 
 #### Performance characteristics
 
-- Worker processes stream articles to the coordinator in batches, minimizing inter-process contention and improving throughput on multi-core machines.
-- The coordinator deduplicates page IDs per batch before inserting, allowing large `--batch-size` values without incurring duplicate constraint penalties.
-- Batch inserts run inside transactions sized by `--batch-size`, so tune this flag based on available memory and database write performance.
-- Internal links are extracted and stored with raw page_id values during loading, avoiding expensive database lookups.
-- Link foreign key resolution happens in a separate post-processing step using efficient batch operations.
+- Worker processes stream articles to the coordinator in batches.
+- The coordinator deduplicates page IDs per batch before inserting, allowing large `--batch-size` values without duplicate penalties.
+- Batch inserts run inside transactions sized by `--batch-size`.
+- Internal links are extracted during loading; foreign keys are resolved after ingestion in the same command.
 
 ## Summarize database
 
