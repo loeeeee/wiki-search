@@ -57,7 +57,7 @@ def iter_jsonl_bz2(file_path: Path) -> Iterator[dict]:
 
 class Command(BaseCommand):
     help = (
-        "Load Wikipedia dump into SQLite (assumes pre-decompressed shards). "
+        "Load Wikipedia dump into database (assumes pre-decompressed shards). "
         "This command wipes the DB, ingests articles and internal links, and resolves link FKs."
     )
 

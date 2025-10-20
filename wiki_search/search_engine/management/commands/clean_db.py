@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = "Delete all data from search_engine tables and VACUUM the SQLite database"
+    help = "Delete all data from search_engine tables and optimize the database"
 
     def add_arguments(self, parser) -> None:
         parser.add_argument("--yes", action="store_true", help="Run non-interactively and skip confirmation")
@@ -28,7 +28,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--no-fast-pragmas",
             action="store_true",
-            help="Do not apply fast SQLite PRAGMAs during cleanup",
+            help="Do not apply fast SQLite PRAGMAs during cleanup (SQLite only)",
         )
         parser.add_argument(
             "--drop-recreate",
@@ -193,7 +193,9 @@ class Command(BaseCommand):
                                 pbar.update(total)
                                 pbar.close()
                     else:
-                        cur.executescript("\n".join(statements))
+                        # Execute statements individually (PostgreSQL doesn't support executescript)
+                        for stmt in statements:
+                            cur.execute(stmt)
 
                     # Best-effort row counts
                     links_deleted = total_links
@@ -241,7 +243,7 @@ class Command(BaseCommand):
             checkpoint_path.unlink()
             self.stdout.write("Deleted loading progress checkpoint file")
 
-        # VACUUM to reclaim space (SQLite only)
+        # Optimize database (VACUUM for SQLite, VACUUM ANALYZE for PostgreSQL)
         try:
             if connection.vendor == "sqlite":
                 if options.get("no_progress"):
@@ -252,12 +254,22 @@ class Command(BaseCommand):
                         with connection.cursor() as cur:
                             cur.execute("VACUUM")
                         pbar.update(1)
+            elif connection.vendor == "postgresql":
+                if options.get("no_progress"):
+                    with connection.cursor() as cur:
+                        cur.execute("VACUUM ANALYZE")
+                else:
+                    with tqdm(total=1, desc="Vacuuming and analyzing database", unit="operation") as pbar:
+                        with connection.cursor() as cur:
+                            cur.execute("VACUUM ANALYZE")
+                        pbar.update(1)
         except Exception as exc:  # pragma: no cover
-            logger.warning("VACUUM failed: %s", exc)
+            logger.warning("Database optimization failed: %s", exc)
 
+        db_type = connection.vendor
         self.stdout.write(
             self.style.SUCCESS(
-                f"Deleted Articles={articles_deleted}, Redirects={redirects_deleted}, InternalLinks={links_deleted} and vacuumed DB"
+                f"Deleted Articles={articles_deleted}, Redirects={redirects_deleted}, InternalLinks={links_deleted} and optimized {db_type} database"
             )
         )
 

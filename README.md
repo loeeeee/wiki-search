@@ -1,6 +1,42 @@
 # wiki-search
 A wikipedia dump processing pipeline
 
+## Database Setup
+
+This project uses PostgreSQL as the database backend, connecting to a server at `172.22.0.133`.
+
+### Environment Configuration
+
+1. **Copy the environment template:**
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Edit `.env` with your actual PostgreSQL credentials:**
+   ```bash
+   POSTGRES_DB=wiki_search
+   POSTGRES_USER=your_actual_username
+   POSTGRES_PASSWORD=your_actual_password
+   POSTGRES_HOST=172.22.0.133
+   POSTGRES_PORT=5432
+   ```
+
+3. **Load environment variables before running Django commands:**
+   ```bash
+   set -a; source .env; set +a
+   ```
+
+4. **Install dependencies and run migrations:**
+   ```bash
+   uv sync
+   python wiki_search/manage.py migrate
+   ```
+
+5. **Test the database connection:**
+   ```bash
+   python wiki_search/manage.py db_summary
+   ```
+
 ## Count Articles
 
 Count the number of articles in the Wikipedia dump:
@@ -46,7 +82,7 @@ python wiki_search/manage.py load_wiki_dump --limit 200000
 | `--limit N` | Stop after processing N articles (smoke tests). |
 
 Notes:
-- This command always drops data at start by calling `clean_db` (non-interactive, fastest drop+recreate on SQLite).
+- This command always drops data at start by calling `clean_db` (non-interactive, optimized for the database backend).
 - It no longer performs decompression, checkpointing, signal handling, or profiling.
 - Internal link resolution (both from_article via page_id and to_article via title) happens automatically at the end.
 
@@ -94,6 +130,7 @@ python wiki_search/manage.py clean_db --yes --drop-recreate
 ```
 
 Notes:
-- The command deletes `InternalLink`, `Redirect`, `TFIDFIndex`, `Vocabulary`, then `Article`, then runs `VACUUM`.
+- The command deletes `InternalLink`, `Redirect`, `TFIDFIndex`, `Vocabulary`, then `Article`, then optimizes the database.
 - With SQLite, fast PRAGMAs are applied by default for speed and restored afterward. Use `--no-fast-pragmas` to disable.
-- `--drop-recreate` is destructive but typically the fastest option for very large datasets.
+- With PostgreSQL, `VACUUM ANALYZE` is run to optimize the database.
+- `--drop-recreate` is SQLite-only and destructive but typically the fastest option for very large datasets.
