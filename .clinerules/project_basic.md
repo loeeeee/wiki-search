@@ -69,6 +69,8 @@ InternalLink in a paragraph:
 
 All the wikipedia data should be loaded into the database.
 
+Always ask for explicit user concent before executing load_wiki_dump.py. This script will wipe the database.
+
 ### Data visualization
 
 This is a web application. It is a search engine where user can search for wikipedia articles using keywords.
