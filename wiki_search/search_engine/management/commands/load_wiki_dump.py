@@ -16,6 +16,7 @@ from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.db.models import Min, Max, Count
 
 from search_engine.ingest.parser import extract_plain_paragraphs, extract_internal_links
 from search_engine.models import Article, InternalLink
@@ -531,57 +532,54 @@ class Command(BaseCommand):
         return created_total, skipped_total, links_total
 
     def _resolve_from_article(self, batch_size: int, db_workers: int = 6) -> int:
-        """Resolve from_article foreign keys using parallel batched SQL UPDATE with JOIN."""
+        """Resolve from_article foreign keys using parallel ID range-based batched SQL UPDATE with JOIN."""
         from django.db import connection
         
-        unresolved_count = InternalLink.objects.filter(
+        # Get ID range and count instead of fetching all IDs
+        result = InternalLink.objects.filter(
             from_article__isnull=True, from_page_id__isnull=False
-        ).count()
+        ).aggregate(min_id=Min('id'), max_id=Max('id'), total=Count('id'))
         
-        if unresolved_count == 0:
+        if not result['total'] or result['min_id'] is None or result['max_id'] is None:
             logger.info("No from_article links to resolve")
             return 0
 
-        logger.info("Resolving from_article for %d links using %d workers", unresolved_count, db_workers)
-
-        # Get all unresolved link IDs to split into batches
-        unresolved_ids = list(InternalLink.objects.filter(
-            from_article__isnull=True, from_page_id__isnull=False
-        ).values_list('id', flat=True))
+        min_id = result['min_id']
+        max_id = result['max_id']
+        unresolved_count = result['total']
         
-        if not unresolved_ids:
-            return 0
+        logger.info("Resolving from_article for %d links (ID range: %d-%d) using %d workers", 
+                    unresolved_count, min_id, max_id, db_workers)
 
-        # Split into batches for parallel processing
-        batch_size_actual = max(1, len(unresolved_ids) // db_workers)
+        # Create ID range batches based on batch_size
         batches = []
-        for i in range(0, len(unresolved_ids), batch_size_actual):
-            batch_ids = unresolved_ids[i:i + batch_size_actual]
-            if batch_ids:
-                batches.append(batch_ids)
+        for start in range(min_id, max_id + 1, batch_size):
+            end = min(start + batch_size, max_id + 1)
+            batches.append((start, end))
 
-        logger.info("Processing %d batches of from_article links", len(batches))
+        logger.info("Processing %d ID range batches of from_article links (batch_size=%d)", 
+                    len(batches), batch_size)
 
-        def update_batch_from_article(batch_ids: List[int]) -> int:
-            """Update a batch of from_article links."""
+        def update_range_from_article(id_start: int, id_end: int) -> int:
+            """Update a range of from_article links by ID range."""
             from django.db import connection
             with connection.cursor() as cursor:
                 sql = """
                     UPDATE search_engine_internallink AS link
                     SET from_article_id = article.id
                     FROM search_engine_article AS article
-                    WHERE link.from_page_id = article.page_id
+                    WHERE link.id >= %s AND link.id < %s
+                      AND link.from_page_id = article.page_id
                       AND link.from_article_id IS NULL
                       AND link.from_page_id IS NOT NULL
-                      AND link.id = ANY(%s)
                 """
-                cursor.execute(sql, [batch_ids])
+                cursor.execute(sql, [id_start, id_end])
                 return cursor.rowcount
 
         # Process batches in parallel
         updated_total = 0
         with ThreadPoolExecutor(max_workers=db_workers) as executor:
-            futures = [executor.submit(update_batch_from_article, batch_ids) for batch_ids in batches]
+            futures = [executor.submit(update_range_from_article, start, end) for start, end in batches]
             for future in as_completed(futures):
                 try:
                     batch_updated = future.result()
@@ -594,54 +592,53 @@ class Command(BaseCommand):
         return updated_total
 
     def _resolve_to_article(self, batch_size: int, db_workers: int = 6) -> int:
-        """Resolve to_article foreign keys using parallel batched SQL UPDATE with JOIN."""
+        """Resolve to_article foreign keys using parallel ID range-based batched SQL UPDATE with JOIN."""
         from django.db import connection
         
-        unresolved_count = InternalLink.objects.filter(to_article__isnull=True).count()
+        # Get ID range and count instead of fetching all IDs
+        result = InternalLink.objects.filter(
+            to_article__isnull=True
+        ).aggregate(min_id=Min('id'), max_id=Max('id'), total=Count('id'))
         
-        if unresolved_count == 0:
+        if not result['total'] or result['min_id'] is None or result['max_id'] is None:
             logger.info("No to_article links to resolve")
             return 0
 
-        logger.info("Resolving to_article for %d links using %d workers", unresolved_count, db_workers)
-
-        # Get all unresolved link IDs to split into batches
-        unresolved_ids = list(InternalLink.objects.filter(
-            to_article__isnull=True
-        ).values_list('id', flat=True))
+        min_id = result['min_id']
+        max_id = result['max_id']
+        unresolved_count = result['total']
         
-        if not unresolved_ids:
-            return 0
+        logger.info("Resolving to_article for %d links (ID range: %d-%d) using %d workers", 
+                    unresolved_count, min_id, max_id, db_workers)
 
-        # Split into batches for parallel processing
-        batch_size_actual = max(1, len(unresolved_ids) // db_workers)
+        # Create ID range batches based on batch_size
         batches = []
-        for i in range(0, len(unresolved_ids), batch_size_actual):
-            batch_ids = unresolved_ids[i:i + batch_size_actual]
-            if batch_ids:
-                batches.append(batch_ids)
+        for start in range(min_id, max_id + 1, batch_size):
+            end = min(start + batch_size, max_id + 1)
+            batches.append((start, end))
 
-        logger.info("Processing %d batches of to_article links", len(batches))
+        logger.info("Processing %d ID range batches of to_article links (batch_size=%d)", 
+                    len(batches), batch_size)
 
-        def update_batch_to_article(batch_ids: List[int]) -> int:
-            """Update a batch of to_article links."""
+        def update_range_to_article(id_start: int, id_end: int) -> int:
+            """Update a range of to_article links by ID range."""
             from django.db import connection
             with connection.cursor() as cursor:
                 sql = """
                     UPDATE search_engine_internallink AS link
                     SET to_article_id = article.id
                     FROM search_engine_article AS article
-                    WHERE link.to_title = article.title
+                    WHERE link.id >= %s AND link.id < %s
+                      AND link.to_title = article.title
                       AND link.to_article_id IS NULL
-                      AND link.id = ANY(%s)
                 """
-                cursor.execute(sql, [batch_ids])
+                cursor.execute(sql, [id_start, id_end])
                 return cursor.rowcount
 
         # Process batches in parallel
         updated_total = 0
         with ThreadPoolExecutor(max_workers=db_workers) as executor:
-            futures = [executor.submit(update_batch_to_article, batch_ids) for batch_ids in batches]
+            futures = [executor.submit(update_range_to_article, start, end) for start, end in batches]
             for future in as_completed(futures):
                 try:
                     batch_updated = future.result()

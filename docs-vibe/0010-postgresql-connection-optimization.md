@@ -48,7 +48,7 @@ python wiki_search/manage.py load_wiki_dump --db-workers 6
 
 **Files: `_resolve_from_article()` and `_resolve_to_article()` methods**
 
-Replaced single-threaded UPDATE operations with parallel batched processing:
+Replaced single-threaded UPDATE operations with parallel ID range-based batched processing:
 
 **Before:**
 ```python
@@ -61,14 +61,18 @@ WHERE link.from_page_id = article.page_id
 
 **After:**
 ```python
-# Parallel batched UPDATE queries
-# Each thread processes a subset of links using WHERE link.id = ANY(%s)
+# Parallel ID range-based UPDATE queries
+# Each thread processes ID ranges using WHERE link.id >= %s AND link.id < %s
 ```
 
 **Benefits:**
-- 2-3x faster link resolution
+- 2-5x faster link resolution
+- Minimal memory usage (no ID array fetching)
 - Better CPU utilization during UPDATE operations
 - Reduced database lock contention
+- Index-friendly range queries
+
+**Note:** Further optimized in v0013 with ID range-based batching - see [0013-id-range-batching-optimization.md](0013-id-range-batching-optimization.md)
 
 ## Usage
 
@@ -144,10 +148,12 @@ Main Process
 
 ### Link Resolution Batching
 
-1. Query all unresolved link IDs
-2. Split into batches based on `--db-workers`
-3. Submit parallel UPDATE queries with `WHERE link.id = ANY(%s)`
+1. Query MIN/MAX ID range (no ID fetching)
+2. Create ID range batches based on `--batch-size`
+3. Submit parallel UPDATE queries with `WHERE link.id >= %s AND link.id < %s`
 4. Aggregate results from all threads
+
+**See [0013-id-range-batching-optimization.md](0013-id-range-batching-optimization.md) for detailed implementation.**
 
 ## Troubleshooting
 
