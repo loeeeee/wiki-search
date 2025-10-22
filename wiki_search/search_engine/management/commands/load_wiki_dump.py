@@ -200,7 +200,8 @@ def _process_shard_batch(
 
                 # Create result tuple
                 article_tuple = (page_id_int, title, paragraphs)
-                link_tuples = [(page_id_int, target_title, anchor_text) for target_title, anchor_text in shard_links]
+                # Truncate link titles to fit database constraints (512 chars)
+                link_tuples = [(page_id_int, target_title[:512], anchor_text[:512]) for target_title, anchor_text in shard_links]
                 
                 result_queue.put((article_tuple, link_tuples, None))
                 

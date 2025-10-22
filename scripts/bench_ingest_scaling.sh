@@ -37,12 +37,16 @@ DB_WORKERS=${DB_WORKERS:-12}
 WORKERS_LIST=${WORKERS_LIST:-"1 2 4 8 12"}
 PRODUCER_THREADS_LIST=${PRODUCER_THREADS_LIST:-"1 3"}
 
+# Multi-scale testing
+SCALE_LIMITS=${SCALE_LIMITS:-"10000 100000 500000 800000"}
+ENABLE_DB_MONITORING=${ENABLE_DB_MONITORING:-true}
+
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="$ROOT_DIR/data/bench/ingest_$TS"
 mkdir -p "$OUT_DIR"
 
 RESULTS_CSV="$OUT_DIR/results.csv"
-echo "timestamp,workers,db_workers,producer_threads,batch_size,limit,elapsed_s,articles_created,dups_skipped,links_created,throughput_articles_per_s,log_path" > "$RESULTS_CSV"
+echo "timestamp,workers,db_workers,producer_threads,batch_size,limit,elapsed_s,articles_created,dups_skipped,links_created,throughput_articles_per_s,log_path,db_monitor_log" > "$RESULTS_CSV"
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -52,13 +56,15 @@ if have_cmd uv; then
   RUNNER_PREFIX=(uv run)
 fi
 
-for PRODUCER_THREADS in $PRODUCER_THREADS_LIST; do
-  for WORKERS in $WORKERS_LIST; do
-    RUN_TAG="w${WORKERS}_db${DB_WORKERS}_pt${PRODUCER_THREADS}"
+for LIMIT in $SCALE_LIMITS; do
+  for PRODUCER_THREADS in $PRODUCER_THREADS_LIST; do
+    for WORKERS in $WORKERS_LIST; do
+    RUN_TAG="limit${LIMIT}_w${WORKERS}_db${DB_WORKERS}_pt${PRODUCER_THREADS}"
     RUN_DIR="$OUT_DIR/$RUN_TAG"
     mkdir -p "$RUN_DIR"
 
     LOG_FILE="$RUN_DIR/run.log"
+    DB_MONITOR_LOG="$RUN_DIR/db_monitor.log"
     SYS_CPU_FILE="$RUN_DIR/pidstat_cpu.log"
     SYS_IO_FILE="$RUN_DIR/iostat.log"
     SYS_VMSTAT_FILE="$RUN_DIR/vmstat.log"
@@ -76,6 +82,15 @@ for PRODUCER_THREADS in $PRODUCER_THREADS_LIST; do
     fi
     if have_cmd vmstat; then
       vmstat 1 > "$SYS_VMSTAT_FILE" 2>&1 & METRICS_PIDS+=($!)
+    fi
+    
+    # Background database monitoring (if enabled)
+    if [[ "$ENABLE_DB_MONITORING" == "true" ]]; then
+      echo "Starting database monitoring..."
+      ${RUNNER_PREFIX[@]} python scripts/monitor_postgres.py --interval=5 --output="$DB_MONITOR_LOG" &
+      DB_MONITOR_PID=$!
+      METRICS_PIDS+=($DB_MONITOR_PID)
+      sleep 2  # Give monitor time to start
     fi
 
     CMD=(${RUNNER_PREFIX[@]} python "$MANAGE" load_wiki_dump \
@@ -104,6 +119,9 @@ for PRODUCER_THREADS in $PRODUCER_THREADS_LIST; do
     for p in "${METRICS_PIDS[@]}"; do
       kill "$p" >/dev/null 2>&1 || true
     done
+    
+    # Wait a moment for monitoring to flush
+    sleep 2
 
     # Extract metrics from log
     # Looking for lines emitted by the command's logger at the end:
@@ -137,7 +155,7 @@ for PRODUCER_THREADS in $PRODUCER_THREADS_LIST; do
         LINKS_VAL=$(echo "$SUMMARY_LINE" | sed -E 's/.*created ([0-9]+) links.*/\1/')
       fi
 
-      echo "$(date -Is),$WORKERS,$DB_WORKERS,$PRODUCER_THREADS,$BATCH_SIZE,$LIMIT,$ELAPSED_VAL,$CREATED_VAL,$SKIPPED_VAL,$LINKS_VAL,$THROUGHPUT_VAL,$LOG_FILE" >> "$RESULTS_CSV"
+      echo "$(date -Is),$WORKERS,$DB_WORKERS,$PRODUCER_THREADS,$BATCH_SIZE,$LIMIT,$ELAPSED_VAL,$CREATED_VAL,$SKIPPED_VAL,$LINKS_VAL,$THROUGHPUT_VAL,$LOG_FILE,$DB_MONITOR_LOG" >> "$RESULTS_CSV"
     fi
 
     # Persist cProfile outputs
@@ -150,6 +168,7 @@ for PRODUCER_THREADS in $PRODUCER_THREADS_LIST; do
       done
     fi
 
+    done
   done
 done
 
