@@ -379,7 +379,11 @@ class Command(BaseCommand):
 
         # Estimate progress bar total based on limit
         estimated_shards = min(len(shards), (limit // 50) + 5) if limit else len(shards)
-        pbar = tqdm(total=estimated_shards, desc="Processing shards", unit="shard", dynamic_ncols=True)
+        pbar = tqdm(total=estimated_shards, desc="Processing shards", unit="shard", dynamic_ncols=True, position=0)
+        
+        # Add progress bars for database write operations
+        pbar_articles = tqdm(desc="Article writes", unit="batch", dynamic_ncols=True, position=1)
+        pbar_links = tqdm(desc="Link writes", unit="batch", dynamic_ncols=True, position=2)
 
         # Use set for O(1) deduplication instead of O(n) list iteration
         seen_article_ids: Set[int] = set()
@@ -540,14 +544,18 @@ class Command(BaseCommand):
                             created, skipped = result
                             created_total += created
                             skipped_total += skipped
+                            pbar_articles.update(1)
                         else:  # links
                             links_total += result
+                            pbar_links.update(1)
                     except Exception as exc:
                         logger.error("Error in background database write: %s", exc)
                         raise
 
         finally:
             pbar.close()
+            pbar_articles.close()
+            pbar_links.close()
 
         # Final flush of remaining data
         if article_tuples:
@@ -588,6 +596,9 @@ class Command(BaseCommand):
         logger.info("Processing %d ID range batches of from_article links (batch_size=%d)", 
                     len(batches), batch_size)
 
+        # Add progress bar for from_article resolution
+        pbar = tqdm(total=len(batches), desc="Resolving from_article", unit="batch", dynamic_ncols=True)
+
         def update_range_from_article(id_start: int, id_end: int) -> int:
             """Update a range of from_article links by ID range."""
             from django.db import connection
@@ -606,15 +617,19 @@ class Command(BaseCommand):
 
         # Process batches in parallel
         updated_total = 0
-        with ThreadPoolExecutor(max_workers=db_workers) as executor:
-            futures = [executor.submit(update_range_from_article, start, end) for start, end in batches]
-            for future in as_completed(futures):
-                try:
-                    batch_updated = future.result()
-                    updated_total += batch_updated
-                except Exception as exc:
-                    logger.error("Error in from_article batch update: %s", exc)
-                    raise
+        try:
+            with ThreadPoolExecutor(max_workers=db_workers) as executor:
+                futures = [executor.submit(update_range_from_article, start, end) for start, end in batches]
+                for future in as_completed(futures):
+                    try:
+                        batch_updated = future.result()
+                        updated_total += batch_updated
+                        pbar.update(1)
+                    except Exception as exc:
+                        logger.error("Error in from_article batch update: %s", exc)
+                        raise
+        finally:
+            pbar.close()
 
         logger.info("Resolved from_article for %d links", updated_total)
         return updated_total
@@ -648,6 +663,9 @@ class Command(BaseCommand):
         logger.info("Processing %d ID range batches of to_article links (batch_size=%d)", 
                     len(batches), batch_size)
 
+        # Add progress bar for to_article resolution
+        pbar = tqdm(total=len(batches), desc="Resolving to_article", unit="batch", dynamic_ncols=True)
+
         def update_range_to_article(id_start: int, id_end: int) -> int:
             """Update a range of to_article links by ID range."""
             from django.db import connection
@@ -665,15 +683,19 @@ class Command(BaseCommand):
 
         # Process batches in parallel
         updated_total = 0
-        with ThreadPoolExecutor(max_workers=db_workers) as executor:
-            futures = [executor.submit(update_range_to_article, start, end) for start, end in batches]
-            for future in as_completed(futures):
-                try:
-                    batch_updated = future.result()
-                    updated_total += batch_updated
-                except Exception as exc:
-                    logger.error("Error in to_article batch update: %s", exc)
-                    raise
+        try:
+            with ThreadPoolExecutor(max_workers=db_workers) as executor:
+                futures = [executor.submit(update_range_to_article, start, end) for start, end in batches]
+                for future in as_completed(futures):
+                    try:
+                        batch_updated = future.result()
+                        updated_total += batch_updated
+                        pbar.update(1)
+                    except Exception as exc:
+                        logger.error("Error in to_article batch update: %s", exc)
+                        raise
+        finally:
+            pbar.close()
 
         logger.info("Resolved to_article for %d links", updated_total)
         return updated_total
