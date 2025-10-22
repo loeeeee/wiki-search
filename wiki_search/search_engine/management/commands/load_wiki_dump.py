@@ -101,7 +101,11 @@ def save_profile_stats(profiler: cProfile.Profile, phase_name: str) -> Path:
     return profile_path
 
 
-def _process_shard_batch(shard_paths: List[Path], record_batch_size: int = 2048) -> Tuple[
+def _process_shard_batch(
+    shard_paths: List[Path], 
+    record_batch_size: int = 2048,
+    producer_threads: int = 3
+) -> Tuple[
     List[Tuple[int, Optional[str], List[str]]],  # (page_id, title, paragraphs)
     List[Tuple[int, str, str]],  # (from_page_id, to_title, anchor_text)
     int  # records_emitted
@@ -109,117 +113,142 @@ def _process_shard_batch(shard_paths: List[Path], record_batch_size: int = 2048)
     """Process multiple shard files with concurrent I/O and parsing.
 
     This function is at module level so it can be pickled for ProcessPoolExecutor.
-    Uses producer-consumer threading pattern to overlap bz2 decompression (I/O) 
-    with JSON parsing and text extraction (CPU), maximizing resource utilization.
+    Uses multiple producer threads (I/O-bound bz2 decompression) and 1 consumer thread 
+    (CPU-bound parsing) to maximize I/O throughput while minimizing CPU overhead.
+    
+    Args:
+        shard_paths: List of shard files to process
+        record_batch_size: Batch size for processing (unused, kept for compatibility)
+        producer_threads: Number of producer threads for concurrent I/O (default: 3)
+    
     Returns simple tuples to minimize serialization overhead between processes.
     """
     import queue
-    from threading import Thread
+    from threading import Thread, Lock
     
     articles: List[Tuple[int, Optional[str], List[str]]] = []
     links: List[Tuple[int, str, str]] = []
     
-    # Use 2-3 parser threads per shard for optimal CPU utilization
-    NUM_PARSER_THREADS = 3
-    QUEUE_SIZE = 1000  # Buffer between I/O and parsing
+    # I/O-optimized: configurable producer threads, 1 consumer thread
+    NUM_PRODUCER_THREADS = max(1, min(producer_threads, len(shard_paths)))  # Don't exceed shard count
+    NUM_CONSUMER_THREADS = 1
+    QUEUE_SIZE = 500 * NUM_PRODUCER_THREADS  # Scale queue with producer count
     
-    for shard_path in shard_paths:
+    # Shared queues for all shards
+    raw_queue: queue.Queue = queue.Queue(maxsize=QUEUE_SIZE)
+    result_queue: queue.Queue = queue.Queue()
+    parsing_errors: List[Exception] = []
+    errors_lock = Lock()
+    
+    # Track active producers
+    active_producers_lock = Lock()
+    active_producers = len(shard_paths)
+    
+    # Producer: read and decompress (one per shard, executed by thread pool)
+    def producer(shard_path: Path):
+        nonlocal active_producers
         shard_str = str(shard_path)
-        raw_queue: queue.Queue = queue.Queue(maxsize=QUEUE_SIZE)
-        result_queue: queue.Queue = queue.Queue()
-        parsing_errors: List[Exception] = []
-        
-        # Producer: read and decompress
-        def producer():
-            try:
-                for line in iter_jsonl_bz2_raw(shard_path):
-                    raw_queue.put(line)
-            except Exception as exc:
-                logger.error("Error reading shard %s: %s", shard_str, exc)
-                result_queue.put((None, exc))
-            finally:
-                # Sentinel values to signal end
-                for _ in range(NUM_PARSER_THREADS):
-                    raw_queue.put(None)
-        
-        # Consumer: parse and extract
-        def consumer():
-            while True:
-                line = raw_queue.get()
-                if line is None:
-                    # Signal completion
-                    result_queue.put(("COMPLETED", None, None))
-                    break
-                try:
-                    rec = _json.loads(line)
-                    
-                    page_id_raw = rec.get("id")
-                    if page_id_raw is None:
-                        logger.error("Record missing 'id' in %s", shard_str)
-                        result_queue.put((None, None, ValueError(f"Missing id in record from {shard_str}")))
-                        continue
-                    
-                    try:
-                        page_id_int = int(page_id_raw)
-                    except Exception as exc:
-                        logger.error("Non-integer id in %s: %r (%s)", shard_str, page_id_raw, exc)
-                        result_queue.put((None, None, exc))
-                        continue
-
-                    title = rec.get("title")
-                    text = rec.get("text") or []
-                    paragraphs = extract_plain_paragraphs(text)
-                    shard_links = extract_internal_links(text)
-
-                    # Create result tuple
-                    article_tuple = (page_id_int, title, paragraphs)
-                    link_tuples = [(page_id_int, target_title, anchor_text) for target_title, anchor_text in shard_links]
-                    
-                    result_queue.put((article_tuple, link_tuples, None))
-                    
-                except Exception as exc:
-                    logger.error("Error parsing record in %s: %s", shard_str, exc)
-                    result_queue.put((None, None, exc))
-                finally:
-                    raw_queue.task_done()
-        
-        # Start threads
-        producer_thread = Thread(target=producer, daemon=True)
-        consumer_threads = [Thread(target=consumer, daemon=True) for _ in range(NUM_PARSER_THREADS)]
-        
-        producer_thread.start()
-        for t in consumer_threads:
-            t.start()
-        
-        # Collect results
-        completed_consumers = 0
-        while completed_consumers < NUM_PARSER_THREADS:
-            try:
-                result = result_queue.get(timeout=30)  # 30 second timeout
-                if len(result) == 3:
-                    article_tuple, link_tuples, error = result
-                    if result[0] == "COMPLETED":  # Consumer completed
-                        completed_consumers += 1
-                    elif error is not None:  # Error case
-                        parsing_errors.append(error)
-                    elif article_tuple is not None:  # Success case
-                        articles.append(article_tuple)
-                        links.extend(link_tuples)
-                elif len(result) == 2 and result[1] is not None:  # Producer error
-                    parsing_errors.append(result[1])
-            except queue.Empty:
-                logger.error("Timeout waiting for results from shard %s", shard_str)
+        try:
+            for line in iter_jsonl_bz2_raw(shard_path):
+                # Tag each line with source shard for error reporting
+                raw_queue.put((line, shard_str))
+        except Exception as exc:
+            logger.error("Error reading shard %s: %s", shard_str, exc)
+            with errors_lock:
+                parsing_errors.append(exc)
+        finally:
+            # Decrement active producers
+            with active_producers_lock:
+                active_producers -= 1
+                if active_producers == 0:
+                    # Signal consumer to stop when all producers done
+                    for _ in range(NUM_CONSUMER_THREADS):
+                        raw_queue.put(None)
+    
+    # Consumer: parse and extract
+    def consumer():
+        while True:
+            item = raw_queue.get()
+            if item is None:
+                # Signal completion
+                result_queue.put(("COMPLETED", None, None))
                 break
-        
-        # Wait for all threads to complete
-        producer_thread.join(timeout=5)
-        for t in consumer_threads:
-            t.join(timeout=5)
-        
-        # Check for errors
-        if parsing_errors:
-            from django.core.management.base import CommandError
-            raise CommandError(f"Errors processing shard {shard_str}: {parsing_errors[0]}")
+            
+            line, shard_str = item
+            try:
+                rec = _json.loads(line)
+                
+                page_id_raw = rec.get("id")
+                if page_id_raw is None:
+                    logger.error("Record missing 'id' in %s", shard_str)
+                    with errors_lock:
+                        parsing_errors.append(ValueError(f"Missing id in record from {shard_str}"))
+                    continue
+                
+                try:
+                    page_id_int = int(page_id_raw)
+                except Exception as exc:
+                    logger.error("Non-integer id in %s: %r (%s)", shard_str, page_id_raw, exc)
+                    with errors_lock:
+                        parsing_errors.append(exc)
+                    continue
+
+                title = rec.get("title")
+                text = rec.get("text") or []
+                paragraphs = extract_plain_paragraphs(text)
+                shard_links = extract_internal_links(text)
+
+                # Create result tuple
+                article_tuple = (page_id_int, title, paragraphs)
+                link_tuples = [(page_id_int, target_title, anchor_text) for target_title, anchor_text in shard_links]
+                
+                result_queue.put((article_tuple, link_tuples, None))
+                
+            except Exception as exc:
+                logger.error("Error parsing record in %s: %s", shard_str, exc)
+                with errors_lock:
+                    parsing_errors.append(exc)
+            finally:
+                raw_queue.task_done()
+    
+    # Create producer threads (one per shard, up to NUM_PRODUCER_THREADS)
+    producer_thread_list = [Thread(target=producer, args=(shard_path,), daemon=True) 
+                           for shard_path in shard_paths]
+    consumer_thread = Thread(target=consumer, daemon=True)
+    
+    # Start all threads
+    for t in producer_thread_list:
+        t.start()
+    consumer_thread.start()
+    
+    # Collect results
+    completed_consumers = 0
+    while completed_consumers < NUM_CONSUMER_THREADS:
+        try:
+            result = result_queue.get(timeout=60)  # Longer timeout for I/O operations
+            if len(result) == 3:
+                article_tuple, link_tuples, error = result
+                if result[0] == "COMPLETED":  # Consumer completed
+                    completed_consumers += 1
+                elif error is not None:  # Error case
+                    with errors_lock:
+                        parsing_errors.append(error)
+                elif article_tuple is not None:  # Success case
+                    articles.append(article_tuple)
+                    links.extend(link_tuples)
+        except queue.Empty:
+            logger.error("Timeout waiting for results from shards")
+            break
+    
+    # Wait for all threads to complete
+    for t in producer_thread_list:
+        t.join(timeout=10)
+    consumer_thread.join(timeout=10)
+    
+    # Check for errors
+    if parsing_errors:
+        from django.core.management.base import CommandError
+        raise CommandError(f"Errors processing shards: {parsing_errors[0]}")
 
     return articles, links, len(articles)
 
@@ -234,7 +263,8 @@ class Command(BaseCommand):
         parser.add_argument("--processed-dir", default=str(_default_processed_dir()))
         parser.add_argument("--batch-size", type=int, default=5000)
         parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-        parser.add_argument("--db-workers", type=int, default=12, help="Number of database writer threads (default: 6)")
+        parser.add_argument("--db-workers", type=int, default=12, help="Number of database writer threads (default: 12)")
+        parser.add_argument("--producer-threads", type=int, default=3, help="Number of I/O producer threads per worker for concurrent bz2 decompression (default: 3)")
         parser.add_argument("--limit", type=int)
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
 
@@ -260,9 +290,11 @@ class Command(BaseCommand):
         batch_size: int = int(opts["batch_size"]) or 5000
         workers: int = max(1, int(opts["workers"]))
         db_workers: int = max(1, int(opts["db_workers"]))
+        producer_threads: int = max(1, int(opts.get("producer_threads", 3)))
         limit: Optional[int] = opts.get("limit")
 
-        logger.info("Found %d shards; starting %d workers, %d db workers", len(shards), workers, db_workers)
+        logger.info("Found %d shards; starting %d workers, %d db workers, %d producer threads per worker", 
+                    len(shards), workers, db_workers, producer_threads)
         
         # Phase 1: Ingest articles and links
         if enable_profiling:
@@ -270,7 +302,7 @@ class Command(BaseCommand):
             profiler.enable()
         
         with phase_timer("Article and Link Ingestion"):
-            created_total, skipped_total, links_total = self._run_pipeline(shards, batch_size, limit, workers, db_workers)
+            created_total, skipped_total, links_total = self._run_pipeline(shards, batch_size, limit, workers, db_workers, producer_threads)
         
         if enable_profiling:
             profiler.disable()
@@ -327,6 +359,7 @@ class Command(BaseCommand):
         limit: Optional[int],
         workers: int,
         db_workers: int,
+        producer_threads: int = 3,
     ) -> Tuple[int, int, int]:
         """Process shards using ProcessPoolExecutor and store results in database."""
         record_batch_size = max(1, min(batch_size, 2048))
@@ -426,7 +459,7 @@ class Command(BaseCommand):
                 for _ in range(initial_submit):
                     try:
                         shard = next(shard_iter)
-                        future = process_executor.submit(_process_shard_batch, [shard], record_batch_size)
+                        future = process_executor.submit(_process_shard_batch, [shard], record_batch_size, producer_threads)
                         futures[future] = shard
                     except StopIteration:
                         break
@@ -478,7 +511,7 @@ class Command(BaseCommand):
                             if limit is None or processed_records < limit:
                                 try:
                                     next_shard = next(shard_iter)
-                                    new_future = process_executor.submit(_process_shard_batch, [next_shard], record_batch_size)
+                                    new_future = process_executor.submit(_process_shard_batch, [next_shard], record_batch_size, producer_threads)
                                     futures[new_future] = next_shard
                                 except StopIteration:
                                     pass

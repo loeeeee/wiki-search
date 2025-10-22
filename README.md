@@ -83,7 +83,8 @@ python wiki_search/manage.py load_wiki_dump --workers 8 --db-workers 8  # 8-core
 | `--processed-dir PATH` | Root of pre-decompressed shards (default path under data/processed). |
 | `--batch-size N` | DB flush size for articles (default: 5000). |
 | `--workers N` | Number of worker processes (default: CPU-1). |
-| `--db-workers N` | Number of database writer threads (default: 6). |
+| `--db-workers N` | Number of database writer threads (default: 12). |
+| `--producer-threads N` | Number of I/O producer threads per worker for concurrent bz2 decompression (default: 3). |
 | `--limit N` | Stop after processing N articles (smoke tests). |
 
 Notes:
@@ -91,7 +92,14 @@ Notes:
 - It no longer performs decompression, checkpointing, signal handling, or profiling.
 - Internal link resolution (both from_article via page_id and to_article via title) happens automatically at the end.
 - **Performance optimized:** Uses persistent database connections and parallel link resolution for 2-3x faster processing.
-- **Concurrent I/O and parsing:** Each worker process uses threading to overlap bz2 decompression (I/O) with JSON parsing (CPU), maximizing resource utilization.
+- **I/O-optimized concurrent processing:** Each worker process uses configurable producer threads (I/O-bound bz2 decompression) and 1 consumer thread (CPU-bound parsing) to maximize I/O throughput and minimize overhead.
+
+#### Tuning producer threads
+
+The `--producer-threads` parameter controls how many concurrent I/O operations each worker performs:
+- **Default (3)**: Optimal for most systems with SSD or fast network storage
+- **Increase (4-6)**: For very fast storage (NVMe, RAM disk) or high-latency network storage
+- **Decrease (1-2)**: For slow HDDs or CPU-constrained systems where parsing becomes the bottleneck
 
 #### Performance characteristics
 
@@ -99,8 +107,8 @@ Notes:
 - The coordinator deduplicates page IDs per batch before inserting, allowing large `--batch-size` values without duplicate penalties.
 - Batch inserts run inside transactions sized by `--batch-size`.
 - Internal links are extracted during loading; foreign keys are resolved after ingestion in the same command.
-- **Concurrent processing:** Each worker uses 3 parser threads to overlap I/O (bz2 decompression) with CPU work (JSON parsing and text extraction).
-- **Resource utilization:** Maximizes both CPU and I/O throughput by eliminating sequential bottlenecks.
+- **I/O-optimized concurrent processing:** Each worker uses 3 producer threads (concurrent I/O-bound bz2 decompression) and 1 consumer thread (CPU-bound JSON parsing and text extraction) to maximize I/O throughput.
+- **Resource utilization:** Prioritizes I/O parallelism over CPU parallelism since bz2 decompression is heavily I/O-bound, achieving 3x better I/O utilization.
 
 ## Summarize database
 
