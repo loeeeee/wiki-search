@@ -46,6 +46,14 @@ def find_bz2_files(root: Path) -> List[Path]:
     return results
 
 
+def iter_jsonl_bz2_raw(file_path: Path) -> Iterator[str]:
+    """Yield raw JSON lines from bz2 file without parsing."""
+    with bz2.open(file_path, mode="rt", encoding="utf-8", errors="strict") as f:
+        for line in f:
+            if line.strip():
+                yield line
+
+
 def iter_jsonl_bz2(file_path: Path) -> Iterator[dict]:
     # Use larger buffer for better I/O performance
     with bz2.open(file_path, mode="rt", encoding="utf-8", errors="strict", compresslevel=9) as f:
@@ -97,41 +105,120 @@ def _process_shard_batch(shard_paths: List[Path], record_batch_size: int = 2048)
     List[Tuple[int, str, str]],  # (from_page_id, to_title, anchor_text)
     int  # records_emitted
 ]:
-    """Process multiple shard files and return lightweight tuples.
+    """Process multiple shard files with concurrent I/O and parsing.
 
     This function is at module level so it can be pickled for ProcessPoolExecutor.
-    Processing multiple shards per worker task reduces overhead and improves throughput.
+    Uses producer-consumer threading pattern to overlap bz2 decompression (I/O) 
+    with JSON parsing and text extraction (CPU), maximizing resource utilization.
     Returns simple tuples to minimize serialization overhead between processes.
-    Workers do the heavy lifting: parsing, text extraction, link extraction.
     """
+    import queue
+    from threading import Thread
+    
     articles: List[Tuple[int, Optional[str], List[str]]] = []
     links: List[Tuple[int, str, str]] = []
-
+    
+    # Use 2-3 parser threads per shard for optimal CPU utilization
+    NUM_PARSER_THREADS = 3
+    QUEUE_SIZE = 1000  # Buffer between I/O and parsing
+    
     for shard_path in shard_paths:
         shard_str = str(shard_path)
+        raw_queue: queue.Queue = queue.Queue(maxsize=QUEUE_SIZE)
+        result_queue: queue.Queue = queue.Queue()
+        parsing_errors: List[Exception] = []
         
-        for rec in iter_jsonl_bz2(shard_path):
-            page_id_raw = rec.get("id")
-            if page_id_raw is None:
-                logger.error("Record missing 'id' in %s", shard_str)
-                raise ValueError(f"Missing id in record from {shard_str}")
+        # Producer: read and decompress
+        def producer():
             try:
-                page_id_int = int(page_id_raw)
+                for line in iter_jsonl_bz2_raw(shard_path):
+                    raw_queue.put(line)
             except Exception as exc:
-                logger.error("Non-integer id in %s: %r (%s)", shard_str, page_id_raw, exc)
-                raise
+                logger.error("Error reading shard %s: %s", shard_str, exc)
+                result_queue.put((None, exc))
+            finally:
+                # Sentinel values to signal end
+                for _ in range(NUM_PARSER_THREADS):
+                    raw_queue.put(None)
+        
+        # Consumer: parse and extract
+        def consumer():
+            while True:
+                line = raw_queue.get()
+                if line is None:
+                    # Signal completion
+                    result_queue.put(("COMPLETED", None, None))
+                    break
+                try:
+                    rec = _json.loads(line)
+                    
+                    page_id_raw = rec.get("id")
+                    if page_id_raw is None:
+                        logger.error("Record missing 'id' in %s", shard_str)
+                        result_queue.put((None, None, ValueError(f"Missing id in record from {shard_str}")))
+                        continue
+                    
+                    try:
+                        page_id_int = int(page_id_raw)
+                    except Exception as exc:
+                        logger.error("Non-integer id in %s: %r (%s)", shard_str, page_id_raw, exc)
+                        result_queue.put((None, None, exc))
+                        continue
 
-            title = rec.get("title")
-            text = rec.get("text") or []
-            paragraphs = extract_plain_paragraphs(text)
-            shard_links = extract_internal_links(text)
+                    title = rec.get("title")
+                    text = rec.get("text") or []
+                    paragraphs = extract_plain_paragraphs(text)
+                    shard_links = extract_internal_links(text)
 
-            # Return lightweight tuples - no Django objects to pickle
-            articles.append((page_id_int, title, paragraphs))
-            
-            # Return link tuples
-            for target_title, anchor_text in shard_links:
-                links.append((page_id_int, target_title, anchor_text))
+                    # Create result tuple
+                    article_tuple = (page_id_int, title, paragraphs)
+                    link_tuples = [(page_id_int, target_title, anchor_text) for target_title, anchor_text in shard_links]
+                    
+                    result_queue.put((article_tuple, link_tuples, None))
+                    
+                except Exception as exc:
+                    logger.error("Error parsing record in %s: %s", shard_str, exc)
+                    result_queue.put((None, None, exc))
+                finally:
+                    raw_queue.task_done()
+        
+        # Start threads
+        producer_thread = Thread(target=producer, daemon=True)
+        consumer_threads = [Thread(target=consumer, daemon=True) for _ in range(NUM_PARSER_THREADS)]
+        
+        producer_thread.start()
+        for t in consumer_threads:
+            t.start()
+        
+        # Collect results
+        completed_consumers = 0
+        while completed_consumers < NUM_PARSER_THREADS:
+            try:
+                result = result_queue.get(timeout=30)  # 30 second timeout
+                if len(result) == 3:
+                    article_tuple, link_tuples, error = result
+                    if result[0] == "COMPLETED":  # Consumer completed
+                        completed_consumers += 1
+                    elif error is not None:  # Error case
+                        parsing_errors.append(error)
+                    elif article_tuple is not None:  # Success case
+                        articles.append(article_tuple)
+                        links.extend(link_tuples)
+                elif len(result) == 2 and result[1] is not None:  # Producer error
+                    parsing_errors.append(result[1])
+            except queue.Empty:
+                logger.error("Timeout waiting for results from shard %s", shard_str)
+                break
+        
+        # Wait for all threads to complete
+        producer_thread.join(timeout=5)
+        for t in consumer_threads:
+            t.join(timeout=5)
+        
+        # Check for errors
+        if parsing_errors:
+            from django.core.management.base import CommandError
+            raise CommandError(f"Errors processing shard {shard_str}: {parsing_errors[0]}")
 
     return articles, links, len(articles)
 

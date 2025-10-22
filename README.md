@@ -91,6 +91,7 @@ Notes:
 - It no longer performs decompression, checkpointing, signal handling, or profiling.
 - Internal link resolution (both from_article via page_id and to_article via title) happens automatically at the end.
 - **Performance optimized:** Uses persistent database connections and parallel link resolution for 2-3x faster processing.
+- **Concurrent I/O and parsing:** Each worker process uses threading to overlap bz2 decompression (I/O) with JSON parsing (CPU), maximizing resource utilization.
 
 #### Performance characteristics
 
@@ -98,6 +99,8 @@ Notes:
 - The coordinator deduplicates page IDs per batch before inserting, allowing large `--batch-size` values without duplicate penalties.
 - Batch inserts run inside transactions sized by `--batch-size`.
 - Internal links are extracted during loading; foreign keys are resolved after ingestion in the same command.
+- **Concurrent processing:** Each worker uses 3 parser threads to overlap I/O (bz2 decompression) with CPU work (JSON parsing and text extraction).
+- **Resource utilization:** Maximizes both CPU and I/O throughput by eliminating sequential bottlenecks.
 
 ## Summarize database
 
