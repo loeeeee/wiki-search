@@ -12,7 +12,8 @@ from django.db import transaction
 from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, TFIDFIndex, Vocabulary
-from search_engine.search import compute_idf, compute_tf, tokenize, vector_l2_norm
+from search_engine.search import compute_idf, compute_tf, vector_l2_norm
+from search_engine.tokenizer import tokenize
 
 logger = logging.getLogger(__name__)
 

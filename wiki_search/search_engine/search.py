@@ -17,32 +17,7 @@ from django.db.models import QuerySet
 from .models import Article, InvertedIndex, PageRank, TFIDFIndex, Vocabulary
 
 
-_WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-_STOPWORDS = {
-    "the",
-    "a",
-    "an",
-    "and",
-    "or",
-    "is",
-    "are",
-    "of",
-    "to",
-    "in",
-    "for",
-    "on",
-    "with",
-    "as",
-    "by",
-    "at",
-}
-
-
-def tokenize(text: str | None) -> List[str]:
-    if not text:
-        return []
-    tokens = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
-    return [t for t in tokens if t not in _STOPWORDS]
+from .tokenizer import tokenize
 
 
 def compute_tf(tokens: Iterable[str]) -> Dict[str, float]:

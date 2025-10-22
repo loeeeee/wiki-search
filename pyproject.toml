@@ -12,4 +12,6 @@ dependencies = [
     "tqdm>=4.67.1",
     "numpy>=2.0.0",
     "scipy>=1.14.0",
+    "tiktoken>=0.8.0",  # GPT tokenizer
+    "nltk>=3.9.0",  # NLTK tokenizer
 ]

@@ -229,3 +229,58 @@ Access comprehensive database statistics and system information at `http://local
 - Auto-refresh every 30 seconds
 
 The status page provides real-time monitoring of your Wikipedia search engine's health and performance.
+
+## Tokenizer Configuration
+
+The search engine supports three different tokenization strategies, configurable via Django settings:
+
+### Available Tokenizers
+
+1. **GPT Tokenizer (Default)**
+   - Uses tiktoken with cl100k_base encoding (GPT-4 compatible)
+   - Subword tokenization, handles unknown words well
+   - Best for compatibility with transformer models
+   - Performance: ~50,000 tokens/second
+
+2. **NLTK Tokenizer**
+   - Uses NLTK's word_tokenize with stopword filtering
+   - Linguistically-aware tokenization
+   - Good for natural language processing tasks
+   - Performance: ~20,000 tokens/second
+
+3. **Naive Tokenizer**
+   - Simple regex-based tokenization
+   - Fastest performance, minimal dependencies
+   - Good for simple word matching
+   - Performance: ~100,000 tokens/second
+
+### Configuration
+
+Set the tokenizer in `wiki_search/settings.py`:
+
+```python
+# Tokenizer configuration
+TOKENIZER_TYPE = 'gpt'  # Options: 'gpt', 'nltk', 'naive'
+```
+
+### Changing Tokenizers
+
+**Important**: When changing the tokenizer, you must rebuild all search indexes:
+
+```bash
+# Clear existing indexes
+python manage.py clean_db --yes
+
+# Rebuild with new tokenizer
+python manage.py build_tfidf_index --rebuild
+```
+
+### Performance Characteristics
+
+| Tokenizer | Speed | Memory | Quality | Use Case |
+|-----------|-------|--------|---------|----------|
+| GPT | Medium | Medium | High | Transformer compatibility |
+| NLTK | Slow | High | High | Linguistic accuracy |
+| Naive | Fast | Low | Medium | Simple matching |
+
+For detailed information, see [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md).
