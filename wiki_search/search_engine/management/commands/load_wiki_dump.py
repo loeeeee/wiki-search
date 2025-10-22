@@ -146,7 +146,7 @@ class Command(BaseCommand):
         parser.add_argument("--processed-dir", default=str(_default_processed_dir()))
         parser.add_argument("--batch-size", type=int, default=5000)
         parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
-        parser.add_argument("--db-workers", type=int, default=6, help="Number of database writer threads (default: 6)")
+        parser.add_argument("--db-workers", type=int, default=12, help="Number of database writer threads (default: 6)")
         parser.add_argument("--limit", type=int)
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
 
