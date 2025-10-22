@@ -146,6 +146,7 @@ class Command(BaseCommand):
         parser.add_argument("--processed-dir", default=str(_default_processed_dir()))
         parser.add_argument("--batch-size", type=int, default=5000)
         parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+        parser.add_argument("--db-workers", type=int, default=6, help="Number of database writer threads (default: 6)")
         parser.add_argument("--limit", type=int)
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
 
@@ -158,7 +159,7 @@ class Command(BaseCommand):
         # Always clean the DB first
         with phase_timer("DB Cleanup"):
             logger.info("Cleaning database tables before ingestion")
-            call_command("clean_db", yes=True, no_progress=True, drop_recreate=True)
+            call_command("clean_db", yes=True, no_progress=True)
 
         processed_dir = Path(opts["processed_dir"]).expanduser()
         if not processed_dir.exists():
@@ -170,9 +171,10 @@ class Command(BaseCommand):
 
         batch_size: int = int(opts["batch_size"]) or 5000
         workers: int = max(1, int(opts["workers"]))
+        db_workers: int = max(1, int(opts["db_workers"]))
         limit: Optional[int] = opts.get("limit")
 
-        logger.info("Found %d shards; starting %d workers", len(shards), workers)
+        logger.info("Found %d shards; starting %d workers, %d db workers", len(shards), workers, db_workers)
         
         # Phase 1: Ingest articles and links
         if enable_profiling:
@@ -180,7 +182,7 @@ class Command(BaseCommand):
             profiler.enable()
         
         with phase_timer("Article and Link Ingestion"):
-            created_total, skipped_total, links_total = self._run_pipeline(shards, batch_size, limit, workers)
+            created_total, skipped_total, links_total = self._run_pipeline(shards, batch_size, limit, workers, db_workers)
         
         if enable_profiling:
             profiler.disable()
@@ -199,7 +201,7 @@ class Command(BaseCommand):
             profiler.enable()
         
         with phase_timer("Resolve from_article Links"):
-            updated_from = self._resolve_from_article(batch_size)
+            updated_from = self._resolve_from_article(batch_size, db_workers)
         
         if enable_profiling:
             profiler.disable()
@@ -211,7 +213,7 @@ class Command(BaseCommand):
             profiler.enable()
         
         with phase_timer("Resolve to_article Links"):
-            updated_to = self._resolve_to_article(batch_size)
+            updated_to = self._resolve_to_article(batch_size, db_workers)
         
         if enable_profiling:
             profiler.disable()
@@ -236,6 +238,7 @@ class Command(BaseCommand):
         batch_size: int,
         limit: Optional[int],
         workers: int,
+        db_workers: int,
     ) -> Tuple[int, int, int]:
         """Process shards using ProcessPoolExecutor and store results in database."""
         record_batch_size = max(1, min(batch_size, 2048))
@@ -318,7 +321,7 @@ class Command(BaseCommand):
             # Use separate thread executor for database writes to avoid blocking main process
             db_write_futures: List[Any] = []
             
-            with ThreadPoolExecutor(max_workers=2) as db_executor, \
+            with ThreadPoolExecutor(max_workers=db_workers) as db_executor, \
                  ProcessPoolExecutor(max_workers=workers) as process_executor:
                 
                 # For I/O-bound work (bz2 decompression), we need MANY more pending tasks
@@ -440,8 +443,8 @@ class Command(BaseCommand):
 
         return created_total, skipped_total, links_total
 
-    def _resolve_from_article(self, batch_size: int) -> int:
-        """Resolve from_article foreign keys using efficient SQL UPDATE with JOIN."""
+    def _resolve_from_article(self, batch_size: int, db_workers: int = 6) -> int:
+        """Resolve from_article foreign keys using parallel batched SQL UPDATE with JOIN."""
         from django.db import connection
         
         unresolved_count = InternalLink.objects.filter(
@@ -452,27 +455,59 @@ class Command(BaseCommand):
             logger.info("No from_article links to resolve")
             return 0
 
-        logger.info("Resolving from_article for %d links", unresolved_count)
+        logger.info("Resolving from_article for %d links using %d workers", unresolved_count, db_workers)
 
-        # Use direct SQL UPDATE with JOIN - much faster than bulk_update
-        # This executes in a single database operation instead of N queries
-        with connection.cursor() as cursor:
-            sql = """
-                UPDATE search_engine_internallink AS link
-                SET from_article_id = article.id
-                FROM search_engine_article AS article
-                WHERE link.from_page_id = article.page_id
-                  AND link.from_article_id IS NULL
-                  AND link.from_page_id IS NOT NULL
-            """
-            cursor.execute(sql)
-            updated_total = cursor.rowcount
+        # Get all unresolved link IDs to split into batches
+        unresolved_ids = list(InternalLink.objects.filter(
+            from_article__isnull=True, from_page_id__isnull=False
+        ).values_list('id', flat=True))
+        
+        if not unresolved_ids:
+            return 0
+
+        # Split into batches for parallel processing
+        batch_size_actual = max(1, len(unresolved_ids) // db_workers)
+        batches = []
+        for i in range(0, len(unresolved_ids), batch_size_actual):
+            batch_ids = unresolved_ids[i:i + batch_size_actual]
+            if batch_ids:
+                batches.append(batch_ids)
+
+        logger.info("Processing %d batches of from_article links", len(batches))
+
+        def update_batch_from_article(batch_ids: List[int]) -> int:
+            """Update a batch of from_article links."""
+            from django.db import connection
+            with connection.cursor() as cursor:
+                sql = """
+                    UPDATE search_engine_internallink AS link
+                    SET from_article_id = article.id
+                    FROM search_engine_article AS article
+                    WHERE link.from_page_id = article.page_id
+                      AND link.from_article_id IS NULL
+                      AND link.from_page_id IS NOT NULL
+                      AND link.id = ANY(%s)
+                """
+                cursor.execute(sql, [batch_ids])
+                return cursor.rowcount
+
+        # Process batches in parallel
+        updated_total = 0
+        with ThreadPoolExecutor(max_workers=db_workers) as executor:
+            futures = [executor.submit(update_batch_from_article, batch_ids) for batch_ids in batches]
+            for future in as_completed(futures):
+                try:
+                    batch_updated = future.result()
+                    updated_total += batch_updated
+                except Exception as exc:
+                    logger.error("Error in from_article batch update: %s", exc)
+                    raise
 
         logger.info("Resolved from_article for %d links", updated_total)
         return updated_total
 
-    def _resolve_to_article(self, batch_size: int) -> int:
-        """Resolve to_article foreign keys using efficient SQL UPDATE with JOIN."""
+    def _resolve_to_article(self, batch_size: int, db_workers: int = 6) -> int:
+        """Resolve to_article foreign keys using parallel batched SQL UPDATE with JOIN."""
         from django.db import connection
         
         unresolved_count = InternalLink.objects.filter(to_article__isnull=True).count()
@@ -481,20 +516,52 @@ class Command(BaseCommand):
             logger.info("No to_article links to resolve")
             return 0
 
-        logger.info("Resolving to_article for %d links", unresolved_count)
+        logger.info("Resolving to_article for %d links using %d workers", unresolved_count, db_workers)
 
-        # Use direct SQL UPDATE with JOIN - much faster than bulk_update
-        # This executes in a single database operation instead of N queries
-        with connection.cursor() as cursor:
-            sql = """
-                UPDATE search_engine_internallink AS link
-                SET to_article_id = article.id
-                FROM search_engine_article AS article
-                WHERE link.to_title = article.title
-                  AND link.to_article_id IS NULL
-            """
-            cursor.execute(sql)
-            updated_total = cursor.rowcount
+        # Get all unresolved link IDs to split into batches
+        unresolved_ids = list(InternalLink.objects.filter(
+            to_article__isnull=True
+        ).values_list('id', flat=True))
+        
+        if not unresolved_ids:
+            return 0
+
+        # Split into batches for parallel processing
+        batch_size_actual = max(1, len(unresolved_ids) // db_workers)
+        batches = []
+        for i in range(0, len(unresolved_ids), batch_size_actual):
+            batch_ids = unresolved_ids[i:i + batch_size_actual]
+            if batch_ids:
+                batches.append(batch_ids)
+
+        logger.info("Processing %d batches of to_article links", len(batches))
+
+        def update_batch_to_article(batch_ids: List[int]) -> int:
+            """Update a batch of to_article links."""
+            from django.db import connection
+            with connection.cursor() as cursor:
+                sql = """
+                    UPDATE search_engine_internallink AS link
+                    SET to_article_id = article.id
+                    FROM search_engine_article AS article
+                    WHERE link.to_title = article.title
+                      AND link.to_article_id IS NULL
+                      AND link.id = ANY(%s)
+                """
+                cursor.execute(sql, [batch_ids])
+                return cursor.rowcount
+
+        # Process batches in parallel
+        updated_total = 0
+        with ThreadPoolExecutor(max_workers=db_workers) as executor:
+            futures = [executor.submit(update_batch_to_article, batch_ids) for batch_ids in batches]
+            for future in as_completed(futures):
+                try:
+                    batch_updated = future.result()
+                    updated_total += batch_updated
+                except Exception as exc:
+                    logger.error("Error in to_article batch update: %s", exc)
+                    raise
 
         logger.info("Resolved to_article for %d links", updated_total)
         return updated_total

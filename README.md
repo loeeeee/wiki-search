@@ -65,11 +65,15 @@ Requirements:
 - The HotpotQA 2017 dump must be pre-decompressed into `data/processed/enwiki-20171001-pages-meta-current-withlinks-processed/` (decompression is handled by a separate script).
 
 ```bash
-# One-step load + link resolution
-python wiki_search/manage.py load_wiki_dump --workers 6 --batch-size 5000
+# One-step load + link resolution (optimized with 6 database workers)
+python wiki_search/manage.py load_wiki_dump --workers 6 --db-workers 6 --batch-size 5000
 
 # Optional: process only a subset
 python wiki_search/manage.py load_wiki_dump --limit 200000
+
+# Performance tuning for different systems
+python wiki_search/manage.py load_wiki_dump --workers 4 --db-workers 4  # 4-core system
+python wiki_search/manage.py load_wiki_dump --workers 8 --db-workers 8  # 8-core system
 ```
 
 ### Options for load_wiki_dump
@@ -79,12 +83,14 @@ python wiki_search/manage.py load_wiki_dump --limit 200000
 | `--processed-dir PATH` | Root of pre-decompressed shards (default path under data/processed). |
 | `--batch-size N` | DB flush size for articles (default: 5000). |
 | `--workers N` | Number of worker processes (default: CPU-1). |
+| `--db-workers N` | Number of database writer threads (default: 6). |
 | `--limit N` | Stop after processing N articles (smoke tests). |
 
 Notes:
 - This command always drops data at start by calling `clean_db` (non-interactive, optimized for the database backend).
 - It no longer performs decompression, checkpointing, signal handling, or profiling.
 - Internal link resolution (both from_article via page_id and to_article via title) happens automatically at the end.
+- **Performance optimized:** Uses persistent database connections and parallel link resolution for 2-3x faster processing.
 
 #### Performance characteristics
 

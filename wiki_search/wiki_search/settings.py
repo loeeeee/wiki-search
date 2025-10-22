@@ -82,6 +82,8 @@ DATABASES = {
         'PASSWORD': os.environ.get('POSTGRES_PASSWORD', 'wikiwikiwiki'),
         'HOST': os.environ.get('POSTGRES_HOST', '172.22.0.133'),
         'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+        'CONN_MAX_AGE': 600,  # Keep connections alive for 10 minutes
+        'CONN_HEALTH_CHECKS': True,  # Django 4.1+ health checks
         'OPTIONS': {
             'connect_timeout': 10,
         },

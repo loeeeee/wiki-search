@@ -78,7 +78,7 @@ class Command(BaseCommand):
                 # Use PostgreSQL TRUNCATE CASCADE for maximum speed
                 logger.info("Executing TRUNCATE CASCADE")
                 table_list = ", ".join(tables)
-                truncate_sql = f"TRUNCATE TABLE {table_list} CASCADE RESTART IDENTITY"
+                truncate_sql = f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE"
                 
                 if use_progress and (total_links or total_redirects or total_articles):
                     with tqdm(total=1, desc="Truncating all tables", unit="operation") as pbar:
@@ -89,7 +89,7 @@ class Command(BaseCommand):
 
             elapsed = time.perf_counter() - start_ts
             logger.info("Data deletion completed in %.2fs", elapsed)
-            return articles_deleted, redirects_deleted, links_deleted
+            return total_articles, total_redirects, total_links
 
         # Fast truncate approach
         articles_deleted, redirects_deleted, links_deleted = truncate_all_tables()
