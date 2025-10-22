@@ -1,0 +1,291 @@
+{% extends 'search_engine/base.html' %}
+
+{% block title %}Database Status - Wikipedia Search{% endblock %}
+
+{% block extra_css %}
+<style>
+    .status-header {
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    
+    .status-header h1 {
+        color: #2c3e50;
+        margin-bottom: 0.5rem;
+    }
+    
+    .status-header p {
+        color: #666;
+        font-size: 1.1rem;
+    }
+    
+    .refresh-controls {
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    
+    .refresh-button {
+        background: #28a745;
+        color: white;
+        border: none;
+        padding: 0.5rem 1rem;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 0.9rem;
+        margin-right: 1rem;
+    }
+    
+    .refresh-button:hover {
+        background: #218838;
+    }
+    
+    .auto-refresh {
+        color: #666;
+        font-size: 0.9rem;
+    }
+    
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 1.5rem;
+        margin-bottom: 2rem;
+    }
+    
+    .stat-card {
+        background: white;
+        border: 1px solid #e1e5e9;
+        border-radius: 8px;
+        padding: 1.5rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    
+    .stat-card h3 {
+        color: #2c3e50;
+        margin-bottom: 1rem;
+        font-size: 1.2rem;
+        border-bottom: 2px solid #e1e5e9;
+        padding-bottom: 0.5rem;
+    }
+    
+    .stat-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.5rem 0;
+        border-bottom: 1px solid #f8f9fa;
+    }
+    
+    .stat-item:last-child {
+        border-bottom: none;
+    }
+    
+    .stat-label {
+        font-weight: 500;
+        color: #555;
+    }
+    
+    .stat-value {
+        font-weight: 600;
+        color: #2c3e50;
+    }
+    
+    .stat-value.number {
+        font-family: 'Courier New', monospace;
+        background: #f8f9fa;
+        padding: 0.2rem 0.5rem;
+        border-radius: 3px;
+    }
+    
+    .error-message {
+        background: #f8d7da;
+        color: #721c24;
+        padding: 1rem;
+        border-radius: 5px;
+        margin-bottom: 1rem;
+        border: 1px solid #f5c6cb;
+    }
+    
+    .system-info {
+        background: #d1ecf1;
+        color: #0c5460;
+        padding: 1rem;
+        border-radius: 5px;
+        margin-bottom: 1rem;
+        border: 1px solid #bee5eb;
+    }
+    
+    .no-data {
+        color: #6c757d;
+        font-style: italic;
+    }
+    
+    @media (max-width: 768px) {
+        .stats-grid {
+            grid-template-columns: 1fr;
+        }
+        
+        .stat-item {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.25rem;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="status-header">
+    <h1>Database Status</h1>
+    <p>Comprehensive statistics and system information</p>
+</div>
+
+<div class="refresh-controls">
+    <button class="refresh-button" onclick="location.reload()">Refresh Now</button>
+    <span class="auto-refresh">Auto-refresh: 30 seconds</span>
+</div>
+
+{% if error %}
+<div class="error-message">
+    <strong>Error loading status:</strong> {{ error }}
+</div>
+{% endif %}
+
+<div class="system-info">
+    <strong>Database Backend:</strong> {{ db_backend|title }} {{ db_version }}<br>
+    <strong>Last Updated:</strong> <span id="last-updated"></span>
+</div>
+
+<div class="stats-grid">
+    <!-- Basic Statistics -->
+    <div class="stat-card">
+        <h3>Basic Statistics</h3>
+        <div class="stat-item">
+            <span class="stat-label">Articles</span>
+            <span class="stat-value number">{{ article_count|floatformat:0 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Redirects</span>
+            <span class="stat-value number">{{ redirect_count|floatformat:0 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Internal Links</span>
+            <span class="stat-value number">{{ link_count|floatformat:0 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Unresolved Links</span>
+            <span class="stat-value number">{{ unresolved_links|floatformat:0 }}</span>
+        </div>
+    </div>
+
+    <!-- Search Indexes -->
+    <div class="stat-card">
+        <h3>Search Indexes</h3>
+        <div class="stat-item">
+            <span class="stat-label">Vocabulary Terms</span>
+            <span class="stat-value number">{{ vocabulary_count|floatformat:0 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">TF-IDF Vectors</span>
+            <span class="stat-value number">{{ tfidf_count|floatformat:0 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Inverted Index Entries</span>
+            <span class="stat-value number">{{ inverted_index_count|floatformat:0 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">PageRank Scores</span>
+            <span class="stat-value number">{{ pagerank_count|floatformat:0 }}</span>
+        </div>
+    </div>
+
+    <!-- Content Statistics -->
+    <div class="stat-card">
+        <h3>Content Statistics</h3>
+        <div class="stat-item">
+            <span class="stat-label">Avg Paragraphs/Article</span>
+            <span class="stat-value number">{{ avg_paragraphs|floatformat:1 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Avg Outgoing Links</span>
+            <span class="stat-value number">{{ avg_outgoing_links|floatformat:1 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Avg Incoming Links</span>
+            <span class="stat-value number">{{ avg_incoming_links|floatformat:1 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Sample Size</span>
+            <span class="stat-value number">{{ sample_size }}</span>
+        </div>
+    </div>
+
+    <!-- PageRank Statistics -->
+    {% if pagerank_stats %}
+    <div class="stat-card">
+        <h3>PageRank Statistics</h3>
+        <div class="stat-item">
+            <span class="stat-label">Max Score</span>
+            <span class="stat-value number">{{ pagerank_stats.max_score|floatformat:6 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Min Score</span>
+            <span class="stat-value number">{{ pagerank_stats.min_score|floatformat:6 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Avg Score</span>
+            <span class="stat-value number">{{ pagerank_stats.avg_score|floatformat:6 }}</span>
+        </div>
+        {% if pagerank_stats.last_computed %}
+        <div class="stat-item">
+            <span class="stat-label">Last Computed</span>
+            <span class="stat-value">{{ pagerank_stats.last_computed|date:"M d, Y H:i" }}</span>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    <!-- TF-IDF Statistics -->
+    {% if tfidf_stats %}
+    <div class="stat-card">
+        <h3>TF-IDF Statistics</h3>
+        <div class="stat-item">
+            <span class="stat-label">Avg L2 Norm</span>
+            <span class="stat-value number">{{ tfidf_stats.avg_l2_norm|floatformat:4 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Max L2 Norm</span>
+            <span class="stat-value number">{{ tfidf_stats.max_l2_norm|floatformat:4 }}</span>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Vocabulary Statistics -->
+    {% if vocab_stats %}
+    <div class="stat-card">
+        <h3>Vocabulary Statistics</h3>
+        <div class="stat-item">
+            <span class="stat-label">Avg Document Frequency</span>
+            <span class="stat-value number">{{ vocab_stats.avg_document_frequency|floatformat:1 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Max Document Frequency</span>
+            <span class="stat-value number">{{ vocab_stats.max_document_frequency|floatformat:0 }}</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-label">Avg IDF Value</span>
+            <span class="stat-value number">{{ vocab_stats.avg_idf|floatformat:4 }}</span>
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<script>
+    // Set current time as last updated
+    document.getElementById('last-updated').textContent = new Date().toLocaleString();
+    
+    // Auto-refresh every 30 seconds
+    setTimeout(function() {
+        location.reload();
+    }, 30000);
+</script>
+{% endblock %}

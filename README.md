@@ -179,6 +179,7 @@ The project includes a two-page Django web application for searching and viewing
 
 - **Search Page**: Clean search interface with results showing article titles and snippets
 - **Article Detail Page**: Full article content with navigation back to search
+- **Status Page**: Comprehensive database statistics and system information at `/status/`
 - **Hybrid Search**: Combines TF-IDF relevance scoring with PageRank authority
 - **Responsive Design**: Mobile-friendly interface with modern styling
 - **Fast Performance**: Optimized database queries and efficient search algorithms
@@ -203,3 +204,28 @@ python manage.py build_pagerank
 ```
 
 The web app will work with basic title search even without these indexes, but hybrid search provides much better results.
+
+### Database Status Page
+
+Access comprehensive database statistics and system information at `http://localhost:8000/status/`:
+
+**Basic Statistics:**
+- Article count, redirects, internal links, unresolved links
+- Search index statistics (TF-IDF, Vocabulary, InvertedIndex, PageRank)
+
+**Content Analysis:**
+- Average paragraphs per article
+- Average outgoing/incoming links per article
+- Sample-based performance metrics
+
+**Search Index Details:**
+- PageRank score statistics (min/max/average)
+- TF-IDF vector statistics (L2 norms)
+- Vocabulary statistics (document frequency, IDF values)
+
+**System Information:**
+- Database backend and version
+- Last updated timestamp
+- Auto-refresh every 30 seconds
+
+The status page provides real-time monitoring of your Wikipedia search engine's health and performance.
