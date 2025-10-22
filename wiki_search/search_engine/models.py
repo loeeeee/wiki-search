@@ -54,3 +54,36 @@ class InternalLink(models.Model):
             models.Index(fields=['to_article']),
             models.Index(fields=['to_title']),
         ]
+
+
+class InvertedIndex(models.Model):
+    """Fast candidate filtering for TF-IDF search using inverted index."""
+    term = models.ForeignKey('Vocabulary', on_delete=models.CASCADE, related_name='inverted_entries')
+    article = models.ForeignKey('Article', on_delete=models.CASCADE, related_name='inverted_entries')
+    tf_idf_score = models.FloatField(default=0.0)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['term', 'tf_idf_score']),  # For query filtering
+            models.Index(fields=['article']),
+        ]
+        unique_together = [['term', 'article']]  # Prevent duplicate entries
+
+    def __str__(self) -> str:
+        return f"{self.term.term} -> {self.article.title} ({self.tf_idf_score:.4f})"
+
+
+class PageRank(models.Model):
+    """Store precomputed PageRank scores for articles."""
+    article = models.OneToOneField('Article', on_delete=models.CASCADE, related_name='pagerank')
+    score = models.FloatField(default=0.0, db_index=True)
+    iteration_count = models.PositiveIntegerField(default=0)  # Convergence tracking
+    last_computed = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['-score']),  # For ordering by PageRank score
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.article.title} (PR: {self.score:.6f})"

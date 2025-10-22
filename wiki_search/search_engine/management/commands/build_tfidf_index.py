@@ -1,91 +1,314 @@
 from __future__ import annotations
 
-import json
-from collections import Counter, defaultdict
-from typing import Dict, Iterable, List, Tuple
+import logging
+import os
+import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import Dict, List, Tuple
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from tqdm import tqdm
 
-from search_engine.models import Article, TFIDFIndex, Vocabulary
+from search_engine.models import Article, InvertedIndex, TFIDFIndex, Vocabulary
 from search_engine.search import compute_idf, compute_tf, tokenize, vector_l2_norm
+
+logger = logging.getLogger(__name__)
+
+
+def _compute_doc_freq_batch(article_tuples: List[Tuple[int, List[str]]]) -> Counter:
+    """Worker: tokenize article paragraphs, return local df Counter.
+    
+    Input: lightweight tuples (article_id, paragraphs)
+    Output: Counter of unique terms seen across batch
+    """
+    doc_freq = Counter()
+    for article_id, paragraphs in article_tuples:
+        seen_terms = set()
+        for para in paragraphs:
+            seen_terms.update(tokenize(para))
+        doc_freq.update(seen_terms)
+    return doc_freq
+
+
+def _build_tfidf_batch(
+    article_tuples: List[Tuple[int, List[str]]],
+    term_to_id: Dict[str, int],
+    term_to_idf: Dict[str, float]
+) -> Tuple[
+    List[Tuple[int, Dict[int, float], float]],  # (article_id, tfidf_vec, l2_norm)
+    List[Tuple[int, int, float]]  # (term_id, article_id, tfidf_score) for InvertedIndex
+]:
+    """Worker: compute TF-IDF vectors and inverted index tuples.
+    
+    Returns lightweight tuples to minimize serialization overhead.
+    """
+    tfidf_tuples = []
+    inverted_tuples = []
+    
+    for article_id, paragraphs in article_tuples:
+        tokens = []
+        for para in paragraphs:
+            tokens.extend(tokenize(para))
+        
+        tf = compute_tf(tokens)
+        vec = {}
+        for term, tf_val in tf.items():
+            term_id = term_to_id.get(term)
+            idf_val = term_to_idf.get(term)
+            if term_id is None or idf_val is None:
+                continue
+            tfidf_score = tf_val * idf_val
+            vec[term_id] = tfidf_score
+            inverted_tuples.append((term_id, article_id, tfidf_score))
+        
+        l2_norm = vector_l2_norm(vec.values()) if vec else 0.0
+        tfidf_tuples.append((article_id, vec, l2_norm))
+    
+    return tfidf_tuples, inverted_tuples
+
+
+def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float]]) -> int:
+    """Synchronous TF-IDF flush - to be run in background thread."""
+    if not tfidf_tuples:
+        return 0
+    
+    # Get articles for the tuples
+    article_ids = [tup[0] for tup in tfidf_tuples]
+    articles = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
+    
+    # Create TFIDFIndex objects
+    tfidf_objects = []
+    for article_id, vec, l2_norm in tfidf_tuples:
+        if article_id in articles:
+            tfidf_objects.append(
+                TFIDFIndex(
+                    article=articles[article_id],
+                    tfidf_vector={str(k): float(v) for k, v in vec.items()},
+                    l2_norm=float(l2_norm)
+                )
+            )
+    
+    if tfidf_objects:
+        with transaction.atomic():
+            TFIDFIndex.objects.bulk_create(tfidf_objects, batch_size=1000, ignore_conflicts=True)
+    
+    return len(tfidf_objects)
+
+
+def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]]) -> int:
+    """Synchronous inverted index flush - to be run in background thread."""
+    if not inverted_tuples:
+        return 0
+    
+    # Get vocabulary terms and articles for the tuples
+    term_ids = list(set(tup[0] for tup in inverted_tuples))
+    article_ids = list(set(tup[1] for tup in inverted_tuples))
+    
+    vocab_map = {v.id: v for v in Vocabulary.objects.filter(id__in=term_ids)}
+    article_map = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
+    
+    # Create InvertedIndex objects
+    inverted_objects = []
+    for term_id, article_id, tfidf_score in inverted_tuples:
+        if term_id in vocab_map and article_id in article_map:
+            inverted_objects.append(
+                InvertedIndex(
+                    term=vocab_map[term_id],
+                    article=article_map[article_id],
+                    tf_idf_score=float(tfidf_score)
+                )
+            )
+    
+    if inverted_objects:
+        with transaction.atomic():
+            InvertedIndex.objects.bulk_create(inverted_objects, batch_size=2000, ignore_conflicts=True)
+    
+    return len(inverted_objects)
 
 
 class Command(BaseCommand):
-    help = "Build TF-IDF index over Article.plain_text_paragraphs"
+    help = "Build TF-IDF index and inverted index over Article.plain_text_paragraphs using all CPU cores"
 
     def add_arguments(self, parser) -> None:
         parser.add_argument("--rebuild", action="store_true", help="Clear existing index before building")
-        parser.add_argument("--batch-size", type=int, default=1000)
+        parser.add_argument("--batch-size", type=int, default=3000, help="Articles per worker batch")
         parser.add_argument("--limit", type=int, default=0, help="Limit number of articles (for testing)")
+        parser.add_argument("--workers", type=int, default=os.cpu_count(), help="Number of worker processes")
+        parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
 
     def handle(self, *args, **options):
-        batch_size: int = options["batch_size"]
-        limit: int = options["limit"]
-        rebuild: bool = options["rebuild"]
-
+        # Setup logging
+        if options["verbose"]:
+            logging.basicConfig(level=logging.INFO, 
+                             format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        
+        batch_size = options["batch_size"]
+        limit = options["limit"]
+        rebuild = options["rebuild"]
+        workers = options["workers"]
+        
+        start_time = time.perf_counter()
+        
         if rebuild:
+            self.stdout.write("Clearing existing indexes...")
+            InvertedIndex.objects.all().delete()
             TFIDFIndex.objects.all().delete()
             Vocabulary.objects.all().delete()
-
-        # Pass 1: compute document frequencies
-        self.stdout.write("Computing document frequencies...")
-        doc_freq: Counter[str] = Counter()
-        total_docs = 0
-
-        qs = Article.objects.only("plain_text_paragraphs")
-        if limit > 0:
-            qs = qs.order_by("id")[:limit]
-
-        for start in range(0, qs.count(), batch_size):
-            for article in qs[start : start + batch_size]:
-                total_docs += 1
-                seen_terms = set()
-                for para in article.plain_text_paragraphs or []:
-                    seen_terms.update(tokenize(para))
-                doc_freq.update(seen_terms)
-
-        # Store vocabulary with IDF
-        self.stdout.write("Saving vocabulary...")
-        vocab_rows: List[Vocabulary] = []
-        for term, df in doc_freq.items():
-            vocab_rows.append(
-                Vocabulary(term=term, document_frequency=int(df), idf_value=compute_idf(total_docs, int(df)))
-            )
-        Vocabulary.objects.bulk_create(vocab_rows, batch_size=1000)
-
-        # Build map term -> idf for indexing pass
-        term_to_id: Dict[str, int] = {v.term: v.id for v in Vocabulary.objects.only("id", "term")}
-        term_to_idf: Dict[str, float] = {v.term: float(v.idf_value) for v in Vocabulary.objects.only("term", "idf_value")}
-
-        # Pass 2: create TF-IDF vectors per article
-        self.stdout.write("Building TF-IDF vectors...")
+        
+        # Get articles to process
         qs = Article.objects.only("id", "plain_text_paragraphs")
         if limit > 0:
             qs = qs.order_by("id")[:limit]
-
-        to_create: List[TFIDFIndex] = []
-        for start in range(0, qs.count(), batch_size):
-            for article in qs[start : start + batch_size]:
-                tokens: List[str] = []
-                for para in article.plain_text_paragraphs or []:
-                    tokens.extend(tokenize(para))
-                tf = compute_tf(tokens)
-                vec: Dict[int, float] = {}
-                for term, tf_val in tf.items():
-                    idf = term_to_idf.get(term)
-                    term_id = term_to_id.get(term)
-                    if idf is None or term_id is None:
-                        continue
-                    vec[term_id] = tf_val * idf
-                l2 = vector_l2_norm(vec.values()) if vec else 0.0
-                to_create.append(
-                    TFIDFIndex(article=article, tfidf_vector={str(k): float(v) for k, v in vec.items()}, l2_norm=float(l2))
+        
+        total_articles = qs.count()
+        if total_articles == 0:
+            self.stdout.write(self.style.WARNING("No articles found to process"))
+            return
+        
+        self.stdout.write(f"Processing {total_articles} articles with {workers} workers")
+        
+        # Convert to lightweight tuples for worker processing
+        self.stdout.write("Loading article data...")
+        article_tuples = [(a.id, a.plain_text_paragraphs) for a in qs]
+        
+        # Split into worker batches
+        worker_batches = [article_tuples[i:i+batch_size] 
+                         for i in range(0, len(article_tuples), batch_size)]
+        
+        self.stdout.write(f"Split into {len(worker_batches)} batches of ~{batch_size} articles each")
+        
+        # Pass 1: Parallel document frequency computation
+        self.stdout.write("Pass 1: Computing document frequencies...")
+        pass1_start = time.perf_counter()
+        
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            # Submit all batches for parallel processing
+            futures = [executor.submit(_compute_doc_freq_batch, batch) 
+                      for batch in worker_batches]
+            
+            # Aggregate results with progress bar
+            global_df = Counter()
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Pass 1 - Doc Freq"):
+                global_df.update(future.result())
+        
+        pass1_time = time.perf_counter() - pass1_start
+        self.stdout.write(f"Pass 1 complete in {pass1_time:.2f}s - found {len(global_df)} unique terms")
+        
+        # Build vocabulary (single-threaded, fast)
+        self.stdout.write("Building vocabulary...")
+        vocab_start = time.perf_counter()
+        
+        total_docs = len(article_tuples)
+        vocab_rows = []
+        for term, df in global_df.items():
+            vocab_rows.append(
+                Vocabulary(
+                    term=term, 
+                    document_frequency=int(df), 
+                    idf_value=compute_idf(total_docs, int(df))
                 )
-            with transaction.atomic():
-                TFIDFIndex.objects.bulk_create(to_create, batch_size=500)
-            to_create.clear()
-
-        self.stdout.write("TF-IDF index build complete.")
-
-
+            )
+        
+        with transaction.atomic():
+            Vocabulary.objects.bulk_create(vocab_rows, batch_size=2000)
+        
+        vocab_time = time.perf_counter() - vocab_start
+        self.stdout.write(f"Vocabulary built in {vocab_time:.2f}s - {len(vocab_rows)} terms")
+        
+        # Build maps for workers
+        term_to_id = {v.term: v.id for v in Vocabulary.objects.only("id", "term")}
+        term_to_idf = {v.term: float(v.idf_value) for v in Vocabulary.objects.only("term", "idf_value")}
+        
+        # Pass 2: Parallel TF-IDF + inverted index with async DB writes
+        self.stdout.write("Pass 2: Building TF-IDF vectors and inverted index...")
+        pass2_start = time.perf_counter()
+        
+        with ThreadPoolExecutor(max_workers=2) as db_executor, \
+             ProcessPoolExecutor(max_workers=workers) as process_executor:
+            
+            # Submit batches for parallel TF-IDF computation
+            futures = [
+                process_executor.submit(_build_tfidf_batch, batch, term_to_id, term_to_idf)
+                for batch in worker_batches
+            ]
+            
+            tfidf_buffer = []
+            inverted_buffer = []
+            db_futures = []
+            
+            # Large flush thresholds for PostgreSQL efficiency
+            TFIDF_FLUSH_THRESHOLD = 20000
+            INVERTED_FLUSH_THRESHOLD = 500000  # Inverted index is much larger
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Pass 2 - TF-IDF"):
+                tfidf_tuples, inverted_tuples = future.result()
+                tfidf_buffer.extend(tfidf_tuples)
+                inverted_buffer.extend(inverted_tuples)
+                
+                # Async database flush when threshold reached
+                if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD:
+                    db_future = db_executor.submit(flush_tfidf_sync, tfidf_buffer[:])
+                    db_futures.append(('tfidf', db_future))
+                    tfidf_buffer.clear()
+                
+                if len(inverted_buffer) >= INVERTED_FLUSH_THRESHOLD:
+                    db_future = db_executor.submit(flush_inverted_sync, inverted_buffer[:])
+                    db_futures.append(('inverted', db_future))
+                    inverted_buffer.clear()
+            
+            # Wait for all DB writes to complete
+            self.stdout.write("Waiting for database writes to complete...")
+            tfidf_created = 0
+            inverted_created = 0
+            
+            for write_type, db_future in db_futures:
+                result = db_future.result()
+                if write_type == 'tfidf':
+                    tfidf_created += result
+                else:
+                    inverted_created += result
+            
+            # Final flush
+            if tfidf_buffer:
+                tfidf_created += flush_tfidf_sync(tfidf_buffer)
+            if inverted_buffer:
+                inverted_created += flush_inverted_sync(inverted_buffer)
+        
+        pass2_time = time.perf_counter() - pass2_start
+        total_time = time.perf_counter() - start_time
+        
+        # Display results
+        self.stdout.write(self.style.SUCCESS(
+            f"TF-IDF index build complete in {total_time:.2f} seconds"
+        ))
+        self.stdout.write(f"  - Pass 1 (doc freq): {pass1_time:.2f}s")
+        self.stdout.write(f"  - Vocabulary build: {vocab_time:.2f}s")
+        self.stdout.write(f"  - Pass 2 (TF-IDF): {pass2_time:.2f}s")
+        self.stdout.write(f"  - Articles processed: {total_articles}")
+        self.stdout.write(f"  - TF-IDF vectors created: {tfidf_created}")
+        self.stdout.write(f"  - Inverted index entries: {inverted_created}")
+        self.stdout.write(f"  - Workers used: {workers}")
+        self.stdout.write(f"  - Throughput: {total_articles/total_time:.1f} articles/second")
+        
+        # Show some statistics
+        vocab_count = Vocabulary.objects.count()
+        tfidf_count = TFIDFIndex.objects.count()
+        inverted_count = InvertedIndex.objects.count()
+        
+        self.stdout.write(f"\nDatabase statistics:")
+        self.stdout.write(f"  - Vocabulary terms: {vocab_count}")
+        self.stdout.write(f"  - TF-IDF vectors: {tfidf_count}")
+        self.stdout.write(f"  - Inverted index entries: {inverted_count}")
+        
+        if inverted_count > 0:
+            avg_terms_per_article = inverted_count / tfidf_count if tfidf_count > 0 else 0
+            self.stdout.write(f"  - Avg terms per article: {avg_terms_per_article:.1f}")
+        
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"Optimized TF-IDF indexing complete. "
+                f"Processed {total_articles} articles in {total_time:.2f}s using {workers} workers."
+            )
+        )
