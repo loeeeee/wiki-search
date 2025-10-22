@@ -343,7 +343,7 @@ class Command(BaseCommand):
         LINK_FLUSH_THRESHOLD = max(100_000, batch_size * 40)  # 2x larger link batches
 
         # Estimate progress bar total based on limit
-        estimated_shards = min(len(shards), (limit // 500) + 5) if limit else len(shards)
+        estimated_shards = min(len(shards), (limit // 50) + 5) if limit else len(shards)
         pbar = tqdm(total=estimated_shards, desc="Processing shards", unit="shard", dynamic_ncols=True)
 
         # Use set for O(1) deduplication instead of O(n) list iteration
@@ -414,7 +414,7 @@ class Command(BaseCommand):
                 # For I/O-bound work (bz2 decompression), we need MANY more pending tasks
                 # than workers to keep them all busy. No batching = maximum parallelism.
                 # Each worker can handle multiple I/O operations concurrently.
-                MAX_PENDING_FUTURES = min(workers * 128, len(shards))  # Aggressive queuing
+                MAX_PENDING_FUTURES = min(workers * 4, len(shards))  # Aggressive queuing
                 
                 shard_iter = iter(shards)
                 futures: Dict[Any, Path] = {}
