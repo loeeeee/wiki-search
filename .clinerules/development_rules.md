@@ -36,6 +36,8 @@ Always exam the existing code logic first with a global view of the code, and st
 
 When optimizing CPU utilization, always use concurrent.futures instead of multiprocessing, unless the user explicit agree the usage of multiprocessing.
 
+Always avoid module level constant.
+
 ## Documentation
 
 Always document concise implementation details and basic usage in docs-vibe/ with a sequential file name.
