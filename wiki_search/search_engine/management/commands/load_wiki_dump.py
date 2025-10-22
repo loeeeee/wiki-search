@@ -6,7 +6,7 @@ import logging
 import os
 import pstats
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -47,7 +47,9 @@ def find_bz2_files(root: Path) -> List[Path]:
 
 
 def iter_jsonl_bz2(file_path: Path) -> Iterator[dict]:
-    with bz2.open(file_path, mode="rt", encoding="utf-8", errors="strict") as f:
+    # Use larger buffer for better I/O performance
+    with bz2.open(file_path, mode="rt", encoding="utf-8", errors="strict", compresslevel=9) as f:
+        # Read in larger chunks to reduce I/O overhead
         for line_number, line in enumerate(f, start=1):
             if not line.strip():
                 continue
@@ -90,43 +92,46 @@ def save_profile_stats(profiler: cProfile.Profile, phase_name: str) -> Path:
     return profile_path
 
 
-def _process_shard(shard_path: Path, record_batch_size: int = 2048) -> Tuple[
+def _process_shard_batch(shard_paths: List[Path], record_batch_size: int = 2048) -> Tuple[
     List[Tuple[int, Optional[str], List[str]]],  # (page_id, title, paragraphs)
     List[Tuple[int, str, str]],  # (from_page_id, to_title, anchor_text)
     int  # records_emitted
 ]:
-    """Process a single shard file and return lightweight tuples.
+    """Process multiple shard files and return lightweight tuples.
 
     This function is at module level so it can be pickled for ProcessPoolExecutor.
+    Processing multiple shards per worker task reduces overhead and improves throughput.
     Returns simple tuples to minimize serialization overhead between processes.
     Workers do the heavy lifting: parsing, text extraction, link extraction.
     """
-    shard_str = str(shard_path)
     articles: List[Tuple[int, Optional[str], List[str]]] = []
     links: List[Tuple[int, str, str]] = []
 
-    for rec in iter_jsonl_bz2(shard_path):
-        page_id_raw = rec.get("id")
-        if page_id_raw is None:
-            logger.error("Record missing 'id' in %s", shard_str)
-            raise ValueError(f"Missing id in record from {shard_str}")
-        try:
-            page_id_int = int(page_id_raw)
-        except Exception as exc:
-            logger.error("Non-integer id in %s: %r (%s)", shard_str, page_id_raw, exc)
-            raise
-
-        title = rec.get("title")
-        text = rec.get("text") or []
-        paragraphs = extract_plain_paragraphs(text)
-        shard_links = extract_internal_links(text)
-
-        # Return lightweight tuples - no Django objects to pickle
-        articles.append((page_id_int, title, paragraphs))
+    for shard_path in shard_paths:
+        shard_str = str(shard_path)
         
-        # Return link tuples
-        for target_title, anchor_text in shard_links:
-            links.append((page_id_int, target_title, anchor_text))
+        for rec in iter_jsonl_bz2(shard_path):
+            page_id_raw = rec.get("id")
+            if page_id_raw is None:
+                logger.error("Record missing 'id' in %s", shard_str)
+                raise ValueError(f"Missing id in record from {shard_str}")
+            try:
+                page_id_int = int(page_id_raw)
+            except Exception as exc:
+                logger.error("Non-integer id in %s: %r (%s)", shard_str, page_id_raw, exc)
+                raise
+
+            title = rec.get("title")
+            text = rec.get("text") or []
+            paragraphs = extract_plain_paragraphs(text)
+            shard_links = extract_internal_links(text)
+
+            # Return lightweight tuples - no Django objects to pickle
+            articles.append((page_id_int, title, paragraphs))
+            
+            # Return link tuples
+            for target_title, anchor_text in shard_links:
+                links.append((page_id_int, target_title, anchor_text))
 
     return articles, links, len(articles)
 
@@ -242,28 +247,38 @@ class Command(BaseCommand):
 
         article_tuples: List[Tuple[int, Optional[str], List[str]]] = []
         link_tuples: List[Tuple[int, str, str]] = []
-        LINK_FLUSH_THRESHOLD = max(50_000, batch_size * 20)
+        
+        # Larger batches to reduce flush frequency
+        ARTICLE_FLUSH_THRESHOLD = batch_size * 4  # 4x larger batches
+        LINK_FLUSH_THRESHOLD = max(100_000, batch_size * 40)  # 2x larger link batches
 
         # Estimate progress bar total based on limit
         estimated_shards = min(len(shards), (limit // 500) + 5) if limit else len(shards)
         pbar = tqdm(total=estimated_shards, desc="Processing shards", unit="shard", dynamic_ncols=True)
 
-        def flush_articles() -> None:
-            nonlocal created_total, skipped_total
-            if not article_tuples:
-                return
-            # Deduplicate by page_id
-            seen_ids: Set[int] = set()
+        # Use set for O(1) deduplication instead of O(n) list iteration
+        seen_article_ids: Set[int] = set()
+
+        def flush_articles_sync(tuples_to_flush: List[Tuple[int, Optional[str], List[str]]]) -> Tuple[int, int]:
+            """Synchronous article flush - to be run in background thread."""
+            if not tuples_to_flush:
+                return 0, 0
+            
+            # Deduplicate using set for O(1) lookup
             unique_tuples: List[Tuple[int, Optional[str], List[str]]] = []
-            for tup in article_tuples:
+            local_seen: Set[int] = set()
+            skipped = 0
+            
+            for tup in tuples_to_flush:
                 page_id = tup[0]
-                if page_id in seen_ids:
-                    skipped_total += 1
+                if page_id in local_seen or page_id in seen_article_ids:
+                    skipped += 1
                     continue
-                seen_ids.add(page_id)
+                local_seen.add(page_id)
                 unique_tuples.append(tup)
             
             # Create Django objects only here, right before bulk_create
+            created = 0
             if unique_tuples:
                 articles_to_insert = [
                     Article(page_id=page_id, title=title, plain_text_paragraphs=paragraphs)
@@ -275,17 +290,21 @@ class Command(BaseCommand):
                         batch_size=batch_size,
                         ignore_conflicts=True
                     )
-                created_total += len(articles_to_insert)
-            article_tuples.clear()
+                created = len(articles_to_insert)
+                # Update global seen set
+                seen_article_ids.update(local_seen)
+            
+            return created, skipped
 
-        def flush_links() -> None:
-            nonlocal links_total
-            if not link_tuples:
-                return
+        def flush_links_sync(tuples_to_flush: List[Tuple[int, str, str]]) -> int:
+            """Synchronous link flush - to be run in background thread."""
+            if not tuples_to_flush:
+                return 0
+            
             # Create Django objects only here, right before bulk_create
             links_to_insert = [
                 InternalLink(from_page_id=from_id, to_title=to_title, anchor_text=anchor)
-                for from_id, to_title, anchor in link_tuples
+                for from_id, to_title, anchor in tuples_to_flush
             ]
             with transaction.atomic():
                 InternalLink.objects.bulk_create(
@@ -293,21 +312,30 @@ class Command(BaseCommand):
                     batch_size=batch_size,
                     ignore_conflicts=True
                 )
-            links_total += len(links_to_insert)
-            link_tuples.clear()
+            return len(links_to_insert)
 
         try:
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                # Use sliding window to avoid overwhelming main process with too many futures
-                MAX_PENDING_FUTURES = workers * 4
+            # Use separate thread executor for database writes to avoid blocking main process
+            db_write_futures: List[Any] = []
+            
+            with ThreadPoolExecutor(max_workers=2) as db_executor, \
+                 ProcessPoolExecutor(max_workers=workers) as process_executor:
+                
+                # For I/O-bound work (bz2 decompression), we need MANY more pending tasks
+                # than workers to keep them all busy. No batching = maximum parallelism.
+                # Each worker can handle multiple I/O operations concurrently.
+                MAX_PENDING_FUTURES = min(workers * 128, len(shards))  # Aggressive queuing
+                
                 shard_iter = iter(shards)
                 futures: Dict[Any, Path] = {}
                 
-                # Submit initial batch
-                for _ in range(min(MAX_PENDING_FUTURES, len(shards))):
+                # Submit large initial batch to saturate all workers
+                initial_submit = min(MAX_PENDING_FUTURES, len(shards))
+                logger.info("Submitting initial %d futures for %d workers (I/O bound work)", initial_submit, workers)
+                for _ in range(initial_submit):
                     try:
                         shard = next(shard_iter)
-                        future = executor.submit(_process_shard, shard, record_batch_size)
+                        future = process_executor.submit(_process_shard_batch, [shard], record_batch_size)
                         futures[future] = shard
                     except StopIteration:
                         break
@@ -330,8 +358,12 @@ class Command(BaseCommand):
                             article_tuples.extend(articles)
                             processed_records += len(articles)
                             
-                            if len(article_tuples) >= batch_size:
-                                flush_articles()
+                            # Submit database write in background thread if threshold reached
+                            if len(article_tuples) >= ARTICLE_FLUSH_THRESHOLD:
+                                tuples_copy = article_tuples[:]
+                                article_tuples.clear()
+                                db_future = db_executor.submit(flush_articles_sync, tuples_copy)
+                                db_write_futures.append(('articles', db_future))
 
                             # Process links - work with tuples
                             if limit is None or processed_records < limit:
@@ -341,16 +373,21 @@ class Command(BaseCommand):
                                     links = [l for l in links if l[0] in article_ids]
                                 
                                 link_tuples.extend(links)
+                                # Submit database write in background thread if threshold reached
                                 if len(link_tuples) >= LINK_FLUSH_THRESHOLD:
-                                    flush_links()
+                                    tuples_copy = link_tuples[:]
+                                    link_tuples.clear()
+                                    db_future = db_executor.submit(flush_links_sync, tuples_copy)
+                                    db_write_futures.append(('links', db_future))
 
+                            # Update progress
                             pbar.update(1)
 
                             # Submit new work to maintain the window
                             if limit is None or processed_records < limit:
                                 try:
                                     next_shard = next(shard_iter)
-                                    new_future = executor.submit(_process_shard, next_shard, record_batch_size)
+                                    new_future = process_executor.submit(_process_shard_batch, [next_shard], record_batch_size)
                                     futures[new_future] = next_shard
                                 except StopIteration:
                                     pass
@@ -374,12 +411,32 @@ class Command(BaseCommand):
                     # Break if limit reached
                     if limit is not None and processed_records >= limit:
                         break
+                
+                # Wait for all pending database writes to complete
+                logger.info("Waiting for %d pending database writes to complete", len(db_write_futures))
+                for write_type, db_future in db_write_futures:
+                    try:
+                        result = db_future.result()
+                        if write_type == 'articles':
+                            created, skipped = result
+                            created_total += created
+                            skipped_total += skipped
+                        else:  # links
+                            links_total += result
+                    except Exception as exc:
+                        logger.error("Error in background database write: %s", exc)
+                        raise
 
         finally:
             pbar.close()
 
-        flush_articles()
-        flush_links()
+        # Final flush of remaining data
+        if article_tuples:
+            created, skipped = flush_articles_sync(article_tuples)
+            created_total += created
+            skipped_total += skipped
+        if link_tuples:
+            links_total += flush_links_sync(link_tuples)
 
         return created_total, skipped_total, links_total
 
