@@ -1,0 +1,33 @@
+/* Additional styles for the Wikipedia Search web app */
+/* Most styles are inline in base.html for simplicity */
+
+/* Additional responsive improvements */
+@media (max-width: 480px) {
+    .search-input {
+        font-size: 16px; /* Prevent zoom on iOS */
+    }
+    
+    .article-title {
+        font-size: 1.5rem;
+    }
+    
+    .article-content {
+        padding: 1rem;
+    }
+}
+
+/* Print styles */
+@media print {
+    .header {
+        display: none;
+    }
+    
+    .back-button {
+        display: none;
+    }
+    
+    .article-content {
+        box-shadow: none;
+        border: none;
+    }
+}

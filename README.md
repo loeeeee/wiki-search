@@ -151,3 +151,55 @@ Notes:
 - With SQLite, fast PRAGMAs are applied by default for speed and restored afterward. Use `--no-fast-pragmas` to disable.
 - With PostgreSQL, `VACUUM ANALYZE` is run to optimize the database.
 - `--drop-recreate` is SQLite-only and destructive but typically the fastest option for very large datasets.
+
+## Web Application
+
+The project includes a two-page Django web application for searching and viewing Wikipedia articles.
+
+### Starting the Web App
+
+1. **Activate the virtual environment:**
+   ```bash
+   cd /home/loe/Projects/wiki-search
+   source .venv/bin/activate
+   ```
+
+2. **Start the development server:**
+   ```bash
+   cd wiki_search
+   python manage.py runserver 0.0.0.0:8000
+   ```
+
+3. **Access the web app:**
+   - Open your browser and navigate to `http://localhost:8000`
+   - Use the search bar to find Wikipedia articles
+   - Click on search results to read full articles
+
+### Web App Features
+
+- **Search Page**: Clean search interface with results showing article titles and snippets
+- **Article Detail Page**: Full article content with navigation back to search
+- **Hybrid Search**: Combines TF-IDF relevance scoring with PageRank authority
+- **Responsive Design**: Mobile-friendly interface with modern styling
+- **Fast Performance**: Optimized database queries and efficient search algorithms
+
+### Search Capabilities
+
+- **Hybrid Ranking**: Combines content relevance (TF-IDF) with page authority (PageRank)
+- **Fallback Search**: Title-based search when advanced indexing unavailable
+- **Snippet Display**: Shows relevant content previews in search results
+- **Link Navigation**: Internal Wikipedia links converted to app navigation
+
+### Building Search Indexes
+
+For optimal search performance, build the TF-IDF and PageRank indexes:
+
+```bash
+# Build TF-IDF index (takes time for large datasets)
+python manage.py build_tfidf_index --limit 100000
+
+# Build PageRank scores
+python manage.py build_pagerank
+```
+
+The web app will work with basic title search even without these indexes, but hybrid search provides much better results.

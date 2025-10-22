@@ -1,0 +1,17 @@
+{% extends 'search_engine/base.html' %}
+
+{% block title %}{{ article.title }} - Wikipedia Search{% endblock %}
+
+{% block content %}
+<a href="{% url 'search' %}" class="back-button">← Back to Search</a>
+
+<div class="article-content">
+    <h1 class="article-title">{{ article.title }}</h1>
+    
+    {% for paragraph in paragraphs %}
+        {% if paragraph %}
+        <p class="article-paragraph">{{ paragraph|safe }}</p>
+        {% endif %}
+    {% endfor %}
+</div>
+{% endblock %}

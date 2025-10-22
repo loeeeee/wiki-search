@@ -1,0 +1,37 @@
+{% extends 'search_engine/base.html' %}
+
+{% block title %}
+{% if query %}Search: {{ query }} - Wikipedia Search{% else %}Wikipedia Search{% endif %}
+{% endblock %}
+
+{% block content %}
+{% if query %}
+    {% if has_results %}
+        <h1>Search Results for "{{ query }}"</h1>
+        <p>{{ results|length }} result{{ results|length|pluralize }} found</p>
+        
+        <ul class="results-list">
+            {% for result in results %}
+            <li class="result-item">
+                <h2 class="result-title">
+                    <a href="{% url 'article_detail' result.article.page_id %}">{{ result.article.title }}</a>
+                </h2>
+                {% if result.snippet %}
+                <p class="result-snippet">{{ result.snippet }}</p>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+    {% else %}
+        <div class="empty-state">
+            <h2>No results found</h2>
+            <p>Try different keywords or check your spelling.</p>
+        </div>
+    {% endif %}
+{% else %}
+    <div class="empty-state">
+        <h2>Welcome to Wikipedia Search</h2>
+        <p>Enter a search term above to find Wikipedia articles.</p>
+    </div>
+{% endif %}
+{% endblock %}
