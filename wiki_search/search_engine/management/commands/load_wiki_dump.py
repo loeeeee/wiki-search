@@ -441,77 +441,60 @@ class Command(BaseCommand):
         return created_total, skipped_total, links_total
 
     def _resolve_from_article(self, batch_size: int) -> int:
-        unresolved_qs = InternalLink.objects.filter(from_article__isnull=True, from_page_id__isnull=False)
-        unresolved_count = unresolved_qs.count()
+        """Resolve from_article foreign keys using efficient SQL UPDATE with JOIN."""
+        from django.db import connection
+        
+        unresolved_count = InternalLink.objects.filter(
+            from_article__isnull=True, from_page_id__isnull=False
+        ).count()
+        
         if unresolved_count == 0:
             logger.info("No from_article links to resolve")
             return 0
 
         logger.info("Resolving from_article for %d links", unresolved_count)
 
-        page_ids = list(
-            unresolved_qs.values_list("from_page_id", flat=True).distinct()
-        )
-        page_id_to_article_id: Dict[int, int] = {}
-        for i in tqdm(range(0, len(page_ids), batch_size), desc="Mapping page_ids", unit="batch", dynamic_ncols=True):
-            batch = page_ids[i : i + batch_size]
-            page_id_to_article_id.update(
-                dict(Article.objects.filter(page_id__in=batch).values_list("page_id", "id"))
-            )
-
-        updated_total = 0
-        for _ in tqdm(range(0, unresolved_count, batch_size), desc="Updating from_article", unit="batch", dynamic_ncols=True):
-            links = list(unresolved_qs[:batch_size])
-            if not links:
-                break
-            to_update: List[InternalLink] = []
-            for link in links:
-                aid = page_id_to_article_id.get(link.from_page_id)
-                if aid is not None:
-                    link.from_article_id = aid
-                    to_update.append(link)
-            if to_update:
-                with transaction.atomic():
-                    InternalLink.objects.bulk_update(to_update, ["from_article"], batch_size=batch_size)
-                updated_total += len(to_update)
+        # Use direct SQL UPDATE with JOIN - much faster than bulk_update
+        # This executes in a single database operation instead of N queries
+        with connection.cursor() as cursor:
+            sql = """
+                UPDATE search_engine_internallink AS link
+                SET from_article_id = article.id
+                FROM search_engine_article AS article
+                WHERE link.from_page_id = article.page_id
+                  AND link.from_article_id IS NULL
+                  AND link.from_page_id IS NOT NULL
+            """
+            cursor.execute(sql)
+            updated_total = cursor.rowcount
 
         logger.info("Resolved from_article for %d links", updated_total)
         return updated_total
 
     def _resolve_to_article(self, batch_size: int) -> int:
-        unresolved_qs = InternalLink.objects.filter(to_article__isnull=True)
-        unresolved_count = unresolved_qs.count()
+        """Resolve to_article foreign keys using efficient SQL UPDATE with JOIN."""
+        from django.db import connection
+        
+        unresolved_count = InternalLink.objects.filter(to_article__isnull=True).count()
+        
         if unresolved_count == 0:
             logger.info("No to_article links to resolve")
             return 0
 
         logger.info("Resolving to_article for %d links", unresolved_count)
 
-        titles = list(
-            unresolved_qs.values_list("to_title", flat=True).distinct()
-        )
-        title_to_article_id: Dict[str, int] = {}
-        for i in tqdm(range(0, len(titles), batch_size), desc="Mapping titles", unit="batch", dynamic_ncols=True):
-            batch = titles[i : i + batch_size]
-            title_to_article_id.update(
-                dict(Article.objects.filter(title__in=batch).values_list("title", "id"))
-            )
-
-        updated_total = 0
-        for _ in tqdm(range(0, unresolved_count, batch_size), desc="Updating to_article", unit="batch", dynamic_ncols=True):
-            links = list(unresolved_qs[:batch_size])
-            if not links:
-                break
-            to_update: List[InternalLink] = []
-            for link in links:
-                aid = title_to_article_id.get(link.to_title)
-                if aid is not None:
-                    link.to_article_id = aid
-                    to_update.append(link)
-            if to_update:
-                with transaction.atomic():
-                    InternalLink.objects.bulk_update(to_update, ["to_article"], batch_size=batch_size)
-                updated_total += len(to_update)
+        # Use direct SQL UPDATE with JOIN - much faster than bulk_update
+        # This executes in a single database operation instead of N queries
+        with connection.cursor() as cursor:
+            sql = """
+                UPDATE search_engine_internallink AS link
+                SET to_article_id = article.id
+                FROM search_engine_article AS article
+                WHERE link.to_title = article.title
+                  AND link.to_article_id IS NULL
+            """
+            cursor.execute(sql)
+            updated_total = cursor.rowcount
 
         logger.info("Resolved to_article for %d links", updated_total)
         return updated_total
