@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
+from django.db import transaction, connection
 from django.db.models import Min, Max, Count
 
 from search_engine.ingest.parser import extract_plain_paragraphs, extract_internal_links
@@ -421,22 +421,19 @@ class Command(BaseCommand):
             return created, skipped
 
         def flush_links_sync(tuples_to_flush: List[Tuple[int, str, str]]) -> int:
-            """Synchronous link flush - to be run in background thread."""
+            """Synchronous link flush using PostgreSQL COPY for high throughput (psycopg3)."""
             if not tuples_to_flush:
                 return 0
-            
-            # Create Django objects only here, right before bulk_create
-            links_to_insert = [
-                InternalLink(from_page_id=from_id, to_title=to_title, anchor_text=anchor)
-                for from_id, to_title, anchor in tuples_to_flush
-            ]
+
             with transaction.atomic():
-                InternalLink.objects.bulk_create(
-                    links_to_insert,
-                    batch_size=batch_size,
-                    ignore_conflicts=True
-                )
-            return len(links_to_insert)
+                with connection.cursor() as cursor:
+                    # Use TEXT format (tab-delimited) where None -> \N automatically
+                    with cursor.copy(
+                        "COPY search_engine_internallink (from_article_id, from_page_id, to_article_id, to_title, anchor_text) FROM STDIN"
+                    ) as copy:
+                        for from_id, to_title, anchor in tuples_to_flush:
+                            copy.write_row([None, from_id, None, to_title, anchor])
+            return len(tuples_to_flush)
 
         try:
             # Use separate thread executor for database writes to avoid blocking main process
