@@ -37,6 +37,26 @@ Observation: Minimal gains beyond 2 workers; plateau ~72–76 articles/s.
 
 Producer threads=1 showed similar elapsed (±2–3%), confirming non-I/O-bound behavior for `--limit=10000`.
 
+### After optimization (COPY-based inserts)
+
+- Implemented DB-side COPY for `InternalLink` and `Article` inserts.
+- Same environment and flags; `--limit=10000`, `--batch-size=5000`, `--db-workers=12`.
+
+#### Throughput vs workers after optimization (producer-threads=3)
+
+| workers | elapsed (s) | throughput (articles/s) |
+|--------:|------------:|------------------------:|
+| 2       | 44.60       | 224.24 |
+| 4       | 44.65       | 223.98 |
+| 8       | 43.72       | 228.73 |
+| 12      | 43.72–43.72 | ~228.7 |
+
+Observation: Throughput improved ~3.0x (from ~75 to ~225 art/s), and scaling beyond 2 workers is no longer bottlenecked by DB inserts at this limit.
+
+Notes:
+- With only link COPY enabled (article via ORM), 4 workers measured 51.3–85.1s depending on run; enabling COPY for `Article` reduced ingestion to ~23.6–27.9s for the ingest sub-phase.
+- Resolve phases remain ~1.6–2.4s (to_article) and ~13–18s (from_article) with 12 db-workers.
+
 #### cProfile hotspots (ingestion phase)
 
 - Dominant time in DB insert path:

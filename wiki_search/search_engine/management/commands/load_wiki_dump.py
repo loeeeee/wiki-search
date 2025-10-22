@@ -384,10 +384,10 @@ class Command(BaseCommand):
         seen_article_ids: Set[int] = set()
 
         def flush_articles_sync(tuples_to_flush: List[Tuple[int, Optional[str], List[str]]]) -> Tuple[int, int]:
-            """Synchronous article flush - to be run in background thread."""
+            """Synchronous article flush using COPY for speed; dedup by page_id."""
             if not tuples_to_flush:
                 return 0, 0
-            
+
             # Deduplicate using set for O(1) lookup
             unique_tuples: List[Tuple[int, Optional[str], List[str]]] = []
             local_seen: Set[int] = set()
@@ -400,24 +400,21 @@ class Command(BaseCommand):
                     continue
                 local_seen.add(page_id)
                 unique_tuples.append(tup)
-            
-            # Create Django objects only here, right before bulk_create
+
             created = 0
             if unique_tuples:
-                articles_to_insert = [
-                    Article(page_id=page_id, title=title, plain_text_paragraphs=paragraphs)
-                    for page_id, title, paragraphs in unique_tuples
-                ]
+                from psycopg.types.json import Json  # type: ignore
                 with transaction.atomic():
-                    Article.objects.bulk_create(
-                        articles_to_insert,
-                        batch_size=batch_size,
-                        ignore_conflicts=True
-                    )
-                created = len(articles_to_insert)
-                # Update global seen set
+                    with connection.cursor() as cursor:
+                        # COPY columns explicitly; id is auto
+                        with cursor.copy(
+                            "COPY search_engine_article (page_id, title, plain_text_paragraphs, is_disambiguation) FROM STDIN"
+                        ) as copy:
+                            for page_id, title, paragraphs in unique_tuples:
+                                copy.write_row([page_id, title, Json(paragraphs), False])
+                created = len(unique_tuples)
                 seen_article_ids.update(local_seen)
-            
+
             return created, skipped
 
         def flush_links_sync(tuples_to_flush: List[Tuple[int, str, str]]) -> int:
