@@ -3,7 +3,7 @@ from django.db import models
 
 class Article(models.Model):
     page_id = models.PositiveBigIntegerField(unique=True, db_index=True)
-    title = models.CharField(max_length=512, unique=True, db_index=True)
+    title = models.CharField(max_length=512, db_index=True)
     plain_text_paragraphs = models.JSONField(default=list)
     is_disambiguation = models.BooleanField(default=False)
 
