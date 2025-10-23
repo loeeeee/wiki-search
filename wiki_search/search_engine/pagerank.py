@@ -119,20 +119,10 @@ def compute_pagerank(
     # Handle dangling nodes (pages with no outgoing links)
     # They should link to all pages with equal probability
     dangling_mask = (col_sums == 1) & (adjacency_matrix.sum(axis=0).A1 == 0)
-    if np.any(dangling_mask):
-        dangling_indices = np.where(dangling_mask)[0]
+    dangling_indices = np.where(dangling_mask)[0] if np.any(dangling_mask) else np.array([], dtype=int)
+    
+    if len(dangling_indices) > 0:
         logger.info(f"Found {len(dangling_indices)} dangling nodes")
-        
-        # OPTIMIZATION: Use vectorized operations instead of LIL format
-        # Create a dense matrix for dangling nodes only (much more efficient)
-        dangling_matrix = np.ones((n, len(dangling_indices))) / n
-        
-        # Add dangling node contributions to transition matrix
-        # This avoids the expensive LIL format conversion and individual assignments
-        transition_matrix = transition_matrix + csr_matrix(dangling_matrix) @ csr_matrix(
-            (np.ones(len(dangling_indices)), (dangling_indices, np.arange(len(dangling_indices)))),
-            shape=(n, len(dangling_indices))
-        ).T
     
     # Initialize PageRank vector
     pagerank = np.ones(n) / n
@@ -141,8 +131,14 @@ def compute_pagerank(
     for iteration in range(max_iter):
         pagerank_old = pagerank.copy()
         
-        # pagerank = (1-damping)/n + damping * P * pagerank
+        # Standard PageRank update: pagerank = (1-damping)/n + damping * P * pagerank
         pagerank = (1 - damping) / n + damping * transition_matrix.dot(pagerank)
+        
+        # Handle dangling nodes using teleportation formula
+        # Dangling nodes contribute their PageRank mass uniformly to all pages
+        if len(dangling_indices) > 0:
+            dangling_sum = damping * np.sum(pagerank[dangling_indices])
+            pagerank += dangling_sum / n
         
         # Check convergence
         residual = np.linalg.norm(pagerank - pagerank_old, ord=1)
