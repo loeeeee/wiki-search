@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cProfile
+import json
 import logging
 import os
 import pstats
@@ -62,10 +63,10 @@ def _build_tfidf_batch(
     term_to_id: Dict[str, int],
     term_to_idf: Dict[str, float]
 ) -> Tuple[
-    List[Tuple[int, Dict[int, float], float]],  # (article_id, tfidf_vec, l2_norm)
+    List[Tuple[int, Dict[int, float], float, List[int]]],  # (article_id, tfidf_vec, l2_norm, token_counts)
     List[Tuple[int, int, float]]  # (term_id, article_id, tfidf_score) for InvertedIndex
 ]:
-    """Worker: compute TF-IDF vectors and inverted index tuples.
+    """Worker: compute TF-IDF vectors, inverted index tuples, and token counts.
     
     Returns lightweight tuples to minimize serialization overhead.
     """
@@ -74,8 +75,13 @@ def _build_tfidf_batch(
     
     for article_id, paragraphs in article_tuples:
         tokens = []
+        token_counts = []
+        
+        # Compute token counts per paragraph
         for para in paragraphs:
-            tokens.extend(tokenize(para))
+            para_tokens = tokenize(para)
+            tokens.extend(para_tokens)
+            token_counts.append(len(para_tokens))
         
         tf = compute_tf(tokens)
         vec = {}
@@ -89,12 +95,12 @@ def _build_tfidf_batch(
             inverted_tuples.append((term_id, article_id, tfidf_score))
         
         l2_norm = vector_l2_norm(vec.values()) if vec else 0.0
-        tfidf_tuples.append((article_id, vec, l2_norm))
+        tfidf_tuples.append((article_id, vec, l2_norm, token_counts))
     
     return tfidf_tuples, inverted_tuples
 
 
-def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float]]) -> int:
+def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List[int]]]) -> int:
     """Synchronous TF-IDF flush using PostgreSQL COPY for high throughput."""
     if not tfidf_tuples:
         return 0
@@ -105,12 +111,12 @@ def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float]]) ->
     
     # Prepare data for COPY
     tfidf_data = []
-    for article_id, vec, l2_norm in tfidf_tuples:
+    for article_id, vec, l2_norm, token_counts in tfidf_tuples:
         if article_id in articles:
             # Convert vector dict to JSON string for COPY
-            import json
             vector_json = json.dumps({str(k): float(v) for k, v in vec.items()})
-            tfidf_data.append((article_id, vector_json, float(l2_norm)))
+            token_counts_json = json.dumps(token_counts)
+            tfidf_data.append((article_id, vector_json, float(l2_norm), token_counts_json))
     
     if tfidf_data:
         with transaction.atomic():
@@ -119,8 +125,14 @@ def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float]]) ->
                 with cursor.copy(
                     "COPY search_engine_tfidfindex (article_id, tfidf_vector, l2_norm) FROM STDIN"
                 ) as copy:
-                    for article_id, vector_json, l2_norm in tfidf_data:
+                    for article_id, vector_json, l2_norm, token_counts_json in tfidf_data:
                         copy.write_row((article_id, vector_json, l2_norm))
+            
+            # Update paragraph_token_counts for articles
+            for article_id, vec, l2_norm, token_counts_json in tfidf_data:
+                Article.objects.filter(id=article_id).update(
+                    paragraph_token_counts=json.loads(token_counts_json)
+                )
     
     return len(tfidf_data)
 
