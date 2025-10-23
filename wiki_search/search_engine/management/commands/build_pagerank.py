@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict
+from typing import Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 from django.core.management.base import BaseCommand
-from django.db import transaction
+from django.db import transaction, connection
 from tqdm import tqdm
 
 from search_engine.models import Article, PageRank
@@ -28,6 +30,87 @@ class Command(BaseCommand):
                           help="Clear existing PageRank scores before building")
         parser.add_argument("--verbose", action="store_true",
                           help="Enable verbose logging")
+        parser.add_argument("--threads", type=int, default=4,
+                          help="Number of threads for parallel database operations (default: 4)")
+        parser.add_argument("--batch-size", type=int, default=1000,
+                          help="Batch size for database operations (default: 1000)")
+
+    def _store_pagerank_batch(self, batch_data: List[Tuple[int, float, int]], 
+                            articles_dict: Dict[int, Article]) -> int:
+        """Store a batch of PageRank scores in the database.
+        
+        Args:
+            batch_data: List of (article_id, score, iteration_count) tuples
+            articles_dict: Dictionary mapping article_id to Article objects
+            
+        Returns:
+            Number of objects created
+        """
+        pagerank_objects = []
+        for article_id, score, iteration_count in batch_data:
+            if article_id in articles_dict:
+                pagerank_objects.append(
+                    PageRank(
+                        article=articles_dict[article_id],
+                        score=score,
+                        iteration_count=iteration_count
+                    )
+                )
+        
+        if pagerank_objects:
+            with transaction.atomic():
+                PageRank.objects.bulk_create(pagerank_objects, ignore_conflicts=True)
+        
+        return len(pagerank_objects)
+
+    def _parallel_store_pagerank_scores(self, pagerank_scores: Dict[int, float], 
+                                      articles_dict: Dict[int, Article], 
+                                      iteration_count: int, 
+                                      num_threads: int, 
+                                      batch_size: int) -> None:
+        """Store PageRank scores using parallel threads.
+        
+        Args:
+            pagerank_scores: Dictionary mapping article_id to PageRank score
+            articles_dict: Dictionary mapping article_id to Article objects
+            iteration_count: Number of iterations used for computation
+            num_threads: Number of threads to use
+            batch_size: Size of each batch
+        """
+        # Prepare batch data
+        batch_data = []
+        for article_id, score in pagerank_scores.items():
+            batch_data.append((article_id, score, iteration_count))
+        
+        # Split into batches
+        batches = []
+        for i in range(0, len(batch_data), batch_size):
+            batches.append(batch_data[i:i + batch_size])
+        
+        self.stdout.write(f"Storing {len(pagerank_scores)} PageRank scores using {num_threads} threads...")
+        
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            # Submit all batch tasks
+            future_to_batch = {
+                executor.submit(self._store_pagerank_batch, batch, articles_dict): batch
+                for batch in batches
+            }
+            
+            # Process completed tasks with progress bar
+            total_created = 0
+            with tqdm(total=len(pagerank_scores), desc="Storing PageRank scores") as pbar:
+                for future in as_completed(future_to_batch):
+                    try:
+                        created_count = future.result()
+                        total_created += created_count
+                        pbar.update(created_count)
+                    except Exception as e:
+                        self.stdout.write(
+                            self.style.ERROR(f"Error storing batch: {e}")
+                        )
+        
+        self.stdout.write(f"Successfully stored {total_created} PageRank scores")
 
     def handle(self, *args, **options):
         # Setup logging
@@ -39,13 +122,42 @@ class Command(BaseCommand):
         max_iter = options["max_iterations"]
         tolerance = options["tolerance"]
         rebuild = options["rebuild"]
+        num_threads = options["threads"]
+        batch_size = options["batch_size"]
         
         start_time = time.perf_counter()
         
         # Clear existing PageRank scores if requested
         if rebuild:
             self.stdout.write("Clearing existing PageRank scores...")
-            PageRank.objects.all().delete()
+            
+            # Get count for progress bar
+            total_count = PageRank.objects.count()
+            if total_count > 0:
+                self.stdout.write(f"Found {total_count} existing PageRank scores to delete")
+                
+                # Delete in batches with progress bar
+                batch_size = 10000
+                deleted_count = 0
+                
+                with tqdm(total=total_count, desc="Deleting PageRank scores") as pbar:
+                    while True:
+                        # Delete a batch
+                        batch_ids = list(PageRank.objects.values_list('id', flat=True)[:batch_size])
+                        if not batch_ids:
+                            break
+                        
+                        deleted = PageRank.objects.filter(id__in=batch_ids).delete()[0]
+                        deleted_count += deleted
+                        pbar.update(deleted)
+                        
+                        # Break if we've deleted everything
+                        if deleted < batch_size:
+                            break
+                
+                self.stdout.write(f"Deleted {deleted_count} PageRank scores")
+            else:
+                self.stdout.write("No existing PageRank scores found")
         
         # Check if we have articles with links
         from django.db import connection
@@ -83,39 +195,21 @@ class Command(BaseCommand):
             )
             return
         
-        # Store results in database
-        self.stdout.write("Storing PageRank scores in database...")
+        # Store results in database using parallel processing
+        self.stdout.write("Preparing to store PageRank scores...")
         
         # Get all articles that have PageRank scores
         article_ids = list(pagerank_scores.keys())
         articles = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
         
-        # Create PageRank objects in batches
-        pagerank_objects = []
-        batch_size = 1000
-        
-        with tqdm(total=len(pagerank_scores), desc="Storing PageRank scores") as pbar:
-            for article_id, score in pagerank_scores.items():
-                if article_id in articles:
-                    pagerank_objects.append(
-                        PageRank(
-                            article=articles[article_id],
-                            score=score,
-                            iteration_count=iterations
-                        )
-                    )
-                
-                if len(pagerank_objects) >= batch_size:
-                    with transaction.atomic():
-                        PageRank.objects.bulk_create(pagerank_objects, ignore_conflicts=True)
-                    pbar.update(len(pagerank_objects))
-                    pagerank_objects.clear()
-            
-            # Final batch
-            if pagerank_objects:
-                with transaction.atomic():
-                    PageRank.objects.bulk_create(pagerank_objects, ignore_conflicts=True)
-                pbar.update(len(pagerank_objects))
+        # Use parallel storage
+        self._parallel_store_pagerank_scores(
+            pagerank_scores=pagerank_scores,
+            articles_dict=articles,
+            iteration_count=iterations,
+            num_threads=num_threads,
+            batch_size=batch_size
+        )
         
         # Display results
         elapsed_time = time.perf_counter() - start_time
