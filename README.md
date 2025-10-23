@@ -221,7 +221,7 @@ The project includes a two-page Django web application for searching and viewing
 For optimal search performance, build the TF-IDF and PageRank indexes:
 
 ```bash
-# Build TF-IDF index (optimized for performance)
+# Build TF-IDF index with token counts (optimized for performance)
 python manage.py build_tfidf_index --limit 100000
 
 # Build PageRank scores (optimized for performance)
@@ -234,6 +234,13 @@ python manage.py build_pagerank --rebuild --profile --verbose
 - **Large datasets (10k+ articles)**: 30-60 articles/second
 - **Auto-scaling**: Worker count automatically optimized based on dataset size
 - **Profiling support**: Use `--profile --verbose` for performance analysis
+
+**Token Counting Integration:**
+- The TF-IDF build process now automatically computes token counts for each paragraph
+- Token counts are stored in the `paragraph_token_counts` field as a parallel array to `plain_text_paragraphs`
+- Uses the same tokenizer as the search engine (configurable via `TOKENIZER_TYPE` setting)
+- No additional processing time - computed during existing tokenization pass
+- Enables paragraph-level analysis and search result ranking by content length
 
 The web app will work with basic title search even without these indexes, but hybrid search provides much better results.
 
@@ -362,3 +369,79 @@ python manage.py build_tfidf_index --rebuild
 | Naive | Fast | Low | Medium | Simple matching |
 
 For detailed information, see [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md).
+
+## QA Dataset Generation
+
+Generate a question-answering dataset for LLM training from HotpotQA data with supporting and distractor documents.
+
+### Generate QA Dataset
+
+Create a QA dataset with multiple context sizes (8k, 32k, 128k tokens):
+
+```bash
+# Test on toy dataset first
+python manage.py generate_qa_dataset \
+  --input data/raw/hotpot_dev_fullwiki_v1_toy.json \
+  --output-dir data/processed \
+  --context-sizes 8000 32000 128000 \
+  --verbose
+
+# Process full dataset (when available)
+python manage.py generate_qa_dataset \
+  --input data/raw/hotpot_dev_fullwiki_v1.json \
+  --output-dir data/processed \
+  --context-sizes 8000 32000 128000 \
+  --workers 8 \
+  --limit 1000
+```
+
+### Output Files
+
+The command generates three JSON files in `data/processed/`:
+- `qa_dataset_8000.json` - entries with context_size ≤ 8k tokens
+- `qa_dataset_32000.json` - entries with context_size ≤ 32k tokens  
+- `qa_dataset_128000.json` - entries with context_size ≤ 128k tokens
+
+### Output Schema
+
+Each entry follows this schema:
+```json
+{
+  "id": "string",
+  "question": "string", 
+  "gold_answer": "string",
+  "supporting_docs": [{"title": "string", "text": "string"}, ...],
+  "distractor_docs": [{"title": "string", "text": "string"}, ...],
+  "context_size": int
+}
+```
+
+### Command Options
+
+| Flag | Purpose |
+|------|---------|
+| `--input PATH` | Path to HotpotQA JSON file (default: data/raw/hotpot_dev_fullwiki_v1.json) |
+| `--output-dir PATH` | Directory for output files (default: data/processed) |
+| `--context-sizes N1 N2 N3` | Context size limits in tokens (default: 8000 32000 128000) |
+| `--limit N` | Limit number of entries to process (for testing) |
+| `--workers N` | Number of worker processes (default: CPU count) |
+| `--verbose` | Enable verbose logging |
+
+### Processing Logic
+
+1. **Supporting Documents**: Extract articles from database using exact title matching from `supporting_facts`
+2. **Distractor Documents**: Use TF-IDF search with supporting fact titles as queries, excluding supporting docs
+3. **Context Filtering**: Skip entries where supporting docs alone exceed context limits
+4. **Token Counting**: Use GPT tokenizer (tiktoken cl100k_base) for consistent token counting
+5. **Output Generation**: Create separate files for each context size with appropriate filtering
+
+### Performance Characteristics
+
+- **Multiprocessing**: Uses all CPU cores by default for parallel processing
+- **Token Counting**: ~50,000 tokens/second using GPT tokenizer
+- **Search Performance**: Uses optimized TF-IDF search with inverted index
+- **Memory Efficient**: Streams processing to handle large datasets
+- **Progress Tracking**: Real-time progress bars and comprehensive logging
+- **Speed**: ~5-6 seconds per entry with 8 workers (vs ~13-15 seconds sequential)
+
+For detailed information, see [docs-vibe/0028-qa-dataset-generation.md](docs-vibe/0028-qa-dataset-generation.md).
