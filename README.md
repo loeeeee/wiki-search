@@ -1,6 +1,8 @@
 # wiki-search
 A wikipedia dump processing pipeline
 
+**SOFTWARE DEFINED DATA**
+
 ## Database Setup
 
 This project uses PostgreSQL as the database backend, connecting to a server at `172.22.0.133`.
