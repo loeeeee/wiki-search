@@ -42,4 +42,8 @@ Always avoid module level constant.
 
 Always document concise implementation details and basic usage in docs-vibe/ with a sequential file name.
 
+When writing documentation in docs-vibe/, always document the user's intent in its original words, in addition to a more logical and concise rephrasing.
+
+Always create documentation in docs-vibe/ before start writing any code.
+
 Always update README.md after each task.
