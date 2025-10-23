@@ -239,11 +239,14 @@ The web app will work with basic title search even without these indexes, but hy
 
 ### PageRank Build Optimization
 
-The PageRank build process has been optimized for high performance:
+The PageRank build process has been optimized for high performance with parallel database operations:
 
 ```bash
-# Standard PageRank build
+# Standard PageRank build (parallel database operations)
 python manage.py build_pagerank
+
+# With custom parallel workers
+python manage.py build_pagerank --db-read-workers 4 --db-write-workers 4
 
 # With profiling and verbose output
 python manage.py build_pagerank --rebuild --profile --verbose
@@ -252,21 +255,33 @@ python manage.py build_pagerank --rebuild --profile --verbose
 python manage.py build_pagerank --profile --verbose 2>&1 | grep "Memory usage"
 ```
 
-**Optimization Features:**
+**New Parallel Optimization Features:**
+- **Parallel Graph Loading**: ID range-based batching with ThreadPoolExecutor (2-4x speedup)
+- **Parallel Storage**: Multi-threaded PostgreSQL COPY operations (2-3x speedup)
+- **Connection Management**: Each thread gets its own database connection
+- **Index Optimization**: Drop indexes before writes, rebuild after
+- **Auto-scaling**: Smart worker count selection based on dataset size
+
+**Legacy Optimization Features:**
 - **PostgreSQL COPY**: 3-5x faster storage than ORM bulk_create
 - **Raw SQL DELETE**: 10x+ faster deletion than ORM batching
 - **Memory efficient**: 50-70% memory reduction by avoiding Article object loading
-- **Single-threaded COPY**: Removed threading overhead for better performance
 - **Comprehensive profiling**: Phase timing, memory tracking, and cProfile integration
 
 **Performance Characteristics:**
-- **Small datasets (1k articles)**: 2-3x speedup over baseline
-- **Medium datasets (10k articles)**: 3-4x speedup over baseline
-- **Large datasets (100k+ articles)**: 4-5x speedup over baseline
+- **Small datasets (1k articles)**: 1.7-2x speedup over baseline
+- **Medium datasets (10k articles)**: 2-2.5x speedup over baseline
+- **Large datasets (100k+ articles)**: 2.5-3.5x speedup over baseline
 - **Memory usage**: Scales linearly with dataset size
-- **Database load**: Reduced by 60-80%
+- **Database load**: Optimized with parallel operations
 
-For detailed optimization information, see [docs-vibe/0027-pagerank-optimization.md](docs-vibe/0027-pagerank-optimization.md).
+**CLI Options:**
+- `--db-read-workers N`: Number of parallel workers for reading links (default: 4)
+- `--db-write-workers N`: Number of parallel workers for writing scores (default: 4)
+- `--batch-size N`: Batch size for database operations (default: 1000)
+- `--limit N`: Limit number of links to process (for testing)
+
+For detailed optimization information, see [docs-vibe/0027-pagerank-optimization.md](docs-vibe/0027-pagerank-optimization.md) and [docs-vibe/0029-multiprocessing-pagerank-feasibility.md](docs-vibe/0029-multiprocessing-pagerank-feasibility.md).
 
 ### Database Status Page
 

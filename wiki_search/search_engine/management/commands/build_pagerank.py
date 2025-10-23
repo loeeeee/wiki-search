@@ -80,6 +80,10 @@ class Command(BaseCommand):
                           help="Enable verbose logging")
         parser.add_argument("--threads", type=int, default=4,
                           help="Number of threads for parallel database operations (default: 4)")
+        parser.add_argument("--db-read-workers", type=int, default=4,
+                          help="Number of parallel workers for reading links (default: 4)")
+        parser.add_argument("--db-write-workers", type=int, default=4,
+                          help="Number of parallel workers for writing scores (default: 4)")
         parser.add_argument("--batch-size", type=int, default=1000,
                           help="Batch size for database operations (default: 1000)")
         parser.add_argument("--profile", action="store_true",
@@ -177,6 +181,72 @@ class Command(BaseCommand):
         
         return created
 
+    def _store_pagerank_parallel(self, pagerank_scores: Dict[int, float],
+                                iteration_count: int,
+                                batch_size: int = 50000,
+                                db_workers: int = 4) -> int:
+        """Store PageRank scores using parallel database writes.
+        
+        Args:
+            pagerank_scores: Dictionary mapping article_id to PageRank score
+            iteration_count: Number of iterations used for computation
+            batch_size: Number of records to process per batch
+            db_workers: Number of parallel database workers
+            
+        Returns:
+            Number of objects created
+        """
+        if not pagerank_scores:
+            return 0
+        
+        # Drop indexes ONCE before all writes
+        self._drop_pagerank_indexes()
+        
+        # Split data into worker chunks
+        items = list(pagerank_scores.items())
+        total = len(items)
+        worker_chunk_size = max(1, total // db_workers)
+        chunks = [items[i:i + worker_chunk_size] 
+                  for i in range(0, total, worker_chunk_size)]
+        
+        logger.info(f"Storing {total} PageRank scores using {db_workers} parallel workers")
+        
+        # Parallel COPY operations
+        def write_chunk(chunk: List[Tuple[int, float]]) -> int:
+            """Each thread writes its chunk using COPY."""
+            written = 0
+            # Further subdivide into batches for memory efficiency
+            for i in range(0, len(chunk), batch_size):
+                batch = chunk[i:i + batch_size]
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        with cursor.copy(
+                            "COPY search_engine_pagerank (article_id, score, iteration_count, last_computed) FROM STDIN"
+                        ) as copy:
+                            for article_id, score in batch:
+                                copy.write_row((article_id, float(score), iteration_count, datetime.now()))
+                written += len(batch)
+            return written
+        
+        # Use ThreadPoolExecutor for database writes
+        created = 0
+        with ThreadPoolExecutor(max_workers=db_workers) as executor:
+            futures = [executor.submit(write_chunk, chunk) for chunk in chunks]
+            with tqdm(total=total, desc="Storing PageRank scores") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        count = future.result()
+                        created += count
+                        pbar.update(count)
+                    except Exception as e:
+                        logger.error(f"Error in parallel storage: {e}")
+                        raise
+        
+        # Rebuild indexes ONCE after all writes
+        self._rebuild_pagerank_indexes()
+        
+        return created
+
 
     def handle(self, *args, **options):
         # Setup logging
@@ -189,6 +259,8 @@ class Command(BaseCommand):
         tolerance = options["tolerance"]
         rebuild = options["rebuild"]
         num_threads = options["threads"]
+        db_read_workers = options["db_read_workers"]
+        db_write_workers = options["db_write_workers"]
         batch_size = options["batch_size"]
         profile = options["profile"]
         
@@ -233,17 +305,19 @@ class Command(BaseCommand):
         # The build_adjacency_matrix function will handle the case of no links gracefully
         self.stdout.write("Proceeding with PageRank computation...")
         
-        # Compute PageRank scores
-        self.stdout.write("Computing PageRank scores...")
-        logger.info("Starting computation phase")
+        # Compute PageRank scores using parallel database reads
+        self.stdout.write(f"Computing PageRank scores using {db_read_workers} parallel database workers...")
+        logger.info("Starting computation phase with parallel graph loading")
         computation_start = time.perf_counter()
         
-        pagerank_scores, iterations, residual = compute_pagerank(
+        from search_engine.pagerank import compute_pagerank_parallel
+        pagerank_scores, iterations, residual = compute_pagerank_parallel(
             damping=damping,
             max_iter=max_iter,
             tol=tolerance,
             verbose=options["verbose"],
-            limit=options["limit"]
+            limit=options["limit"],
+            db_read_workers=db_read_workers
         )
         
         computation_elapsed = time.perf_counter() - computation_start
@@ -255,20 +329,19 @@ class Command(BaseCommand):
             )
             return
         
-        # Store results in database using PostgreSQL COPY
-        self.stdout.write("Preparing to store PageRank scores...")
-        logger.info("Starting storage phase")
+        # Store results in database using parallel PostgreSQL COPY
+        self.stdout.write(f"Preparing to store PageRank scores using {db_write_workers} parallel workers...")
+        logger.info("Starting storage phase with parallel writes")
         storage_start = time.perf_counter()
         
-        # Use COPY for high-throughput storage with batch streaming
-        self.stdout.write(f"Storing {len(pagerank_scores)} PageRank scores using PostgreSQL COPY...")
-        with tqdm(total=len(pagerank_scores), desc="Storing PageRank scores") as pbar:
-            created_count = self._store_pagerank_copy(
-                pagerank_scores=pagerank_scores,
-                iteration_count=iterations,
-                batch_size=batch_size
-            )
-            pbar.update(created_count)
+        # Use parallel COPY for high-throughput storage
+        self.stdout.write(f"Storing {len(pagerank_scores)} PageRank scores using parallel PostgreSQL COPY...")
+        created_count = self._store_pagerank_parallel(
+            pagerank_scores=pagerank_scores,
+            iteration_count=iterations,
+            batch_size=batch_size,
+            db_workers=db_write_workers
+        )
         
         storage_elapsed = time.perf_counter() - storage_start
         logger.info("Storage phase completed in %.2f seconds", storage_elapsed)
