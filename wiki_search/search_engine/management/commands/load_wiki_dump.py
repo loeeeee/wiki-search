@@ -323,7 +323,7 @@ class Command(BaseCommand):
             profiler.enable()
         
         with phase_timer("Resolve Link Foreign Keys"):
-            updated_from, updated_to = self._resolve_links_merged(batch_size, db_workers)
+            call_command('resolve_links', batch_size=batch_size, db_workers=db_workers)
         
         if enable_profiling:
             profiler.disable()
@@ -557,87 +557,5 @@ class Command(BaseCommand):
         return created_total, skipped_total, links_total
 
 
-    def _resolve_links_merged(self, batch_size: int, db_workers: int = 6) -> Tuple[int, int]:
-        """Resolve both from_article and to_article foreign keys in a single pass."""
-        from django.db import connection
-        from django.db.models import Q
-        
-        # Get ID range for unresolved links (either from_article or to_article is NULL)
-        result = InternalLink.objects.filter(
-            Q(from_article__isnull=True, from_page_id__isnull=False) |
-            Q(to_article__isnull=True)
-        ).aggregate(min_id=Min('id'), max_id=Max('id'), total=Count('id'))
-        
-        if not result['total'] or result['min_id'] is None or result['max_id'] is None:
-            logger.info("No links to resolve")
-            return 0, 0
-
-        min_id = result['min_id']
-        max_id = result['max_id']
-        unresolved_count = result['total']
-        
-        logger.info("Resolving both from_article and to_article for %d links (ID range: %d-%d) using %d workers", 
-                    unresolved_count, min_id, max_id, db_workers)
-
-        # Create ID range batches based on batch_size
-        batches = []
-        for start in range(min_id, max_id + 1, batch_size):
-            end = min(start + batch_size, max_id + 1)
-            batches.append((start, end))
-
-        logger.info("Processing %d ID range batches of links (batch_size=%d)", 
-                    len(batches), batch_size)
-
-        # Add progress bar for link resolution
-        pbar = tqdm(total=len(batches), desc="Resolving links", unit="batch", dynamic_ncols=True)
-
-        def update_range_both(id_start: int, id_end: int) -> Tuple[int, int]:
-            """Update both from_article and to_article in single query."""
-            from django.db import connection
-            with connection.cursor() as cursor:
-                # Merged UPDATE with dual JOIN
-                sql = """
-                    UPDATE search_engine_internallink AS link
-                    SET 
-                        from_article_id = COALESCE(link.from_article_id, from_art.id),
-                        to_article_id = COALESCE(link.to_article_id, to_art.id)
-                    FROM 
-                        search_engine_article AS from_art,
-                        search_engine_article AS to_art
-                    WHERE link.id >= %s AND link.id < %s
-                      AND link.from_page_id = from_art.page_id
-                      AND link.to_title = to_art.title
-                """
-                cursor.execute(sql, [id_start, id_end])
-                
-                # Count separate updates for reporting
-                cursor.execute("""
-                    SELECT 
-                        COUNT(*) FILTER (WHERE from_article_id IS NOT NULL),
-                        COUNT(*) FILTER (WHERE to_article_id IS NOT NULL)
-                    FROM search_engine_internallink
-                    WHERE id >= %s AND id < %s
-                """, [id_start, id_end])
-                return cursor.fetchone()
-
-        # Process batches in parallel
-        updated_from, updated_to = 0, 0
-        try:
-            with ThreadPoolExecutor(max_workers=db_workers) as executor:
-                futures = [executor.submit(update_range_both, start, end) for start, end in batches]
-                for future in as_completed(futures):
-                    try:
-                        batch_from, batch_to = future.result()
-                        updated_from += batch_from
-                        updated_to += batch_to
-                        pbar.update(1)
-                    except Exception as exc:
-                        logger.error("Error in link resolution batch update: %s", exc)
-                        raise
-        finally:
-            pbar.close()
-
-        logger.info("Resolved from_article for %d links, to_article for %d links", updated_from, updated_to)
-        return updated_from, updated_to
 
 
