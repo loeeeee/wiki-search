@@ -298,6 +298,7 @@ class Command(BaseCommand):
                     len(shards), workers, db_workers, producer_threads)
         
         # Phase 1: Ingest articles and links
+        profiler = None
         if enable_profiling:
             profiler = cProfile.Profile()
             profiler.enable()
@@ -305,7 +306,7 @@ class Command(BaseCommand):
         with phase_timer("Article and Link Ingestion"):
             created_total, skipped_total, links_total = self._run_pipeline(shards, batch_size, limit, workers, db_workers, producer_threads)
         
-        if enable_profiling:
+        if enable_profiling and profiler is not None:
             profiler.disable()
             save_profile_stats(profiler, "ingestion_phase")
 
@@ -316,29 +317,9 @@ class Command(BaseCommand):
             links_total,
         )
 
-        # Phase 2: Resolve from_article links
-        if enable_profiling:
-            profiler_from = cProfile.Profile()
-            profiler_from.enable()
-        
-        with phase_timer("Resolve from_article Links"):
-            updated_from = self._resolve_from_article(batch_size, db_workers)
-        
-        if enable_profiling:
-            profiler_from.disable()
-            save_profile_stats(profiler_from, "resolve_from_article")
-
-        # Phase 3: Resolve to_article links
-        if enable_profiling:
-            profiler_to = cProfile.Profile()
-            profiler_to.enable()
-        
-        with phase_timer("Resolve to_article Links"):
-            updated_to = self._resolve_to_article(batch_size, db_workers)
-        
-        if enable_profiling:
-            profiler_to.disable()
-            save_profile_stats(profiler_to, "resolve_to_article")
+        # Phase 2: Resolve links using separate command
+        with phase_timer("Resolve Links"):
+            call_command('resolve_links', batch_size=batch_size, db_workers=db_workers)
 
         overall_elapsed = time.perf_counter() - overall_start
         logger.info("=" * 60)
@@ -348,8 +329,8 @@ class Command(BaseCommand):
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"Created {created_total} new articles, skipped {skipped_total} dups, created {links_total} links; "
-                f"resolved from_article={updated_from}, to_article={updated_to} in {overall_elapsed:.2f}s"
+                f"Created {created_total} new articles, skipped {skipped_total} dups, created {links_total} links "
+                f"in {overall_elapsed:.2f}s"
             )
         )
 
@@ -568,139 +549,5 @@ class Command(BaseCommand):
         return created_total, skipped_total, links_total
 
 
-    def _resolve_from_article(self, batch_size: int, db_workers: int = 6) -> int:
-        """Resolve from_article foreign keys using from_page_id."""
-        from django.db import connection
-        from django.db.models import Q
-        
-        # Get ID range for unresolved from_article links
-        result = InternalLink.objects.filter(
-            from_article__isnull=True, 
-            from_page_id__isnull=False
-        ).aggregate(min_id=Min('id'), max_id=Max('id'), total=Count('id'))
-        
-        if not result['total'] or result['min_id'] is None or result['max_id'] is None:
-            logger.info("No from_article links to resolve")
-            return 0
-
-        min_id = result['min_id']
-        max_id = result['max_id']
-        unresolved_count = result['total']
-        
-        logger.info("Resolving from_article for %d links (ID range: %d-%d) using %d workers", 
-                    unresolved_count, min_id, max_id, db_workers)
-
-        # Create ID range batches based on batch_size
-        batches = []
-        for start in range(min_id, max_id + 1, batch_size):
-            end = min(start + batch_size, max_id + 1)
-            batches.append((start, end))
-
-        logger.info("Processing %d ID range batches for from_article resolution (batch_size=%d)", 
-                    len(batches), batch_size)
-
-        # Add progress bar for from_article resolution
-        pbar = tqdm(total=len(batches), desc="Resolving from_article", unit="batch", dynamic_ncols=True)
-
-        def update_range_from_article(id_start: int, id_end: int) -> int:
-            """Update from_article_id for a range of links."""
-            from django.db import connection
-            with connection.cursor() as cursor:
-                sql = """
-                    UPDATE search_engine_internallink AS link
-                    SET from_article_id = article.id
-                    FROM search_engine_article AS article
-                    WHERE link.id >= %s AND link.id < %s
-                      AND link.from_article_id IS NULL
-                      AND link.from_page_id = article.page_id
-                """
-                cursor.execute(sql, [id_start, id_end])
-                return cursor.rowcount
-
-        # Process batches in parallel
-        updated_total = 0
-        try:
-            with ThreadPoolExecutor(max_workers=db_workers) as executor:
-                futures = [executor.submit(update_range_from_article, start, end) for start, end in batches]
-                for future in as_completed(futures):
-                    try:
-                        batch_updated = future.result()
-                        updated_total += batch_updated
-                        pbar.update(1)
-                    except Exception as exc:
-                        logger.error("Error in from_article resolution batch update: %s", exc)
-                        raise
-        finally:
-            pbar.close()
-
-        logger.info("Resolved from_article for %d links", updated_total)
-        return updated_total
-
-    def _resolve_to_article(self, batch_size: int, db_workers: int = 6) -> int:
-        """Resolve to_article foreign keys using to_title."""
-        from django.db import connection
-        from django.db.models import Q
-        
-        # Get ID range for unresolved to_article links
-        result = InternalLink.objects.filter(
-            to_article__isnull=True
-        ).aggregate(min_id=Min('id'), max_id=Max('id'), total=Count('id'))
-        
-        if not result['total'] or result['min_id'] is None or result['max_id'] is None:
-            logger.info("No to_article links to resolve")
-            return 0
-
-        min_id = result['min_id']
-        max_id = result['max_id']
-        unresolved_count = result['total']
-        
-        logger.info("Resolving to_article for %d links (ID range: %d-%d) using %d workers", 
-                    unresolved_count, min_id, max_id, db_workers)
-
-        # Create ID range batches based on batch_size
-        batches = []
-        for start in range(min_id, max_id + 1, batch_size):
-            end = min(start + batch_size, max_id + 1)
-            batches.append((start, end))
-
-        logger.info("Processing %d ID range batches for to_article resolution (batch_size=%d)", 
-                    len(batches), batch_size)
-
-        # Add progress bar for to_article resolution
-        pbar = tqdm(total=len(batches), desc="Resolving to_article", unit="batch", dynamic_ncols=True)
-
-        def update_range_to_article(id_start: int, id_end: int) -> int:
-            """Update to_article_id for a range of links."""
-            from django.db import connection
-            with connection.cursor() as cursor:
-                sql = """
-                    UPDATE search_engine_internallink AS link
-                    SET to_article_id = article.id
-                    FROM search_engine_article AS article
-                    WHERE link.id >= %s AND link.id < %s
-                      AND link.to_article_id IS NULL
-                      AND link.to_title = article.title
-                """
-                cursor.execute(sql, [id_start, id_end])
-                return cursor.rowcount
-
-        # Process batches in parallel
-        updated_total = 0
-        try:
-            with ThreadPoolExecutor(max_workers=db_workers) as executor:
-                futures = [executor.submit(update_range_to_article, start, end) for start, end in batches]
-                for future in as_completed(futures):
-                    try:
-                        batch_updated = future.result()
-                        updated_total += batch_updated
-                        pbar.update(1)
-                    except Exception as exc:
-                        logger.error("Error in to_article resolution batch update: %s", exc)
-                        raise
-        finally:
-            pbar.close()
-
-        logger.info("Resolved to_article for %d links", updated_total)
-        return updated_total
 
 

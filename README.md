@@ -76,6 +76,23 @@ python wiki_search/manage.py load_wiki_dump --workers 4 --db-workers 4  # 4-core
 python wiki_search/manage.py load_wiki_dump --workers 8 --db-workers 8  # 8-core system
 ```
 
+### Separate Link Resolution
+
+Link resolution can now be run independently using the `resolve_links` command:
+
+```bash
+# Run link resolution separately (useful for re-processing links)
+python wiki_search/manage.py resolve_links --batch-size 5000 --db-workers 96
+
+# Run with custom settings
+python wiki_search/manage.py resolve_links --batch-size 10000 --db-workers 48
+```
+
+This is useful when:
+- Re-running link resolution without reloading articles
+- Debugging link resolution issues
+- Optimizing link resolution performance independently
+
 ### Options for load_wiki_dump
 
 | Flag | Purpose |
