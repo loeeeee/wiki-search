@@ -78,14 +78,14 @@ class Command(BaseCommand):
                           help="Clear existing PageRank scores before building")
         parser.add_argument("--verbose", action="store_true",
                           help="Enable verbose logging")
-        parser.add_argument("--threads", type=int, default=4,
-                          help="Number of threads for parallel database operations (default: 4)")
-        parser.add_argument("--db-read-workers", type=int, default=4,
-                          help="Number of parallel workers for reading links (default: 4)")
-        parser.add_argument("--db-write-workers", type=int, default=4,
-                          help="Number of parallel workers for writing scores (default: 4)")
-        parser.add_argument("--batch-size", type=int, default=1000,
-                          help="Batch size for database operations (default: 1000)")
+        parser.add_argument("--threads", type=int, default=48,
+                          help="Number of threads for parallel database operations (default: 48)")
+        parser.add_argument("--db-read-workers", type=int, default=48,
+                          help="Number of parallel workers for reading links (default: 48)")
+        parser.add_argument("--db-write-workers", type=int, default=48,
+                          help="Number of parallel workers for writing scores (default: 48)")
+        parser.add_argument("--batch-size", type=int, default=5000,
+                          help="Batch size for database operations (default: 5000)")
         parser.add_argument("--profile", action="store_true",
                           help="Enable detailed profiling with cProfile")
         parser.add_argument("--limit", type=int, default=None,
