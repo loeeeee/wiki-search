@@ -15,7 +15,7 @@ from django.db import connection
 logger = logging.getLogger(__name__)
 
 
-def build_adjacency_matrix() -> Tuple[csr_matrix, List[int], Dict[int, int]]:
+def build_adjacency_matrix(limit: int = None) -> Tuple[csr_matrix, List[int], Dict[int, int]]:
     """Build sparse adjacency matrix from InternalLink graph.
     
     Returns:
@@ -26,38 +26,41 @@ def build_adjacency_matrix() -> Tuple[csr_matrix, List[int], Dict[int, int]]:
     logger.info("Building adjacency matrix from InternalLink graph...")
     
     with connection.cursor() as cursor:
-        # Get all articles that have links (either in or out)
-        cursor.execute("""
-            SELECT DISTINCT a.id 
-            FROM search_engine_article a
-            WHERE EXISTS (
-                SELECT 1 FROM search_engine_internallink l 
-                WHERE l.from_article_id = a.id OR l.to_article_id = a.id
-            )
-            ORDER BY a.id
-        """)
-        article_ids = [row[0] for row in cursor.fetchall()]
+        # Get all valid links in a single query - this is more efficient
+        if limit:
+            cursor.execute("""
+                SELECT from_article_id, to_article_id
+                FROM search_engine_internallink
+                WHERE from_article_id IS NOT NULL 
+                  AND to_article_id IS NOT NULL
+                  AND from_article_id != to_article_id  -- Skip self-loops
+                LIMIT %s
+            """, [limit])
+        else:
+            cursor.execute("""
+                SELECT from_article_id, to_article_id
+                FROM search_engine_internallink
+                WHERE from_article_id IS NOT NULL 
+                  AND to_article_id IS NOT NULL
+                  AND from_article_id != to_article_id  -- Skip self-loops
+            """)
+        links = cursor.fetchall()
     
-    if not article_ids:
-        logger.warning("No articles with links found")
+    if not links:
+        logger.warning("No valid links found")
         return csr_matrix((0, 0)), [], {}
     
-    # Create mapping from article ID to matrix index
+    # Extract article IDs from links and create mapping
+    all_article_ids = set()
+    for from_id, to_id in links:
+        all_article_ids.add(from_id)
+        all_article_ids.add(to_id)
+    
+    article_ids = sorted(all_article_ids)
     id_to_index = {article_id: idx for idx, article_id in enumerate(article_ids)}
     n = len(article_ids)
     
     logger.info(f"Building {n}x{n} adjacency matrix for {n} articles with links")
-    
-    # Get all valid links (both from_article and to_article resolved)
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT from_article_id, to_article_id
-            FROM search_engine_internallink
-            WHERE from_article_id IS NOT NULL 
-              AND to_article_id IS NOT NULL
-              AND from_article_id != to_article_id  -- Skip self-loops
-        """)
-        links = cursor.fetchall()
     
     # Build sparse matrix
     rows, cols = [], []
@@ -79,7 +82,8 @@ def compute_pagerank(
     damping: float = 0.85,
     max_iter: int = 100,
     tol: float = 1e-6,
-    verbose: bool = True
+    verbose: bool = True,
+    limit: int = None
 ) -> Tuple[Dict[int, float], int, float]:
     """Compute PageRank scores using power iteration.
     
@@ -97,7 +101,7 @@ def compute_pagerank(
     logger.info(f"Computing PageRank with damping={damping}, max_iter={max_iter}, tol={tol}")
     
     # Build adjacency matrix
-    adjacency_matrix, article_ids, id_to_index = build_adjacency_matrix()
+    adjacency_matrix, article_ids, id_to_index = build_adjacency_matrix(limit=limit)
     n = len(article_ids)
     
     if n == 0:
@@ -119,9 +123,15 @@ def compute_pagerank(
         dangling_indices = np.where(dangling_mask)[0]
         logger.info(f"Found {len(dangling_indices)} dangling nodes")
         
+        # Convert to LIL format for efficient column assignment
+        transition_matrix = transition_matrix.tolil()
+        
         # Add uniform links from dangling nodes to all pages
         for j in dangling_indices:
             transition_matrix[:, j] = 1.0 / n
+        
+        # Convert back to CSR for efficient matrix operations
+        transition_matrix = transition_matrix.tocsr()
     
     # Initialize PageRank vector
     pagerank = np.ones(n) / n
@@ -134,7 +144,7 @@ def compute_pagerank(
         pagerank = (1 - damping) / n + damping * transition_matrix.dot(pagerank)
         
         # Check convergence
-        residual = norm(pagerank - pagerank_old, ord=1)
+        residual = np.linalg.norm(pagerank - pagerank_old, ord=1)
         
         if verbose and iteration % 10 == 0:
             logger.info(f"Iteration {iteration}: residual = {residual:.2e}")

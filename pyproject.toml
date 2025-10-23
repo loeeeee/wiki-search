@@ -6,12 +6,13 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "django>=5.2.7",
-    "psycopg[binary]>=3.2.0",  # PostgreSQL adapter for Django
+    "psycopg[binary]>=3.2.0", # PostgreSQL adapter for Django
     "lxml>=6.0.2",
     "orjson>=3.11.3",
     "tqdm>=4.67.1",
     "numpy>=2.0.0",
     "scipy>=1.14.0",
-    "tiktoken>=0.8.0",  # GPT tokenizer
-    "nltk>=3.9.0",  # NLTK tokenizer
+    "tiktoken>=0.8.0", # GPT tokenizer
+    "nltk>=3.9.0", # NLTK tokenizer
+    "psutil>=7.1.1",
 ]
