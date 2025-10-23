@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import cProfile
 import logging
 import os
+import pstats
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Dict, List, Tuple
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
-from django.db import transaction
+from django.db import transaction, connection
 from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, TFIDFIndex, Vocabulary
@@ -16,6 +20,26 @@ from search_engine.search import compute_idf, compute_tf, vector_l2_norm
 from search_engine.tokenizer import tokenize
 
 logger = logging.getLogger(__name__)
+
+
+def save_profile_stats(profiler: cProfile.Profile, phase_name: str) -> str:
+    """Save cProfile statistics to file and log top functions."""
+    base_dir = settings.BASE_DIR.parent / "data" / "profiles"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    profile_path = base_dir / f"{phase_name}_{timestamp}.prof"
+    
+    profiler.dump_stats(str(profile_path))
+    
+    # Log top functions by cumulative time
+    stats = pstats.Stats(profiler)
+    stats.sort_stats(pstats.SortKey.CUMULATIVE)
+    
+    logger.info("Top 20 functions by cumulative time for %s:", phase_name)
+    stats.print_stats(20)
+    
+    return str(profile_path)
 
 
 def _compute_doc_freq_batch(article_tuples: List[Tuple[int, List[str]]]) -> Counter:
@@ -71,7 +95,7 @@ def _build_tfidf_batch(
 
 
 def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float]]) -> int:
-    """Synchronous TF-IDF flush - to be run in background thread."""
+    """Synchronous TF-IDF flush using PostgreSQL COPY for high throughput."""
     if not tfidf_tuples:
         return 0
     
@@ -79,27 +103,30 @@ def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float]]) ->
     article_ids = [tup[0] for tup in tfidf_tuples]
     articles = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
     
-    # Create TFIDFIndex objects
-    tfidf_objects = []
+    # Prepare data for COPY
+    tfidf_data = []
     for article_id, vec, l2_norm in tfidf_tuples:
         if article_id in articles:
-            tfidf_objects.append(
-                TFIDFIndex(
-                    article=articles[article_id],
-                    tfidf_vector={str(k): float(v) for k, v in vec.items()},
-                    l2_norm=float(l2_norm)
-                )
-            )
+            # Convert vector dict to JSON string for COPY
+            import json
+            vector_json = json.dumps({str(k): float(v) for k, v in vec.items()})
+            tfidf_data.append((article_id, vector_json, float(l2_norm)))
     
-    if tfidf_objects:
+    if tfidf_data:
         with transaction.atomic():
-            TFIDFIndex.objects.bulk_create(tfidf_objects, batch_size=1000, ignore_conflicts=True)
+            with connection.cursor() as cursor:
+                # Use COPY for bulk insert
+                with cursor.copy(
+                    "COPY search_engine_tfidfindex (article_id, tfidf_vector, l2_norm) FROM STDIN"
+                ) as copy:
+                    for article_id, vector_json, l2_norm in tfidf_data:
+                        copy.write_row((article_id, vector_json, l2_norm))
     
-    return len(tfidf_objects)
+    return len(tfidf_data)
 
 
 def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]]) -> int:
-    """Synchronous inverted index flush - to be run in background thread."""
+    """Synchronous inverted index flush using PostgreSQL COPY for high throughput."""
     if not inverted_tuples:
         return 0
     
@@ -110,23 +137,23 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]]) -> int:
     vocab_map = {v.id: v for v in Vocabulary.objects.filter(id__in=term_ids)}
     article_map = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
     
-    # Create InvertedIndex objects
-    inverted_objects = []
+    # Prepare data for COPY
+    inverted_data = []
     for term_id, article_id, tfidf_score in inverted_tuples:
         if term_id in vocab_map and article_id in article_map:
-            inverted_objects.append(
-                InvertedIndex(
-                    term=vocab_map[term_id],
-                    article=article_map[article_id],
-                    tf_idf_score=float(tfidf_score)
-                )
-            )
+            inverted_data.append((term_id, article_id, float(tfidf_score)))
     
-    if inverted_objects:
+    if inverted_data:
         with transaction.atomic():
-            InvertedIndex.objects.bulk_create(inverted_objects, batch_size=2000, ignore_conflicts=True)
+            with connection.cursor() as cursor:
+                # Use COPY for bulk insert
+                with cursor.copy(
+                    "COPY search_engine_invertedindex (term_id, article_id, tf_idf_score) FROM STDIN"
+                ) as copy:
+                    for term_id, article_id, tfidf_score in inverted_data:
+                        copy.write_row((term_id, article_id, tfidf_score))
     
-    return len(inverted_objects)
+    return len(inverted_data)
 
 
 class Command(BaseCommand):
@@ -134,10 +161,12 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser) -> None:
         parser.add_argument("--rebuild", action="store_true", help="Clear existing index before building")
-        parser.add_argument("--batch-size", type=int, default=3000, help="Articles per worker batch")
+        parser.add_argument("--batch-size", type=int, default=1000, help="Articles per worker batch")
         parser.add_argument("--limit", type=int, default=0, help="Limit number of articles (for testing)")
-        parser.add_argument("--workers", type=int, default=os.cpu_count(), help="Number of worker processes")
+        parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+        parser.add_argument("--db-workers", type=int, default=96, help="Number of database writer threads (default: 96)")
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+        parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
 
     def handle(self, *args, **options):
         # Setup logging
@@ -149,6 +178,13 @@ class Command(BaseCommand):
         limit = options["limit"]
         rebuild = options["rebuild"]
         workers = options["workers"]
+        db_workers = options["db_workers"]
+        enable_profiling = options.get("profile", False)
+        
+        # Initialize profilers
+        profiler_pass1 = None
+        profiler_vocab = None
+        profiler_pass2 = None
         
         start_time = time.perf_counter()
         
@@ -168,7 +204,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("No articles found to process"))
             return
         
-        self.stdout.write(f"Processing {total_articles} articles with {workers} workers")
+        self.stdout.write(f"Processing {total_articles} articles with {workers} workers, {db_workers} database workers")
         
         # Convert to lightweight tuples for worker processing
         self.stdout.write("Loading article data...")
@@ -184,6 +220,10 @@ class Command(BaseCommand):
         self.stdout.write("Pass 1: Computing document frequencies...")
         pass1_start = time.perf_counter()
         
+        if enable_profiling:
+            profiler_pass1 = cProfile.Profile()
+            profiler_pass1.enable()
+        
         with ProcessPoolExecutor(max_workers=workers) as executor:
             # Submit all batches for parallel processing
             futures = [executor.submit(_compute_doc_freq_batch, batch) 
@@ -194,6 +234,10 @@ class Command(BaseCommand):
             for future in tqdm(as_completed(futures), total=len(futures), desc="Pass 1 - Doc Freq"):
                 global_df.update(future.result())
         
+        if enable_profiling and profiler_pass1 is not None:
+            profiler_pass1.disable()
+            save_profile_stats(profiler_pass1, "pass1_doc_freq")
+        
         pass1_time = time.perf_counter() - pass1_start
         self.stdout.write(f"Pass 1 complete in {pass1_time:.2f}s - found {len(global_df)} unique terms")
         
@@ -201,22 +245,34 @@ class Command(BaseCommand):
         self.stdout.write("Building vocabulary...")
         vocab_start = time.perf_counter()
         
+        if enable_profiling:
+            profiler_vocab = cProfile.Profile()
+            profiler_vocab.enable()
+        
         total_docs = len(article_tuples)
-        vocab_rows = []
+        vocab_data = []
         for term, df in global_df.items():
-            vocab_rows.append(
-                Vocabulary(
-                    term=term, 
-                    document_frequency=int(df), 
-                    idf_value=compute_idf(total_docs, int(df))
-                )
-            )
+            vocab_data.append((
+                term, 
+                int(df), 
+                compute_idf(total_docs, int(df))
+            ))
         
         with transaction.atomic():
-            Vocabulary.objects.bulk_create(vocab_rows, batch_size=2000)
+            with connection.cursor() as cursor:
+                # Use COPY for vocabulary insertion
+                with cursor.copy(
+                    "COPY search_engine_vocabulary (term, document_frequency, idf_value) FROM STDIN"
+                ) as copy:
+                    for term, df, idf in vocab_data:
+                        copy.write_row((term, df, idf))
+        
+        if enable_profiling and profiler_vocab is not None:
+            profiler_vocab.disable()
+            save_profile_stats(profiler_vocab, "vocabulary_build")
         
         vocab_time = time.perf_counter() - vocab_start
-        self.stdout.write(f"Vocabulary built in {vocab_time:.2f}s - {len(vocab_rows)} terms")
+        self.stdout.write(f"Vocabulary built in {vocab_time:.2f}s - {len(vocab_data)} terms")
         
         # Build maps for workers
         term_to_id = {v.term: v.id for v in Vocabulary.objects.only("id", "term")}
@@ -226,7 +282,11 @@ class Command(BaseCommand):
         self.stdout.write("Pass 2: Building TF-IDF vectors and inverted index...")
         pass2_start = time.perf_counter()
         
-        with ThreadPoolExecutor(max_workers=2) as db_executor, \
+        if enable_profiling:
+            profiler_pass2 = cProfile.Profile()
+            profiler_pass2.enable()
+        
+        with ThreadPoolExecutor(max_workers=db_workers) as db_executor, \
              ProcessPoolExecutor(max_workers=workers) as process_executor:
             
             # Submit batches for parallel TF-IDF computation
@@ -276,6 +336,10 @@ class Command(BaseCommand):
                 tfidf_created += flush_tfidf_sync(tfidf_buffer)
             if inverted_buffer:
                 inverted_created += flush_inverted_sync(inverted_buffer)
+        
+        if enable_profiling and profiler_pass2 is not None:
+            profiler_pass2.disable()
+            save_profile_stats(profiler_pass2, "pass2_tfidf")
         
         pass2_time = time.perf_counter() - pass2_start
         total_time = time.perf_counter() - start_time
