@@ -316,17 +316,29 @@ class Command(BaseCommand):
             links_total,
         )
 
-        # Phase 2: Resolve link foreign keys (merged from_article and to_article)
+        # Phase 2: Resolve from_article links
         if enable_profiling:
-            profiler = cProfile.Profile()
-            profiler.enable()
+            profiler_from = cProfile.Profile()
+            profiler_from.enable()
         
-        with phase_timer("Resolve Link Foreign Keys"):
-            updated_from, updated_to = self._resolve_links_merged(batch_size, db_workers)
+        with phase_timer("Resolve from_article Links"):
+            updated_from = self._resolve_from_article(batch_size, db_workers)
         
         if enable_profiling:
-            profiler.disable()
-            save_profile_stats(profiler, "resolve_links_merged")
+            profiler_from.disable()
+            save_profile_stats(profiler_from, "resolve_from_article")
+
+        # Phase 3: Resolve to_article links
+        if enable_profiling:
+            profiler_to = cProfile.Profile()
+            profiler_to.enable()
+        
+        with phase_timer("Resolve to_article Links"):
+            updated_to = self._resolve_to_article(batch_size, db_workers)
+        
+        if enable_profiling:
+            profiler_to.disable()
+            save_profile_stats(profiler_to, "resolve_to_article")
 
         overall_elapsed = time.perf_counter() - overall_start
         logger.info("=" * 60)
@@ -556,26 +568,26 @@ class Command(BaseCommand):
         return created_total, skipped_total, links_total
 
 
-    def _resolve_links_merged(self, batch_size: int, db_workers: int = 6) -> Tuple[int, int]:
-        """Resolve both from_article and to_article foreign keys in a single pass."""
+    def _resolve_from_article(self, batch_size: int, db_workers: int = 6) -> int:
+        """Resolve from_article foreign keys using from_page_id."""
         from django.db import connection
         from django.db.models import Q
         
-        # Get ID range for unresolved links (either from_article or to_article is NULL)
+        # Get ID range for unresolved from_article links
         result = InternalLink.objects.filter(
-            Q(from_article__isnull=True, from_page_id__isnull=False) |
-            Q(to_article__isnull=True)
+            from_article__isnull=True, 
+            from_page_id__isnull=False
         ).aggregate(min_id=Min('id'), max_id=Max('id'), total=Count('id'))
         
         if not result['total'] or result['min_id'] is None or result['max_id'] is None:
-            logger.info("No links to resolve")
-            return 0, 0
+            logger.info("No from_article links to resolve")
+            return 0
 
         min_id = result['min_id']
         max_id = result['max_id']
         unresolved_count = result['total']
         
-        logger.info("Resolving both from_article and to_article for %d links (ID range: %d-%d) using %d workers", 
+        logger.info("Resolving from_article for %d links (ID range: %d-%d) using %d workers", 
                     unresolved_count, min_id, max_id, db_workers)
 
         # Create ID range batches based on batch_size
@@ -584,59 +596,111 @@ class Command(BaseCommand):
             end = min(start + batch_size, max_id + 1)
             batches.append((start, end))
 
-        logger.info("Processing %d ID range batches of links (batch_size=%d)", 
+        logger.info("Processing %d ID range batches for from_article resolution (batch_size=%d)", 
                     len(batches), batch_size)
 
-        # Add progress bar for link resolution
-        pbar = tqdm(total=len(batches), desc="Resolving links", unit="batch", dynamic_ncols=True)
+        # Add progress bar for from_article resolution
+        pbar = tqdm(total=len(batches), desc="Resolving from_article", unit="batch", dynamic_ncols=True)
 
-        def update_range_both(id_start: int, id_end: int) -> Tuple[int, int]:
-            """Update both from_article and to_article in single query."""
+        def update_range_from_article(id_start: int, id_end: int) -> int:
+            """Update from_article_id for a range of links."""
             from django.db import connection
             with connection.cursor() as cursor:
-                # Merged UPDATE with dual JOIN
                 sql = """
                     UPDATE search_engine_internallink AS link
-                    SET 
-                        from_article_id = COALESCE(link.from_article_id, from_art.id),
-                        to_article_id = COALESCE(link.to_article_id, to_art.id)
-                    FROM 
-                        search_engine_article AS from_art,
-                        search_engine_article AS to_art
+                    SET from_article_id = article.id
+                    FROM search_engine_article AS article
                     WHERE link.id >= %s AND link.id < %s
-                      AND link.from_page_id = from_art.page_id
-                      AND link.to_title = to_art.title
+                      AND link.from_article_id IS NULL
+                      AND link.from_page_id = article.page_id
                 """
                 cursor.execute(sql, [id_start, id_end])
-                
-                # Count separate updates for reporting
-                cursor.execute("""
-                    SELECT 
-                        COUNT(*) FILTER (WHERE from_article_id IS NOT NULL),
-                        COUNT(*) FILTER (WHERE to_article_id IS NOT NULL)
-                    FROM search_engine_internallink
-                    WHERE id >= %s AND id < %s
-                """, [id_start, id_end])
-                return cursor.fetchone()
+                return cursor.rowcount
 
         # Process batches in parallel
-        updated_from, updated_to = 0, 0
+        updated_total = 0
         try:
             with ThreadPoolExecutor(max_workers=db_workers) as executor:
-                futures = [executor.submit(update_range_both, start, end) for start, end in batches]
+                futures = [executor.submit(update_range_from_article, start, end) for start, end in batches]
                 for future in as_completed(futures):
                     try:
-                        batch_from, batch_to = future.result()
-                        updated_from += batch_from
-                        updated_to += batch_to
+                        batch_updated = future.result()
+                        updated_total += batch_updated
                         pbar.update(1)
                     except Exception as exc:
-                        logger.error("Error in link resolution batch update: %s", exc)
+                        logger.error("Error in from_article resolution batch update: %s", exc)
                         raise
         finally:
             pbar.close()
 
-        logger.info("Resolved from_article for %d links, to_article for %d links", updated_from, updated_to)
-        return updated_from, updated_to
+        logger.info("Resolved from_article for %d links", updated_total)
+        return updated_total
+
+    def _resolve_to_article(self, batch_size: int, db_workers: int = 6) -> int:
+        """Resolve to_article foreign keys using to_title."""
+        from django.db import connection
+        from django.db.models import Q
+        
+        # Get ID range for unresolved to_article links
+        result = InternalLink.objects.filter(
+            to_article__isnull=True
+        ).aggregate(min_id=Min('id'), max_id=Max('id'), total=Count('id'))
+        
+        if not result['total'] or result['min_id'] is None or result['max_id'] is None:
+            logger.info("No to_article links to resolve")
+            return 0
+
+        min_id = result['min_id']
+        max_id = result['max_id']
+        unresolved_count = result['total']
+        
+        logger.info("Resolving to_article for %d links (ID range: %d-%d) using %d workers", 
+                    unresolved_count, min_id, max_id, db_workers)
+
+        # Create ID range batches based on batch_size
+        batches = []
+        for start in range(min_id, max_id + 1, batch_size):
+            end = min(start + batch_size, max_id + 1)
+            batches.append((start, end))
+
+        logger.info("Processing %d ID range batches for to_article resolution (batch_size=%d)", 
+                    len(batches), batch_size)
+
+        # Add progress bar for to_article resolution
+        pbar = tqdm(total=len(batches), desc="Resolving to_article", unit="batch", dynamic_ncols=True)
+
+        def update_range_to_article(id_start: int, id_end: int) -> int:
+            """Update to_article_id for a range of links."""
+            from django.db import connection
+            with connection.cursor() as cursor:
+                sql = """
+                    UPDATE search_engine_internallink AS link
+                    SET to_article_id = article.id
+                    FROM search_engine_article AS article
+                    WHERE link.id >= %s AND link.id < %s
+                      AND link.to_article_id IS NULL
+                      AND link.to_title = article.title
+                """
+                cursor.execute(sql, [id_start, id_end])
+                return cursor.rowcount
+
+        # Process batches in parallel
+        updated_total = 0
+        try:
+            with ThreadPoolExecutor(max_workers=db_workers) as executor:
+                futures = [executor.submit(update_range_to_article, start, end) for start, end in batches]
+                for future in as_completed(futures):
+                    try:
+                        batch_updated = future.result()
+                        updated_total += batch_updated
+                        pbar.update(1)
+                    except Exception as exc:
+                        logger.error("Error in to_article resolution batch update: %s", exc)
+                        raise
+        finally:
+            pbar.close()
+
+        logger.info("Resolved to_article for %d links", updated_total)
+        return updated_total
 
 
