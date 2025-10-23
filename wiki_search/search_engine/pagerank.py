@@ -123,15 +123,16 @@ def compute_pagerank(
         dangling_indices = np.where(dangling_mask)[0]
         logger.info(f"Found {len(dangling_indices)} dangling nodes")
         
-        # Convert to LIL format for efficient column assignment
-        transition_matrix = transition_matrix.tolil()
+        # OPTIMIZATION: Use vectorized operations instead of LIL format
+        # Create a dense matrix for dangling nodes only (much more efficient)
+        dangling_matrix = np.ones((n, len(dangling_indices))) / n
         
-        # Add uniform links from dangling nodes to all pages
-        for j in dangling_indices:
-            transition_matrix[:, j] = 1.0 / n
-        
-        # Convert back to CSR for efficient matrix operations
-        transition_matrix = transition_matrix.tocsr()
+        # Add dangling node contributions to transition matrix
+        # This avoids the expensive LIL format conversion and individual assignments
+        transition_matrix = transition_matrix + csr_matrix(dangling_matrix) @ csr_matrix(
+            (np.ones(len(dangling_indices)), (dangling_indices, np.arange(len(dangling_indices)))),
+            shape=(n, len(dangling_indices))
+        ).T
     
     # Initialize PageRank vector
     pagerank = np.ones(n) / n
