@@ -7,6 +7,7 @@ import pstats
 import io
 import psutil
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -86,15 +87,63 @@ class Command(BaseCommand):
         parser.add_argument("--limit", type=int, default=None,
                           help="Limit number of links to process (for testing)")
 
+    def _drop_pagerank_indexes(self):
+        """Drop PageRank indexes before bulk insert for faster writes."""
+        with connection.cursor() as cursor:
+            # Drop unique constraint on article_id (OneToOneField)
+            cursor.execute("""
+                ALTER TABLE search_engine_pagerank 
+                DROP CONSTRAINT IF EXISTS search_engine_pagerank_article_id_key
+            """)
+            logger.info("Dropped article_id unique constraint")
+            
+            # Get other index names from pg_indexes
+            cursor.execute("""
+                SELECT indexname FROM pg_indexes 
+                WHERE tablename = 'search_engine_pagerank'
+                AND indexname != 'search_engine_pagerank_pkey'
+                AND indexname != 'search_engine_pagerank_article_id_key'
+            """)
+            indexes = [row[0] for row in cursor.fetchall()]
+            
+            for index_name in indexes:
+                cursor.execute(f"DROP INDEX IF EXISTS {index_name}")
+                logger.info(f"Dropped index: {index_name}")
+    
+    def _rebuild_pagerank_indexes(self):
+        """Rebuild PageRank indexes after bulk insert."""
+        with connection.cursor() as cursor:
+            # Rebuild article_id unique constraint (OneToOneField)
+            cursor.execute("""
+                ALTER TABLE search_engine_pagerank 
+                ADD CONSTRAINT search_engine_pagerank_article_id_key 
+                UNIQUE (article_id)
+            """)
+            logger.info("Rebuilt article_id unique constraint")
+            
+            # Rebuild score index
+            cursor.execute("""
+                CREATE INDEX search_engine_pagerank_score_idx 
+                ON search_engine_pagerank (score)
+            """)
+            
+            # Rebuild -score index (for ordering DESC)
+            cursor.execute("""
+                CREATE INDEX search_engi_score_293842_idx 
+                ON search_engine_pagerank (score DESC)
+            """)
+            
+            logger.info("Rebuilt all PageRank indexes")
+
     def _store_pagerank_copy(self, pagerank_scores: Dict[int, float], 
-                           article_ids: List[int], 
-                           iteration_count: int) -> int:
-        """Store PageRank scores using PostgreSQL COPY for high throughput.
+                           iteration_count: int,
+                           batch_size: int = 50000) -> int:
+        """Store PageRank scores using PostgreSQL COPY with batch streaming.
         
         Args:
             pagerank_scores: Dictionary mapping article_id to PageRank score
-            article_ids: List of article IDs that have PageRank scores
             iteration_count: Number of iterations used for computation
+            batch_size: Number of records to process per batch
             
         Returns:
             Number of objects created
@@ -102,25 +151,31 @@ class Command(BaseCommand):
         if not pagerank_scores:
             return 0
         
-        # Prepare data for COPY (memory efficient - no Article objects needed)
-        pagerank_data = []
-        for article_id, score in pagerank_scores.items():
-            if article_id in article_ids:
-                pagerank_data.append((article_id, float(score), iteration_count))
+        # Drop indexes before bulk insert for faster writes
+        self._drop_pagerank_indexes()
         
-        if not pagerank_data:
-            return 0
+        total = len(pagerank_scores)
+        created = 0
         
-        # Use COPY for bulk insert
-        with transaction.atomic():
-            with connection.cursor() as cursor:
-                with cursor.copy(
-                    "COPY search_engine_pagerank (article_id, score, iteration_count, last_computed) FROM STDIN"
-                ) as copy:
-                    for article_id, score, iteration_count in pagerank_data:
-                        copy.write_row((article_id, score, iteration_count, "NOW()"))
+        # Stream in batches
+        items = list(pagerank_scores.items())
+        for i in range(0, total, batch_size):
+            batch = items[i:i + batch_size]
+            
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    with cursor.copy(
+                        "COPY search_engine_pagerank (article_id, score, iteration_count, last_computed) FROM STDIN"
+                    ) as copy:
+                        for article_id, score in batch:
+                            copy.write_row((article_id, float(score), iteration_count, datetime.now()))
+            
+            created += len(batch)
+            
+        # Rebuild indexes after bulk insert
+        self._rebuild_pagerank_indexes()
         
-        return len(pagerank_data)
+        return created
 
 
     def handle(self, *args, **options):
@@ -205,16 +260,13 @@ class Command(BaseCommand):
         logger.info("Starting storage phase")
         storage_start = time.perf_counter()
         
-        # Get article IDs for PageRank scores (memory efficient)
-        article_ids = list(pagerank_scores.keys())
-        
-        # Use COPY for high-throughput storage (no need to load full Article objects)
+        # Use COPY for high-throughput storage with batch streaming
         self.stdout.write(f"Storing {len(pagerank_scores)} PageRank scores using PostgreSQL COPY...")
         with tqdm(total=len(pagerank_scores), desc="Storing PageRank scores") as pbar:
             created_count = self._store_pagerank_copy(
                 pagerank_scores=pagerank_scores,
-                article_ids=article_ids,
-                iteration_count=iterations
+                iteration_count=iterations,
+                batch_size=batch_size
             )
             pbar.update(created_count)
         
