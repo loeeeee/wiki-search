@@ -78,7 +78,7 @@ python wiki_search/manage.py load_wiki_dump --workers 8 --db-workers 8  # 8-core
 
 ### Separate Link Resolution
 
-Link resolution can now be run independently using the `resolve_links` command:
+Link resolution can now be run independently using the `resolve_links` command with **merged optimization**:
 
 ```bash
 # Run link resolution separately (useful for re-processing links)
@@ -87,6 +87,12 @@ python wiki_search/manage.py resolve_links --batch-size 5000 --db-workers 96
 # Run with custom settings
 python wiki_search/manage.py resolve_links --batch-size 10000 --db-workers 48
 ```
+
+**Performance Optimization**: The link resolution now uses a merged approach that resolves both `from_article` and `to_article` foreign keys in a single database pass, providing:
+- 50% reduction in database queries
+- Single progress bar for the entire operation
+- Better query optimization by the database engine
+- Reduced I/O overhead
 
 This is useful when:
 - Re-running link resolution without reloading articles
