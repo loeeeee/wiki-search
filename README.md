@@ -397,6 +397,7 @@ The project includes a Django web application for searching and viewing Wikipedi
 - **Article Detail Page**: Full article content with navigation back to search
 - **Status Page**: Comprehensive database statistics and system information at `/status/`
 - **Hybrid Search**: Combines TF-IDF relevance scoring with PageRank authority
+- **Query Tokenization Display**: Shows users how their search queries are tokenized by the search engine
 - **Responsive Design**: Mobile-friendly interface with modern styling
 - **Fast Performance**: Optimized database queries and efficient search algorithms
 
@@ -406,6 +407,7 @@ The project includes a Django web application for searching and viewing Wikipedi
 - **Fallback Search**: Title-based search when advanced indexing unavailable
 - **Snippet Display**: Shows relevant content previews in search results
 - **Link Navigation**: Internal Wikipedia links converted to app navigation
+- **Query Transparency**: Visual display of how search queries are tokenized using the configured tokenizer
 
 ### Database Status Page
 

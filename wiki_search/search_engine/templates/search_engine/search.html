@@ -10,6 +10,17 @@
         <h1>Search Results for "{{ query }}"</h1>
         <p>{{ results|length }} result{{ results|length|pluralize }} found</p>
         
+        {% if tokens %}
+        <div class="tokenization-display">
+            <span class="tokenization-label">Query tokenized as:</span>
+            <div class="tokens-container">
+                {% for token in tokens %}
+                <span class="token-badge">{{ token }}</span>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        
         <ul class="results-list">
             {% for result in results %}
             <li class="result-item">
@@ -27,6 +38,17 @@
             <h2>No results found</h2>
             <p>Try different keywords or check your spelling.</p>
         </div>
+        
+        {% if tokens %}
+        <div class="tokenization-display">
+            <span class="tokenization-label">Query tokenized as:</span>
+            <div class="tokens-container">
+                {% for token in tokens %}
+                <span class="token-badge">{{ token }}</span>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
     {% endif %}
 {% else %}
     <div class="empty-state">

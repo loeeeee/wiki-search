@@ -10,14 +10,19 @@ from django.db import connection, models
 
 from .models import Article, Redirect, Vocabulary, TFIDFIndex, InvertedIndex, PageRank, InternalLink
 from .search import search_hybrid
+from .tokenizer import tokenize
 
 
 def search_view(request):
     """Handle search queries and display results."""
     query = request.GET.get('q', '').strip()
     results = []
+    tokens = []
     
     if query:
+        # Tokenize query for display
+        tokens = tokenize(query)
+        
         # Use hybrid search with TF-IDF + PageRank, fallback to title search
         try:
             search_results = search_hybrid(query, limit=20)
@@ -43,7 +48,8 @@ def search_view(request):
     context = {
         'query': query,
         'results': results,
-        'has_results': len(results) > 0
+        'has_results': len(results) > 0,
+        'tokens': tokens,  # Add tokens to context
     }
     return render(request, 'search_engine/search.html', context)
 
