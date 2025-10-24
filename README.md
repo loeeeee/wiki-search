@@ -385,7 +385,7 @@ Generate a question-answering dataset for LLM training from HotpotQA data with s
 
 ### Generate QA Dataset
 
-Create a QA dataset with multiple context sizes (8k, 32k, 128k tokens):
+Create a QA dataset with multiple context sizes (8k, 32k, 128k tokens). Uses ProcessPoolExecutor for optimal CPU utilization:
 
 ```bash
 # Test on toy dataset first

@@ -8,7 +8,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 from dataclasses import dataclass, asdict
 
@@ -76,8 +76,10 @@ def process_qa_entry_worker(entry_data: Dict) -> _QAEntry | Dict:
             calculate_context_size
         )
         
-        # Ensure database connection is established in worker thread
-        connection.ensure_connection()
+        # Close any inherited database connections (required for multiprocessing)
+        from django.db import connections
+        for conn in connections.all():
+            conn.close()
         
         # Extract basic fields
         qa_id = entry_data.get('_id', '')
@@ -249,7 +251,7 @@ class Command(BaseCommand):
             '--workers',
             type=int,
             default=cpu_count(),
-            help=f'Number of worker threads (default: {cpu_count()})'
+            help=f'Number of worker processes (default: {cpu_count()})'
         )
         parser.add_argument(
             '--debug',
@@ -309,7 +311,7 @@ class Command(BaseCommand):
 
         self.stdout.write(f"Processing {len(qa_data)} QA entries with {workers} workers...")
 
-        # Process entries with multiprocessing
+        # Process entries with process pool
         results = self.process_qa_entries_parallel(qa_data, context_sizes, workers)
 
         # Generate output files
@@ -318,7 +320,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS("QA dataset generation completed!"))
 
     def process_qa_entries_parallel(self, qa_data: List[Dict], context_sizes: List[int], workers: int) -> Dict[int, List[Dict]]:
-        """Process QA entries in parallel using multiprocessing."""
+        """Process QA entries in parallel using process pool."""
         results = {size: [] for size in context_sizes}
         
         stats = {
@@ -330,7 +332,7 @@ class Command(BaseCommand):
         }
 
         # Process entries in parallel
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
             # Submit all tasks
             future_to_entry = {
                 executor.submit(process_qa_entry_worker, entry): entry 
