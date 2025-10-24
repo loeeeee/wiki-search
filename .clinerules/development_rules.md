@@ -48,4 +48,6 @@ When writing documentation in docs-vibe/, always document the user's intent in i
 
 Always create documentation in docs-vibe/ before start writing any code.
 
+Always update the newly created documentation at the end of the task to reflect the latest status of the code.
+
 Always update README.md after each task.
