@@ -88,6 +88,9 @@ python wiki_search/manage.py resolve_links --batch-size 5000 --db-workers 96
 
 # Run with custom settings
 python wiki_search/manage.py resolve_links --batch-size 10000 --db-workers 48
+
+# Rebuild all link resolutions from scratch
+python wiki_search/manage.py resolve_links --rebuild --batch-size 5000 --db-workers 96
 ```
 
 **Performance Optimization**: The link resolution now uses a merged approach that resolves both `from_article` and `to_article` foreign keys in a single database pass, providing:
@@ -96,10 +99,16 @@ python wiki_search/manage.py resolve_links --batch-size 10000 --db-workers 48
 - Better query optimization by the database engine
 - Reduced I/O overhead
 
+**Rebuild Option**: The `--rebuild` flag clears all existing link resolutions and rebuilds them from scratch:
+- Clears `from_article` and `to_article` foreign keys for all links in batched manner
+- Re-resolves all links using the existing optimization
+- Useful for fixing corrupted link data or after schema changes
+
 This is useful when:
 - Re-running link resolution without reloading articles
 - Debugging link resolution issues
 - Optimizing link resolution performance independently
+- Fixing corrupted link relationships with `--rebuild`
 
 ### Options for load_wiki_dump
 

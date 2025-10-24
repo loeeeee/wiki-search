@@ -72,9 +72,9 @@
 
 ### Performance Considerations
 
-- **Multiprocessing**: Parallel processing with `ProcessPoolExecutor`; defaults to CPU count
+- **Threading**: Parallel processing with `ThreadPoolExecutor`; defaults to CPU count
 - **Workers Flag**: Control concurrency with `--workers N`
-- **Throughput**: ~5–6s/entry with 8 workers (vs ~13–15s sequential)
+- **Database Connections**: Uses threads to avoid Django database connection issues across processes
 - **Progress Tracking**: `tqdm` progress bar over completed futures
 - **Memory Management**: Streams entries; workers hold only per-entry state
 - **Logging**: Comprehensive logging for debugging and monitoring
@@ -95,14 +95,52 @@ python manage.py generate_qa_dataset \
   --output-dir data/processed \
   --context-sizes 8000 32000 128000 \
   --workers 8 \
-  --verbose
+  --verbose \
+  --debug
 ```
 
 Flags:
 - `--input PATH`: HotpotQA JSON input
 - `--output-dir PATH`: Output directory
 - `--context-sizes N...`: Token caps (e.g., 8000 32000 128000)
-- `--workers N`: Number of worker processes (default: CPU count)
+- `--workers N`: Number of worker threads (default: CPU count)
 - `--limit N`: Optional cap on processed entries (smoke tests)
+- `--debug`: Enable debug logging for troubleshooting
 
 This approach ensures high-quality QA dataset generation with proper token counting, relevant distractor selection, and multiple context size variants for different LLM training scenarios.
+
+## Troubleshooting
+
+### Empty Distractor Documents
+
+If the generated dataset has empty `distractor_docs` arrays:
+
+1. **Check TF-IDF Index**: Ensure the index is built before running:
+   ```bash
+   python manage.py build_tfidf_index --rebuild
+   ```
+
+2. **Enable Debug Logging**: Use `--debug` flag to see detailed search operations:
+   ```bash
+   python manage.py generate_qa_dataset --debug --limit 10
+   ```
+
+3. **Verify Database**: Check that articles exist in the database:
+   ```bash
+   python manage.py shell
+   >>> from search_engine.models import Article
+   >>> Article.objects.count()
+   ```
+
+### Common Issues
+
+- **"TF-IDF index is empty"**: Run `build_tfidf_index` command first
+- **"No search results"**: Check if article titles in HotpotQA match database titles
+- **Database connection errors**: The command now uses ThreadPoolExecutor to avoid connection issues
+- **Memory issues**: Reduce `--workers` count for large datasets
+
+### Performance Optimization
+
+- Use `--workers 4` for optimal performance on most systems
+- Monitor memory usage with large datasets
+- Consider processing in smaller batches with `--limit` for testing

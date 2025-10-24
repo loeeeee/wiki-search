@@ -8,14 +8,14 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Set
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from tqdm import tqdm
 
-from search_engine.models import Article
+from search_engine.models import Article, TFIDFIndex, InvertedIndex
 from search_engine.search import search_by_tfidf_optimized
 from search_engine.qa_helpers import (
     count_article_tokens, 
@@ -45,7 +45,7 @@ def process_qa_entry_worker(entry_data: Dict) -> Dict:
             calculate_context_size
         )
         
-        # Ensure database connection is established in worker process
+        # Ensure database connection is established in worker thread
         connection.ensure_connection()
         
         # Extract basic fields
@@ -99,6 +99,11 @@ def process_qa_entry_worker(entry_data: Dict) -> Dict:
                     # Search for similar articles
                     search_results = search_by_tfidf_optimized(query, limit=20)
                     
+                    if not search_results:
+                        logger.debug(f"No search results for query '{query}'")
+                    else:
+                        logger.debug(f"Found {len(search_results)} results for query '{query}'")
+                    
                     for article, score in search_results:
                         # Skip if it's already a supporting doc
                         if article.title in supporting_titles:
@@ -109,6 +114,7 @@ def process_qa_entry_worker(entry_data: Dict) -> Dict:
                             continue
                         
                         distractor_docs.append(format_article_for_qa(article))
+                        logger.debug(f"Added distractor: {article.title} (score: {score:.4f})")
                         
                         # Check if we've reached a reasonable context limit
                         current_context_size = calculate_context_size(supporting_docs, distractor_docs)
@@ -121,7 +127,7 @@ def process_qa_entry_worker(entry_data: Dict) -> Dict:
                         break
                         
                 except Exception as e:
-                    logger.warning(f"Error searching for distractors with query '{query}': {e}")
+                    logger.error(f"Error searching for distractors with query '{query}': {e}", exc_info=True)
 
         # Create QA entry
         qa_entry = {
@@ -183,12 +189,17 @@ class Command(BaseCommand):
             '--workers',
             type=int,
             default=cpu_count(),
-            help=f'Number of worker processes (default: {cpu_count()})'
+            help=f'Number of worker threads (default: {cpu_count()})'
+        )
+        parser.add_argument(
+            '--debug',
+            action='store_true',
+            help='Enable debug logging for troubleshooting'
         )
 
     def handle(self, *args, **options):
         # Configure logging
-        log_level = logging.DEBUG if options['verbose'] else logging.INFO
+        log_level = logging.DEBUG if (options['verbose'] or options['debug']) else logging.INFO
         logging.basicConfig(
             level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -207,6 +218,18 @@ class Command(BaseCommand):
         # Validate input file
         if not input_path.exists():
             raise CommandError(f"Input file not found: {input_path}")
+
+        # Validate TF-IDF index exists
+        tfidf_count = TFIDFIndex.objects.count()
+        inverted_count = InvertedIndex.objects.count()
+        
+        if tfidf_count == 0:
+            raise CommandError("TF-IDF index is empty. Please run 'python manage.py build_tfidf_index' first.")
+        
+        if inverted_count == 0:
+            raise CommandError("Inverted index is empty. Please run 'python manage.py build_tfidf_index' first.")
+        
+        self.stdout.write(f"TF-IDF index validation: {tfidf_count} articles indexed, {inverted_count} inverted index entries")
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -247,7 +270,7 @@ class Command(BaseCommand):
         }
 
         # Process entries in parallel
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             # Submit all tasks
             future_to_entry = {
                 executor.submit(process_qa_entry_worker, entry): entry 
