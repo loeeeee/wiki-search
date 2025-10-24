@@ -268,7 +268,7 @@ python wiki_search/manage.py build_tfidf_index --workers 8 --db-workers 48 --pro
 **Token Counting Integration:**
 - Automatically computes token counts for each paragraph
 - Token counts stored in `paragraph_token_counts` field
-- Uses same tokenizer as search engine (configurable via `TOKENIZER_TYPE` setting)
+- Uses NLTK tokenizer for TF-IDF indexing and search functionality
 - No additional processing time - computed during existing tokenization pass
 
 ### Build PageRank
@@ -356,7 +356,7 @@ python wiki_search/manage.py generate_qa_dataset \
 1. **Supporting Documents**: Extract articles from database using exact title matching from `supporting_facts`
 2. **Distractor Documents**: Use hybrid search (TF-IDF + PageRank) with supporting fact titles as queries, excluding supporting docs
 3. **Context Filtering**: Skip entries where supporting docs alone exceed context limits
-4. **Token Counting**: Use GPT tokenizer (tiktoken cl100k_base) for consistent token counting
+4. **Token Counting**: Use GPT tokenizer (tiktoken cl100k_base) for LLM-compatible token counting
 5. **Output Generation**: Create separate files for each context size with appropriate filtering
 
 **Performance Characteristics:**
@@ -407,7 +407,7 @@ The project includes a Django web application for searching and viewing Wikipedi
 - **Fallback Search**: Title-based search when advanced indexing unavailable
 - **Snippet Display**: Shows relevant content previews in search results
 - **Link Navigation**: Internal Wikipedia links converted to app navigation
-- **Query Transparency**: Visual display of how search queries are tokenized using the configured tokenizer
+- **Query Transparency**: Visual display of how search queries are tokenized using NLTK tokenizer
 
 ### Database Status Page
 
@@ -436,58 +436,51 @@ Access comprehensive database statistics and system information at `http://local
 
 ### Tokenizer Configuration
 
-The search engine supports three different tokenization strategies, configurable via Django settings:
+The system uses different tokenization strategies based on use case:
 
-#### Available Tokenizers
+#### TF-IDF and Search (NLTK Tokenizer)
+- **Purpose**: TF-IDF indexing and web app search functionality
+- **Tokenizer**: NLTK word_tokenize with stopword filtering
+- **Benefits**: Better linguistic tokenization for search relevance
+- **Performance**: ~20,000 tokens/second
+- **Usage**: Automatic - no configuration needed
 
-1. **GPT Tokenizer (Default)**
-   - Uses tiktoken with cl100k_base encoding (GPT-4 compatible)
-   - Subword tokenization, handles unknown words well
-   - Best for compatibility with transformer models
-   - Performance: ~50,000 tokens/second
-
-2. **NLTK Tokenizer**
-   - Uses NLTK's word_tokenize with stopword filtering
-   - Linguistically-aware tokenization
-   - Good for natural language processing tasks
-   - Performance: ~20,000 tokens/second
-
-3. **Naive Tokenizer**
-   - Simple regex-based tokenization
-   - Fastest performance, minimal dependencies
-   - Good for simple word matching
-   - Performance: ~100,000 tokens/second
+#### QA Dataset Generation (GPT Tokenizer)
+- **Purpose**: Token counting for LLM context size calculations
+- **Tokenizer**: tiktoken cl100k_base (GPT-4 compatible)
+- **Benefits**: Accurate token counts for LLM compatibility
+- **Performance**: ~50,000 tokens/second
+- **Usage**: Automatic - no configuration needed
 
 #### Configuration
 
-Set the tokenizer in `wiki_search/settings.py`:
+The tokenizer selection is now automatic based on use case:
 
 ```python
-# Tokenizer configuration
-TOKENIZER_TYPE = 'gpt'  # Options: 'gpt', 'nltk', 'naive'
+# settings.py - kept for backward compatibility
+TOKENIZER_TYPE = 'nltk'  # Not actively used, kept for compatibility
 ```
 
-#### Changing Tokenizers
+#### Rebuilding Indexes
 
-**Important**: When changing the tokenizer, you must rebuild all search indexes:
+**Important**: After this refactor, rebuild TF-IDF indexes to use NLTK tokenization:
 
 ```bash
 # Clear existing indexes
 python manage.py clean_db --yes
 
-# Rebuild with new tokenizer
+# Rebuild with NLTK tokenizer
 python manage.py build_tfidf_index --rebuild
 ```
 
 #### Performance Characteristics
 
-| Tokenizer | Speed | Memory | Quality | Use Case |
-|-----------|-------|--------|---------|----------|
-| GPT | Medium | Medium | High | Transformer compatibility |
-| NLTK | Slow | High | High | Linguistic accuracy |
-| Naive | Fast | Low | Medium | Simple matching |
+| Use Case | Tokenizer | Speed | Memory | Quality | Purpose |
+|----------|-----------|-------|--------|---------|---------|
+| TF-IDF/Search | NLTK | ~20k/sec | High | High | Linguistic accuracy |
+| QA Generation | GPT | ~50k/sec | Medium | High | LLM compatibility |
 
-For detailed information, see [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md).
+For detailed information, see [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/0037-nltk-tfidf-refactor.md).
 
 ## Performance Tuning
 
@@ -535,4 +528,5 @@ For detailed implementation information, see the documentation in `docs-vibe/`:
 - [docs-vibe/0029-multiprocessing-pagerank-feasibility.md](docs-vibe/0029-multiprocessing-pagerank-feasibility.md) - Multiprocessing PageRank analysis
 - [docs-vibe/0031-qa-dataset-generation.md](docs-vibe/0031-qa-dataset-generation.md) - QA dataset generation
 - [docs-vibe/0033-qa-dataset-hybrid-search.md](docs-vibe/0033-qa-dataset-hybrid-search.md) - QA dataset hybrid search
-- [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md) - Tokenizer configuration
+- [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md) - Original tokenizer configuration
+- [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/0037-nltk-tfidf-refactor.md) - NLTK TF-IDF refactor

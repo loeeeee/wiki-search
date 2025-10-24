@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Dict, List
 
 from .models import Article
-from .tokenizer import tokenize
+from .tokenizer import tokenize_gpt
 
 
 def count_article_tokens(article: Article) -> int:
@@ -20,11 +20,11 @@ def count_article_tokens(article: Article) -> int:
         Total number of tokens in the article
     """
     # Count tokens in title
-    title_tokens = len(tokenize(article.title))
+    title_tokens = len(tokenize_gpt(article.title))
     
     # Count tokens in all paragraphs
     paragraph_tokens = sum(
-        len(tokenize(paragraph)) 
+        len(tokenize_gpt(paragraph)) 
         for paragraph in article.plain_text_paragraphs
     )
     
@@ -64,14 +64,14 @@ def calculate_context_size(supporting_docs: List[Dict[str, str]],
     
     # Count supporting docs tokens
     for doc in supporting_docs:
-        title_tokens = len(tokenize(doc['title']))
-        text_tokens = len(tokenize(doc['text']))
+        title_tokens = len(tokenize_gpt(doc['title']))
+        text_tokens = len(tokenize_gpt(doc['text']))
         total_tokens += title_tokens + text_tokens
     
     # Count distractor docs tokens
     for doc in distractor_docs:
-        title_tokens = len(tokenize(doc['title']))
-        text_tokens = len(tokenize(doc['text']))
+        title_tokens = len(tokenize_gpt(doc['title']))
+        text_tokens = len(tokenize_gpt(doc['text']))
         total_tokens += title_tokens + text_tokens
     
     return total_tokens

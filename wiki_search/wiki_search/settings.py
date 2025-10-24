@@ -133,5 +133,8 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Tokenizer configuration
-# Options: 'gpt' (default), 'nltk', 'naive'
-TOKENIZER_TYPE = 'gpt'
+# Note: TF-IDF and search now use NLTK tokenizer directly via tokenize() function
+# QA dataset generation uses GPT tokenizer via tokenize_gpt() function
+# This setting is kept for backward compatibility but not actively used
+# Options: 'gpt', 'nltk', 'naive'
+TOKENIZER_TYPE = 'nltk'

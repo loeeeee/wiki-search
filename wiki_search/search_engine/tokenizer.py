@@ -136,7 +136,7 @@ def get_tokenizer() -> Tokenizer:
 _tokenizer_instance: Tokenizer | None = None
 
 
-def tokenize(text: str | None) -> List[str]:
+def tokenize_configurable(text: str | None) -> List[str]:
     """Convenience function that uses the configured tokenizer.
     
     This maintains backward compatibility with existing code that imports
@@ -152,3 +152,35 @@ def tokenize(text: str | None) -> List[str]:
     if _tokenizer_instance is None:
         _tokenizer_instance = get_tokenizer()
     return _tokenizer_instance.tokenize(text)
+
+
+def tokenize(text: str | None) -> List[str]:
+    """Tokenize for TF-IDF and search (always uses NLTK).
+    
+    This function is used for TF-IDF indexing and web app search functionality.
+    It always uses NLTK tokenizer for consistent linguistic tokenization.
+    
+    Args:
+        text: Input text to tokenize
+        
+    Returns:
+        List of token strings using NLTK tokenization
+    """
+    nltk_tokenizer = NLTKTokenizer()
+    return nltk_tokenizer.tokenize(text)
+
+
+def tokenize_gpt(text: str | None) -> List[str]:
+    """Tokenize for QA dataset generation (always uses GPT).
+    
+    This function is used for QA dataset generation where GPT token counting
+    is required for LLM compatibility.
+    
+    Args:
+        text: Input text to tokenize
+        
+    Returns:
+        List of token strings using GPT tokenization
+    """
+    gpt_tokenizer = GPTTokenizer()
+    return gpt_tokenizer.tokenize(text)
