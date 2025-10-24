@@ -1,170 +1,121 @@
-# wiki-search
-A wikipedia dump processing pipeline
+# Wiki Search
+
+A Wikipedia dump processing pipeline with interactive search capabilities
 
 **SOFTWARE DEFINED DATA**
 
-## Database Setup
+## Quick Start
 
-This project uses PostgreSQL as the database backend, connecting to a server at `172.22.0.133`.
+Get up and running in 5 minutes:
 
-### Environment Configuration
-
-1. **Copy the environment template:**
+1. **Clone and setup environment:**
    ```bash
-   cp .env.example .env
+   git clone <repository-url>
+   cd wiki-search
+   nix-shell  # Activates NixOS environment
+   uv sync    # Install Python dependencies
    ```
 
-2. **Edit `.env` with your actual PostgreSQL credentials:**
+2. **Configure database:**
    ```bash
-   POSTGRES_DB=wiki_search
-   POSTGRES_USER=your_actual_username
-   POSTGRES_PASSWORD=your_actual_password
+   # Create .env file with PostgreSQL credentials
+   echo "POSTGRES_DB=wiki_search
+   POSTGRES_USER=your_username
+   POSTGRES_PASSWORD=your_password
    POSTGRES_HOST=172.22.0.133
-   POSTGRES_PORT=5432
+   POSTGRES_PORT=5432" > .env
+   
+   # Load environment and migrate
+   set -a; source .env; set +a
+   python wiki_search/manage.py migrate
    ```
 
-3. **Load environment variables before running Django commands:**
+3. **Load sample data and start web app:**
+   ```bash
+   # Load limited dataset for testing
+   python wiki_search/manage.py load_wiki_dump --limit 10000
+   
+   # Start web server
+   cd wiki_search
+   python manage.py runserver 0.0.0.0:8000
+   ```
+
+4. **Access the application:**
+   - Search interface: http://localhost:8000
+   - Database status: http://localhost:8000/status
+   - Admin interface: http://localhost:8000/admin
+
+## Environment Setup
+
+### Prerequisites
+
+- **NixOS** development environment (configured via `shell.nix`)
+- **Python 3.13+** with virtual environment at `.venv/`
+- **PostgreSQL** database server
+- **uv** package manager for Python dependencies
+
+### NixOS Environment
+
+The project uses `shell.nix` to configure the development environment:
+
+```bash
+# Activate NixOS environment
+nix-shell
+
+# This provides:
+# - Python 3.13 with development tools
+# - PostgreSQL client libraries
+# - System libraries (gcc, zlib, bzip2, etc.)
+# - Build tools for Python packages
+```
+
+### Database Configuration
+
+1. **Create environment file:**
+   ```bash
+   cp .env.example .env  # If template exists
+   # Or create manually:
+   echo "POSTGRES_DB=wiki_search
+   POSTGRES_USER=your_username
+   POSTGRES_PASSWORD=your_password
+   POSTGRES_HOST=172.22.0.133
+   POSTGRES_PORT=5432" > .env
+   ```
+
+2. **Load environment variables:**
    ```bash
    set -a; source .env; set +a
    ```
 
-4. **Install dependencies and run migrations:**
+3. **Install dependencies and migrate:**
    ```bash
    uv sync
    python wiki_search/manage.py migrate
    ```
 
-5. **Test the database connection:**
+4. **Test database connection:**
    ```bash
    python wiki_search/manage.py db_summary
    ```
 
-## Count Articles
+## Database Management Commands
 
-Count the number of articles in the Wikipedia dump:
+### Database Summary
 
-```bash
-# Quick estimate (recommended)
-python wiki_search/manage.py count_articles --estimate
-
-# Sample specific number of files
-python wiki_search/manage.py count_articles --sample 100
-
-# Full count (takes hours)
-python wiki_search/manage.py count_articles
-
-# Verbose output
-python wiki_search/manage.py count_articles --estimate --verbose
-```
-
-Based on sampling, the dump contains approximately **5,357,970 articles** across 15,517 files.
-
-## Load data
-
-The loader is now a single-step command that wipes the DB, ingests the pre-decompressed dump, extracts internal links, and resolves link foreign keys.
-
-Requirements:
-- The HotpotQA 2017 dump must be pre-decompressed into `data/processed/enwiki-20171001-pages-meta-current-withlinks-processed/` (decompression is handled by a separate script).
-
-```bash
-# One-step load + link resolution (optimized with 6 database workers)
-python wiki_search/manage.py load_wiki_dump --workers 6 --db-workers 6 --batch-size 5000
-
-# Optional: process only a subset
-python wiki_search/manage.py load_wiki_dump --limit 200000
-
-# Performance tuning for different systems
-python wiki_search/manage.py load_wiki_dump --workers 4 --db-workers 4  # 4-core system
-python wiki_search/manage.py load_wiki_dump --workers 8 --db-workers 8  # 8-core system
-```
-
-### Separate Link Resolution
-
-Link resolution can now be run independently using the `resolve_links` command with **merged optimization**:
-
-```bash
-# Run link resolution separately (useful for re-processing links)
-python wiki_search/manage.py resolve_links --batch-size 5000 --db-workers 96
-
-# Run with custom settings
-python wiki_search/manage.py resolve_links --batch-size 10000 --db-workers 48
-
-# Rebuild all link resolutions from scratch
-python wiki_search/manage.py resolve_links --rebuild --batch-size 5000 --db-workers 96
-```
-
-**Performance Optimization**: The link resolution now uses a merged approach that resolves both `from_article` and `to_article` foreign keys in a single database pass, providing:
-- 50% reduction in database queries
-- Single progress bar for the entire operation
-- Better query optimization by the database engine
-- Reduced I/O overhead
-
-**Rebuild Option**: The `--rebuild` flag clears all existing link resolutions and rebuilds them from scratch:
-- Clears `from_article` and `to_article` foreign keys for all links in batched manner
-- Re-resolves all links using the existing optimization
-- Useful for fixing corrupted link data or after schema changes
-
-This is useful when:
-- Re-running link resolution without reloading articles
-- Debugging link resolution issues
-- Optimizing link resolution performance independently
-- Fixing corrupted link relationships with `--rebuild`
-
-### Options for load_wiki_dump
-
-| Flag | Purpose |
-| ---- | ------- |
-| `--processed-dir PATH` | Root of pre-decompressed shards (default path under data/processed). |
-| `--batch-size N` | DB flush size for articles (default: 5000). |
-| `--workers N` | Number of worker processes (default: CPU-1). |
-| `--db-workers N` | Number of database writer threads (default: 12). |
-| `--producer-threads N` | Number of I/O producer threads per worker for concurrent bz2 decompression (default: 3). |
-| `--limit N` | Stop after processing N articles (smoke tests). |
-
-Notes:
-- This command always drops data at start by calling `clean_db` (non-interactive, optimized for the database backend).
-- It no longer performs decompression, checkpointing, signal handling, or profiling.
-- Internal link resolution (both from_article via page_id and to_article via title) happens automatically at the end.
-- **Performance optimized:** Uses persistent database connections and parallel link resolution for 2-3x faster processing.
-- **I/O-optimized concurrent processing:** Each worker process uses configurable producer threads (I/O-bound bz2 decompression) and 1 consumer thread (CPU-bound parsing) to maximize I/O throughput and minimize overhead.
-
-#### Tuning producer threads
-
-The `--producer-threads` parameter controls how many concurrent I/O operations each worker performs:
-- **Default (3)**: Optimal for most systems with SSD or fast network storage
-- **Increase (4-6)**: For very fast storage (NVMe, RAM disk) or high-latency network storage
-- **Decrease (1-2)**: For slow HDDs or CPU-constrained systems where parsing becomes the bottleneck
-
-#### Performance characteristics
-
-- Worker processes stream articles to the coordinator in batches.
-- The coordinator deduplicates page IDs per batch before inserting, allowing large `--batch-size` values without duplicate penalties.
-- Batch inserts run inside transactions sized by `--batch-size`.
-- Internal links are extracted during loading; foreign keys are resolved after ingestion in the same command.
-- **I/O-optimized concurrent processing:** Each worker uses 3 producer threads (concurrent I/O-bound bz2 decompression) and 1 consumer thread (CPU-bound JSON parsing and text extraction) to maximize I/O throughput.
-- **Resource utilization:** Prioritizes I/O parallelism over CPU parallelism since bz2 decompression is heavily I/O-bound, achieving 3x better I/O utilization.
-
-## Summarize database
+View current database statistics:
 
 ```bash
 python wiki_search/manage.py db_summary
 ```
 
-To monitor loading progress continuously:
-
+Monitor loading progress:
 ```bash
 watch --interval 30 python wiki_search/manage.py db_summary
 ```
 
-## Random Article
+### Database Cleanup
 
-```bash
-python wiki_search/manage.py random_articles --max-paragraphs 5
-```
-
-## Database cleanup
-
-Fastly purge all search_engine tables and reclaim space:
+Fast cleanup of all search_engine tables:
 
 ```bash
 # Default (fast pragmas enabled), non-interactive
@@ -180,15 +131,245 @@ python wiki_search/manage.py clean_db --yes --no-fast-pragmas
 python wiki_search/manage.py clean_db --yes --drop-recreate
 ```
 
-Notes:
-- The command deletes `InternalLink`, `Redirect`, `TFIDFIndex`, `Vocabulary`, then `Article`, then optimizes the database.
-- With SQLite, fast PRAGMAs are applied by default for speed and restored afterward. Use `--no-fast-pragmas` to disable.
-- With PostgreSQL, `VACUUM ANALYZE` is run to optimize the database.
-- `--drop-recreate` is SQLite-only and destructive but typically the fastest option for very large datasets.
+**Options:**
+- `--yes`: Run non-interactively and skip confirmation
+- `--no-progress`: Do not show progress bars or perform COUNT(*) queries
+- `--no-fast-pragmas`: Disable fast SQLite pragmas (safer but slower)
+- `--drop-recreate`: SQLite-only, drop and recreate tables (fastest for large datasets)
+
+### Random Articles
+
+Display random articles for testing:
+
+```bash
+python wiki_search/manage.py random_articles --max-paragraphs 5
+```
+
+**Options:**
+- `--max-paragraphs N`: Maximum paragraphs to print per article (default: 5)
+
+## Data Processing Commands
+
+### Count Articles
+
+Count articles in the Wikipedia dump:
+
+```bash
+# Quick estimate (recommended)
+python wiki_search/manage.py count_articles --estimate
+
+# Sample specific number of files
+python wiki_search/manage.py count_articles --sample 100
+
+# Full count (takes hours)
+python wiki_search/manage.py count_articles
+
+# Verbose output
+python wiki_search/manage.py count_articles --estimate --verbose
+```
+
+**Options:**
+- `--processed-dir PATH`: Path to processed directory (default: data/processed/enwiki-20171001-pages-meta-current-withlinks-processed)
+- `--sample N`: Sample only N files for quick estimate
+- `--estimate`: Use sampling to estimate total (samples 1% of files)
+- `--verbose`: Enable verbose logging
+
+Based on sampling, the dump contains approximately **5,357,970 articles** across 15,517 files.
+
+### Load Wikipedia Dump
+
+Load Wikipedia dump into database with automatic link resolution:
+
+```bash
+# One-step load + link resolution (optimized with 6 database workers)
+python wiki_search/manage.py load_wiki_dump --workers 6 --db-workers 6 --batch-size 5000
+
+# Optional: process only a subset
+python wiki_search/manage.py load_wiki_dump --limit 200000
+
+# Performance tuning for different systems
+python wiki_search/manage.py load_wiki_dump --workers 4 --db-workers 4  # 4-core system
+python wiki_search/manage.py load_wiki_dump --workers 8 --db-workers 8  # 8-core system
+```
+
+**Options:**
+- `--processed-dir PATH`: Root of pre-decompressed shards (default: data/processed/enwiki-20171001-pages-meta-current-withlinks-processed)
+- `--batch-size N`: DB flush size for articles (default: 5000)
+- `--workers N`: Number of worker processes (default: CPU-1)
+- `--db-workers N`: Number of database writer threads (default: 96)
+- `--producer-threads N`: Number of I/O producer threads per worker for concurrent bz2 decompression (default: 2)
+- `--limit N`: Stop after processing N articles (smoke tests)
+- `--profile`: Enable detailed profiling with cProfile
+
+**Performance Notes:**
+- This command always drops data at start by calling `clean_db`
+- Internal link resolution happens automatically at the end
+- Uses persistent database connections and parallel link resolution for 2-3x faster processing
+- I/O-optimized concurrent processing with configurable producer threads
+
+### Resolve Links
+
+Separate link resolution with merged optimization:
+
+```bash
+# Run link resolution separately
+python wiki_search/manage.py resolve_links --batch-size 5000 --db-workers 96
+
+# Run with custom settings
+python wiki_search/manage.py resolve_links --batch-size 10000 --db-workers 48
+
+# Rebuild all link resolutions from scratch
+python wiki_search/manage.py resolve_links --rebuild --batch-size 5000 --db-workers 96
+```
+
+**Options:**
+- `--batch-size N`: Batch size for processing (default: 5000)
+- `--db-workers N`: Number of database worker threads (default: 96)
+- `--rebuild`: Clear existing link resolutions and rebuild from scratch
+
+**Performance Optimization:**
+- Merged approach resolves both `from_article` and `to_article` foreign keys in single database pass
+- 50% reduction in database queries
+- Single progress bar for entire operation
+- Better query optimization by database engine
+
+## Search Index Commands
+
+### Build TF-IDF Index
+
+Build TF-IDF index and inverted index for search functionality:
+
+```bash
+# Build TF-IDF index with token counts (optimized for performance)
+python wiki_search/manage.py build_tfidf_index --limit 100000
+
+# Rebuild existing index
+python wiki_search/manage.py build_tfidf_index --rebuild
+
+# With custom workers and profiling
+python wiki_search/manage.py build_tfidf_index --workers 8 --db-workers 48 --profile --verbose
+```
+
+**Options:**
+- `--rebuild`: Clear existing index before building
+- `--batch-size N`: Articles per worker batch (default: 1000)
+- `--limit N`: Limit number of articles (for testing)
+- `--workers N`: Number of worker processes (default: CPU/2)
+- `--db-workers N`: Number of database writer threads (default: 96)
+- `--verbose`: Enable verbose logging
+- `--profile`: Enable detailed profiling with cProfile
+
+**Performance Characteristics:**
+- **Small datasets (100-1k articles)**: 10-25 articles/second
+- **Medium datasets (1k-10k articles)**: 20-40 articles/second
+- **Large datasets (10k+ articles)**: 30-60 articles/second
+- **Auto-scaling**: Worker count automatically optimized based on dataset size
+
+**Token Counting Integration:**
+- Automatically computes token counts for each paragraph
+- Token counts stored in `paragraph_token_counts` field
+- Uses same tokenizer as search engine (configurable via `TOKENIZER_TYPE` setting)
+- No additional processing time - computed during existing tokenization pass
+
+### Build PageRank
+
+Build PageRank scores for articles using the InternalLink graph:
+
+```bash
+# Standard PageRank build (parallel database operations)
+python wiki_search/manage.py build_pagerank
+
+# With custom parallel workers
+python wiki_search/manage.py build_pagerank --db-read-workers 4 --db-write-workers 4
+
+# With profiling and verbose output
+python wiki_search/manage.py build_pagerank --rebuild --profile --verbose
+
+# Performance monitoring
+python wiki_search/manage.py build_pagerank --profile --verbose 2>&1 | grep "Memory usage"
+```
+
+**Options:**
+- `--damping FLOAT`: PageRank damping factor (default: 0.85)
+- `--max-iterations N`: Maximum number of iterations (default: 100)
+- `--tolerance FLOAT`: Convergence tolerance (default: 1e-6)
+- `--rebuild`: Clear existing PageRank scores before building
+- `--verbose`: Enable verbose logging
+- `--threads N`: Number of threads for parallel database operations (default: 48)
+- `--db-read-workers N`: Number of parallel workers for reading links (default: 48)
+- `--db-write-workers N`: Number of parallel workers for writing scores (default: 48)
+- `--batch-size N`: Batch size for database operations (default: 1000)
+- `--limit N`: Limit number of links to process (for testing)
+- `--profile`: Enable detailed profiling with cProfile
+
+**Performance Characteristics:**
+- **Small datasets (1k articles)**: 1.7-2x speedup over baseline
+- **Medium datasets (10k articles)**: 2-2.5x speedup over baseline
+- **Large datasets (100k+ articles)**: 2.5-3.5x speedup over baseline
+- **Memory usage**: Scales linearly with dataset size
+- **Database load**: Optimized with parallel operations
+
+**Optimization Features:**
+- **Parallel Graph Loading**: ID range-based batching with ThreadPoolExecutor (2-4x speedup)
+- **Parallel Storage**: Multi-threaded PostgreSQL COPY operations (2-3x speedup)
+- **Connection Management**: Each thread gets its own database connection
+- **Index Optimization**: Drop indexes before writes, rebuild after
+- **Auto-scaling**: Smart worker count selection based on dataset size
+
+## QA Dataset Commands
+
+### Generate QA Dataset
+
+Generate question-answering dataset for LLM training from HotpotQA data:
+
+```bash
+# Test on toy dataset first
+python wiki_search/manage.py generate_qa_dataset \
+  --input data/raw/hotpot_dev_fullwiki_v1_toy.json \
+  --output-dir data/processed \
+  --context-sizes 8000 32000 128000 \
+  --verbose
+
+# Process full dataset (when available)
+python wiki_search/manage.py generate_qa_dataset \
+  --input data/raw/hotpot_dev_fullwiki_v1.json \
+  --output-dir data/processed \
+  --context-sizes 8000 32000 128000 \
+  --workers 8 \
+  --limit 1000
+```
+
+**Options:**
+- `--input PATH`: Path to HotpotQA JSON file (default: data/raw/hotpot_dev_fullwiki_v1.json)
+- `--output-dir PATH`: Directory for output files (default: data/processed)
+- `--context-sizes N1 N2 N3`: Context size limits in tokens (default: 8000 32000 128000)
+- `--limit N`: Limit number of entries to process (for testing)
+- `--workers N`: Number of worker processes (default: CPU count)
+- `--verbose`: Enable verbose logging
+
+**Output Files:**
+- `qa_dataset_8000.json` - entries with context_size ≤ 8k tokens
+- `qa_dataset_32000.json` - entries with context_size ≤ 32k tokens
+- `qa_dataset_128000.json` - entries with context_size ≤ 128k tokens
+
+**Processing Logic:**
+1. **Supporting Documents**: Extract articles from database using exact title matching from `supporting_facts`
+2. **Distractor Documents**: Use hybrid search (TF-IDF + PageRank) with supporting fact titles as queries, excluding supporting docs
+3. **Context Filtering**: Skip entries where supporting docs alone exceed context limits
+4. **Token Counting**: Use GPT tokenizer (tiktoken cl100k_base) for consistent token counting
+5. **Output Generation**: Create separate files for each context size with appropriate filtering
+
+**Performance Characteristics:**
+- **Multiprocessing**: Uses all CPU cores by default for parallel processing
+- **Token Counting**: ~50,000 tokens/second using GPT tokenizer
+- **Search Performance**: Uses hybrid search (TF-IDF + PageRank) with inverted index for better quality distractor documents
+- **Memory Efficient**: Streams processing to handle large datasets
+- **Progress Tracking**: Real-time progress bars and comprehensive logging
+- **Speed**: ~5-6 seconds per entry with 8 workers (vs ~13-15 seconds sequential)
 
 ## Web Application
 
-The project includes a two-page Django web application for searching and viewing Wikipedia articles.
+The project includes a Django web application for searching and viewing Wikipedia articles.
 
 ### Starting the Web App
 
@@ -205,9 +386,10 @@ The project includes a two-page Django web application for searching and viewing
    ```
 
 3. **Access the web app:**
-   - Open your browser and navigate to `http://localhost:8000`
-   - Use the search bar to find Wikipedia articles
-   - Click on search results to read full articles
+   - Search interface: http://localhost:8000
+   - Article detail: http://localhost:8000/article/<page_id>/
+   - Database status: http://localhost:8000/status/
+   - Admin interface: http://localhost:8000/admin/
 
 ### Web App Features
 
@@ -224,80 +406,6 @@ The project includes a two-page Django web application for searching and viewing
 - **Fallback Search**: Title-based search when advanced indexing unavailable
 - **Snippet Display**: Shows relevant content previews in search results
 - **Link Navigation**: Internal Wikipedia links converted to app navigation
-
-### Building Search Indexes
-
-For optimal search performance, build the TF-IDF and PageRank indexes:
-
-```bash
-# Build TF-IDF index with token counts (optimized for performance)
-python manage.py build_tfidf_index --limit 100000
-
-# Build PageRank scores (optimized for performance)
-python manage.py build_pagerank --rebuild --profile --verbose
-```
-
-**Performance Characteristics:**
-- **Small datasets (100-1k articles)**: 10-25 articles/second
-- **Medium datasets (1k-10k articles)**: 20-40 articles/second  
-- **Large datasets (10k+ articles)**: 30-60 articles/second
-- **Auto-scaling**: Worker count automatically optimized based on dataset size
-- **Profiling support**: Use `--profile --verbose` for performance analysis
-
-**Token Counting Integration:**
-- The TF-IDF build process now automatically computes token counts for each paragraph
-- Token counts are stored in the `paragraph_token_counts` field as a parallel array to `plain_text_paragraphs`
-- Uses the same tokenizer as the search engine (configurable via `TOKENIZER_TYPE` setting)
-- No additional processing time - computed during existing tokenization pass
-- Enables paragraph-level analysis and search result ranking by content length
-
-The web app will work with basic title search even without these indexes, but hybrid search provides much better results.
-
-### PageRank Build Optimization
-
-The PageRank build process has been optimized for high performance with parallel database operations:
-
-```bash
-# Standard PageRank build (parallel database operations)
-python manage.py build_pagerank
-
-# With custom parallel workers
-python manage.py build_pagerank --db-read-workers 4 --db-write-workers 4
-
-# With profiling and verbose output
-python manage.py build_pagerank --rebuild --profile --verbose
-
-# Performance monitoring
-python manage.py build_pagerank --profile --verbose 2>&1 | grep "Memory usage"
-```
-
-**New Parallel Optimization Features:**
-- **Parallel Graph Loading**: ID range-based batching with ThreadPoolExecutor (2-4x speedup)
-- **Parallel Storage**: Multi-threaded PostgreSQL COPY operations (2-3x speedup)
-- **Connection Management**: Each thread gets its own database connection
-- **Index Optimization**: Drop indexes before writes, rebuild after
-- **Auto-scaling**: Smart worker count selection based on dataset size
-
-**Legacy Optimization Features:**
-- **PostgreSQL COPY**: 3-5x faster storage than ORM bulk_create
-- **Raw SQL DELETE**: 10x+ faster deletion than ORM batching
-- **Memory efficient**: 50-70% memory reduction by avoiding Article object loading
-- **Comprehensive profiling**: Phase timing, memory tracking, and cProfile integration
-
-**Performance Characteristics:**
-- **Small datasets (1k articles)**: 1.7-2x speedup over baseline
-- **Medium datasets (10k articles)**: 2-2.5x speedup over baseline
-- **Large datasets (100k+ articles)**: 2.5-3.5x speedup over baseline
-- **Memory usage**: Scales linearly with dataset size
-- **Database load**: Optimized with parallel operations
-
-**CLI Options:**
-- `--db-read-workers N`: Number of parallel workers for reading links (default: 4)
-- `--db-write-workers N`: Number of parallel workers for writing scores (default: 4)
-- `--batch-size N`: Batch size for database operations (default: 1000)
-- `--limit N`: Limit number of links to process (for testing)
-
-For detailed optimization information, see [docs-vibe/0027-pagerank-optimization.md](docs-vibe/0027-pagerank-optimization.md) and [docs-vibe/0029-multiprocessing-pagerank-feasibility.md](docs-vibe/0029-multiprocessing-pagerank-feasibility.md).
 
 ### Database Status Page
 
@@ -322,13 +430,13 @@ Access comprehensive database statistics and system information at `http://local
 - Last updated timestamp
 - Auto-refresh every 30 seconds
 
-The status page provides real-time monitoring of your Wikipedia search engine's health and performance.
+## Configuration
 
-## Tokenizer Configuration
+### Tokenizer Configuration
 
 The search engine supports three different tokenization strategies, configurable via Django settings:
 
-### Available Tokenizers
+#### Available Tokenizers
 
 1. **GPT Tokenizer (Default)**
    - Uses tiktoken with cl100k_base encoding (GPT-4 compatible)
@@ -348,7 +456,7 @@ The search engine supports three different tokenization strategies, configurable
    - Good for simple word matching
    - Performance: ~100,000 tokens/second
 
-### Configuration
+#### Configuration
 
 Set the tokenizer in `wiki_search/settings.py`:
 
@@ -357,7 +465,7 @@ Set the tokenizer in `wiki_search/settings.py`:
 TOKENIZER_TYPE = 'gpt'  # Options: 'gpt', 'nltk', 'naive'
 ```
 
-### Changing Tokenizers
+#### Changing Tokenizers
 
 **Important**: When changing the tokenizer, you must rebuild all search indexes:
 
@@ -369,7 +477,7 @@ python manage.py clean_db --yes
 python manage.py build_tfidf_index --rebuild
 ```
 
-### Performance Characteristics
+#### Performance Characteristics
 
 | Tokenizer | Speed | Memory | Quality | Use Case |
 |-----------|-------|--------|---------|----------|
@@ -379,78 +487,50 @@ python manage.py build_tfidf_index --rebuild
 
 For detailed information, see [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md).
 
-## QA Dataset Generation
+## Performance Tuning
 
-Generate a question-answering dataset for LLM training from HotpotQA data with supporting and distractor documents.
+### Load Performance
 
-### Generate QA Dataset
+**Producer Threads Tuning:**
+- **Default (2)**: Optimal for most systems with SSD or fast network storage
+- **Increase (4-6)**: For very fast storage (NVMe, RAM disk) or high-latency network storage
+- **Decrease (1)**: For slow HDDs or CPU-constrained systems where parsing becomes the bottleneck
 
-Create a QA dataset with multiple context sizes (8k, 32k, 128k tokens). Uses ProcessPoolExecutor for optimal CPU utilization:
+**Worker Configuration:**
+- **4-core system**: `--workers 4 --db-workers 4`
+- **8-core system**: `--workers 8 --db-workers 8`
+- **High-memory system**: `--workers 12 --db-workers 96`
 
-```bash
-# Test on toy dataset first
-python manage.py generate_qa_dataset \
-  --input data/raw/hotpot_dev_fullwiki_v1_toy.json \
-  --output-dir data/processed \
-  --context-sizes 8000 32000 128000 \
-  --verbose
+### Search Index Performance
 
-# Process full dataset (when available)
-python manage.py generate_qa_dataset \
-  --input data/raw/hotpot_dev_fullwiki_v1.json \
-  --output-dir data/processed \
-  --context-sizes 8000 32000 128000 \
-  --workers 8 \
-  --limit 1000
-```
+**TF-IDF Build Performance:**
+- **Small datasets (100-1k articles)**: 10-25 articles/second
+- **Medium datasets (1k-10k articles)**: 20-40 articles/second
+- **Large datasets (10k+ articles)**: 30-60 articles/second
 
-### Output Files
+**PageRank Build Performance:**
+- **Small datasets (1k articles)**: 1.7-2x speedup over baseline
+- **Medium datasets (10k articles)**: 2-2.5x speedup over baseline
+- **Large datasets (100k+ articles)**: 2.5-3.5x speedup over baseline
 
-The command generates three JSON files in `data/processed/`:
-- `qa_dataset_8000.json` - entries with context_size ≤ 8k tokens
-- `qa_dataset_32000.json` - entries with context_size ≤ 32k tokens  
-- `qa_dataset_128000.json` - entries with context_size ≤ 128k tokens
+### QA Dataset Performance
 
-### Output Schema
+**Generation Speed:**
+- **Sequential processing**: ~13-15 seconds per entry
+- **8 workers**: ~5-6 seconds per entry
+- **Token counting**: ~50,000 tokens/second using GPT tokenizer
 
-Each entry follows this schema:
-```json
-{
-  "id": "string",
-  "question": "string", 
-  "gold_answer": "string",
-  "supporting_docs": [{"title": "string", "text": "string"}, ...],
-  "distractor_docs": [{"title": "string", "text": "string"}, ...],
-  "context_size": int
-}
-```
+**Memory Usage:**
+- Scales linearly with dataset size
+- Streams processing to handle large datasets
+- Uses ProcessPoolExecutor for optimal CPU utilization
 
-### Command Options
+## Documentation
 
-| Flag | Purpose |
-|------|---------|
-| `--input PATH` | Path to HotpotQA JSON file (default: data/raw/hotpot_dev_fullwiki_v1.json) |
-| `--output-dir PATH` | Directory for output files (default: data/processed) |
-| `--context-sizes N1 N2 N3` | Context size limits in tokens (default: 8000 32000 128000) |
-| `--limit N` | Limit number of entries to process (for testing) |
-| `--workers N` | Number of worker processes (default: CPU count) |
-| `--verbose` | Enable verbose logging |
+For detailed implementation information, see the documentation in `docs-vibe/`:
 
-### Processing Logic
-
-1. **Supporting Documents**: Extract articles from database using exact title matching from `supporting_facts`
-2. **Distractor Documents**: Use hybrid search (TF-IDF + PageRank) with supporting fact titles as queries, excluding supporting docs
-3. **Context Filtering**: Skip entries where supporting docs alone exceed context limits
-4. **Token Counting**: Use GPT tokenizer (tiktoken cl100k_base) for consistent token counting
-5. **Output Generation**: Create separate files for each context size with appropriate filtering
-
-### Performance Characteristics
-
-- **Multiprocessing**: Uses all CPU cores by default for parallel processing
-- **Token Counting**: ~50,000 tokens/second using GPT tokenizer
-- **Search Performance**: Uses hybrid search (TF-IDF + PageRank) with inverted index for better quality distractor documents
-- **Memory Efficient**: Streams processing to handle large datasets
-- **Progress Tracking**: Real-time progress bars and comprehensive logging
-- **Speed**: ~5-6 seconds per entry with 8 workers (vs ~13-15 seconds sequential)
-
-For detailed information, see [docs-vibe/0031-qa-dataset-generation.md](docs-vibe/0031-qa-dataset-generation.md) and [docs-vibe/0033-qa-dataset-hybrid-search.md](docs-vibe/0033-qa-dataset-hybrid-search.md).
+- [docs-vibe/0027-pagerank-optimization.md](docs-vibe/0027-pagerank-optimization.md) - PageRank optimization details
+- [docs-vibe/0029-multiprocessing-pagerank-feasibility.md](docs-vibe/0029-multiprocessing-pagerank-feasibility.md) - Multiprocessing PageRank analysis
+- [docs-vibe/0031-qa-dataset-generation.md](docs-vibe/0031-qa-dataset-generation.md) - QA dataset generation
+- [docs-vibe/0033-qa-dataset-hybrid-search.md](docs-vibe/0033-qa-dataset-hybrid-search.md) - QA dataset hybrid search
+- [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md) - Tokenizer configuration
