@@ -7,16 +7,17 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
+from dataclasses import dataclass
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from tqdm import tqdm
 
 from search_engine.models import Article, TFIDFIndex, InvertedIndex
-from search_engine.search import search_by_tfidf_optimized
+from search_engine.search import search_hybrid
 from search_engine.qa_helpers import (
     count_article_tokens, 
     format_article_for_qa, 
@@ -26,7 +27,37 @@ from search_engine.qa_helpers import (
 logger = logging.getLogger(__name__)
 
 
-def process_qa_entry_worker(entry_data: Dict) -> Dict:
+@dataclass
+class QAEntry:
+    id: str
+    question: str
+    gold_answer: str
+    supporting_docs: List[Dict]
+    distractor_docs: List[Dict]
+    context_size: int
+
+@dataclass
+class _QAEntry:
+    id: str
+    question: str
+    gold_answer: str
+    supporting_docs: List[Dict]
+    distractor_docs: List[Dict]
+    context_sizes: Dict[int, Tuple[int, int]]
+
+    def get_all_context_sizes(self) -> Dict[int, QAEntry]:
+        return {
+            context_size: QAEntry(
+                id=self.id,
+                question=self.question,
+                gold_answer=self.gold_answer,
+                supporting_docs=self.supporting_docs,
+                distractor_docs=self.distractor_docs[:self.context_sizes[context_size][1]],
+                context_size=self.context_sizes[context_size][0])
+                for context_size in self.context_sizes
+        }
+
+def process_qa_entry_worker(entry_data: Dict) -> _QAEntry:
     """Worker function to process a single QA entry.
     
     This function runs in a separate process and handles:
@@ -38,7 +69,7 @@ def process_qa_entry_worker(entry_data: Dict) -> Dict:
     try:
         from django.db import connection
         from search_engine.models import Article
-        from search_engine.search import search_by_tfidf_optimized
+        from search_engine.search import search_hybrid
         from search_engine.qa_helpers import (
             count_article_tokens, 
             format_article_for_qa, 
@@ -79,55 +110,45 @@ def process_qa_entry_worker(entry_data: Dict) -> Dict:
             count_article_tokens(Article.objects.get(title=doc['title']))
             for doc in supporting_docs
         )
-        
-        if supporting_tokens > 8000:  # Minimum context size
-            return {
-                'status': 'skipped_context_overflow',
-                'id': qa_id,
-                'supporting_tokens': supporting_tokens
-            }
 
         # Get distractor documents
         distractor_docs = []
         supporting_titles = {doc['title'] for doc in supporting_docs}
         
         # Use supporting fact titles as search queries
-        for fact in supporting_facts:
-            if len(fact) >= 1:
-                query = fact[0]
-                try:
-                    # Search for similar articles
-                    search_results = search_by_tfidf_optimized(query, limit=20)
+        search_results = [search_hybrid(fact, limit=20) for fact in supporting_facts]
+        cnt_distractor_tokens: int = 0
+
+        while supporting_tokens + cnt_distractor_tokens <= 128000:
+            for result_index in range(len(search_results)):
+                result: Tuple[Article, float] = search_results[result_index].pop(0)
+                cnt_distractor_tokens += count_article_tokens(result[0])
+
                     
-                    if not search_results:
-                        logger.debug(f"No search results for query '{query}'")
-                    else:
-                        logger.debug(f"Found {len(search_results)} results for query '{query}'")
+        #             for article, score in search_results:
+        #                 # Skip if it's already a supporting doc
+        #                 if article.title in supporting_titles:
+        #                     continue
+                        
+        #                 # Skip if already in distractors
+        #                 if any(doc['title'] == article.title for doc in distractor_docs):
+        #                     continue
+                        
+        #                 distractor_docs.append(format_article_for_qa(article))
+        #                 logger.debug(f"Added distractor: {article.title} (score: {score:.4f})")
+                        
+        #                 # Check if we've reached a reasonable context limit
+        #                 current_context_size = calculate_context_size(supporting_docs, distractor_docs)
+        #                 if current_context_size >= 128000:  # Max context size
+        #                     break
                     
-                    for article, score in search_results:
-                        # Skip if it's already a supporting doc
-                        if article.title in supporting_titles:
-                            continue
+        #             # Check if we should break outer loop
+        #             current_context_size = calculate_context_size(supporting_docs, distractor_docs)
+        #             if current_context_size >= 128000:
+        #                 break
                         
-                        # Skip if already in distractors
-                        if any(doc['title'] == article.title for doc in distractor_docs):
-                            continue
-                        
-                        distractor_docs.append(format_article_for_qa(article))
-                        logger.debug(f"Added distractor: {article.title} (score: {score:.4f})")
-                        
-                        # Check if we've reached a reasonable context limit
-                        current_context_size = calculate_context_size(supporting_docs, distractor_docs)
-                        if current_context_size >= 128000:  # Max context size
-                            break
-                    
-                    # Check if we should break outer loop
-                    current_context_size = calculate_context_size(supporting_docs, distractor_docs)
-                    if current_context_size >= 128000:
-                        break
-                        
-                except Exception as e:
-                    logger.error(f"Error searching for distractors with query '{query}': {e}", exc_info=True)
+        #         except Exception as e:
+        #             logger.error(f"Error searching for distractors with query '{query}': {e}", exc_info=True)
 
         # Create QA entry
         qa_entry = {

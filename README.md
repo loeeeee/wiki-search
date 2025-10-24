@@ -439,7 +439,7 @@ Each entry follows this schema:
 ### Processing Logic
 
 1. **Supporting Documents**: Extract articles from database using exact title matching from `supporting_facts`
-2. **Distractor Documents**: Use TF-IDF search with supporting fact titles as queries, excluding supporting docs
+2. **Distractor Documents**: Use hybrid search (TF-IDF + PageRank) with supporting fact titles as queries, excluding supporting docs
 3. **Context Filtering**: Skip entries where supporting docs alone exceed context limits
 4. **Token Counting**: Use GPT tokenizer (tiktoken cl100k_base) for consistent token counting
 5. **Output Generation**: Create separate files for each context size with appropriate filtering
@@ -448,9 +448,9 @@ Each entry follows this schema:
 
 - **Multiprocessing**: Uses all CPU cores by default for parallel processing
 - **Token Counting**: ~50,000 tokens/second using GPT tokenizer
-- **Search Performance**: Uses optimized TF-IDF search with inverted index
+- **Search Performance**: Uses hybrid search (TF-IDF + PageRank) with inverted index for better quality distractor documents
 - **Memory Efficient**: Streams processing to handle large datasets
 - **Progress Tracking**: Real-time progress bars and comprehensive logging
 - **Speed**: ~5-6 seconds per entry with 8 workers (vs ~13-15 seconds sequential)
 
-For detailed information, see [docs-vibe/0028-qa-dataset-generation.md](docs-vibe/0028-qa-dataset-generation.md).
+For detailed information, see [docs-vibe/0031-qa-dataset-generation.md](docs-vibe/0031-qa-dataset-generation.md) and [docs-vibe/0033-qa-dataset-hybrid-search.md](docs-vibe/0033-qa-dataset-hybrid-search.md).
