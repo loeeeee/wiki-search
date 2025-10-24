@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
@@ -57,7 +57,7 @@ class _QAEntry:
                 for context_size in self.context_sizes
         }
 
-def process_qa_entry_worker(entry_data: Dict) -> _QAEntry:
+def process_qa_entry_worker(entry_data: Dict) -> _QAEntry | Dict:
     """Worker function to process a single QA entry.
     
     This function runs in a separate process and handles:
@@ -111,61 +111,100 @@ def process_qa_entry_worker(entry_data: Dict) -> _QAEntry:
             for doc in supporting_docs
         )
 
-        # Get distractor documents
+        # Get distractor documents using round-robin selection
         distractor_docs = []
         supporting_titles = {doc['title'] for doc in supporting_docs}
         
-        # Use supporting fact titles as search queries
-        search_results = [search_hybrid(fact, limit=20) for fact in supporting_facts]
-        cnt_distractor_tokens: int = 0
-
-        while supporting_tokens + cnt_distractor_tokens <= 128000:
+        # Use supporting fact titles as search queries (extract title from [title, sentence_index] format)
+        search_results = [search_hybrid(fact[0], limit=20) for fact in supporting_facts if len(fact) > 0]
+        
+        # Round-robin through search results to collect distractors up to 128k limit
+        current_distractor_tokens = 0
+        max_context_tokens = 128000
+        search_result_indices = [0] * len(search_results)  # Track current position in each search result
+        
+        while supporting_tokens + current_distractor_tokens < max_context_tokens:
+            # Find next available article from any search result
+            found_article = False
+            
             for result_index in range(len(search_results)):
-                result: Tuple[Article, float] = search_results[result_index].pop(0)
-                cnt_distractor_tokens += count_article_tokens(result[0])
-
+                if search_result_indices[result_index] < len(search_results[result_index]):
+                    article, score = search_results[result_index][search_result_indices[result_index]]
+                    search_result_indices[result_index] += 1
                     
-        #             for article, score in search_results:
-        #                 # Skip if it's already a supporting doc
-        #                 if article.title in supporting_titles:
-        #                     continue
+                    # Skip if it's already a supporting doc
+                    if article.title in supporting_titles:
+                        continue
                         
-        #                 # Skip if already in distractors
-        #                 if any(doc['title'] == article.title for doc in distractor_docs):
-        #                     continue
-                        
-        #                 distractor_docs.append(format_article_for_qa(article))
-        #                 logger.debug(f"Added distractor: {article.title} (score: {score:.4f})")
-                        
-        #                 # Check if we've reached a reasonable context limit
-        #                 current_context_size = calculate_context_size(supporting_docs, distractor_docs)
-        #                 if current_context_size >= 128000:  # Max context size
-        #                     break
+                    # Skip if already in distractors
+                    if any(doc['title'] == article.title for doc in distractor_docs):
+                        continue
                     
-        #             # Check if we should break outer loop
-        #             current_context_size = calculate_context_size(supporting_docs, distractor_docs)
-        #             if current_context_size >= 128000:
-        #                 break
-                        
-        #         except Exception as e:
-        #             logger.error(f"Error searching for distractors with query '{query}': {e}", exc_info=True)
+                    # Check if adding this article would exceed the limit
+                    try:
+                        article_tokens = count_article_tokens(article)
+                    except Exception as e:
+                        logger.error(f"Error counting tokens for article {article.title}: {e}")
+                        continue
+                    
+                    if supporting_tokens + current_distractor_tokens + article_tokens > max_context_tokens:
+                        break
+                    
+                    # Add the distractor
+                    distractor_docs.append(format_article_for_qa(article))
+                    current_distractor_tokens += article_tokens
+                    found_article = True
+                    logger.debug(f"Added distractor: {article.title} (score: {score:.4f}, tokens: {article_tokens})")
+                    break
+            
+            # If no more articles available from any search result, break
+            if not found_article:
+                break
 
-        # Create QA entry
-        qa_entry = {
-            'id': qa_id,
-            'question': question,
-            'gold_answer': answer,
-            'supporting_docs': supporting_docs,
-            'distractor_docs': distractor_docs,
-            'context_size': calculate_context_size(supporting_docs, distractor_docs)
-        }
+        # Calculate context size mapping for different target sizes
+        context_sizes = {}
+        target_sizes = [8000, 32000, 128000]
+        
+        for target_size in target_sizes:
+            # Calculate how many distractor docs fit within this target size
+            distractor_tokens_used = 0
+            num_distractor_docs = 0
+            
+            for doc in distractor_docs:
+                # Count tokens for this distractor doc
+                try:
+                    doc_tokens = count_article_tokens(Article.objects.get(title=doc['title']))
+                except Exception as e:
+                    logger.error(f"Error counting tokens for distractor doc {doc['title']}: {e}")
+                    continue
+                
+                # Check if adding this doc would exceed the target size
+                if supporting_tokens + distractor_tokens_used + doc_tokens <= target_size:
+                    distractor_tokens_used += doc_tokens
+                    num_distractor_docs += 1
+                else:
+                    break
+            
+            # Store the actual context size and number of distractor docs
+            actual_context_size = supporting_tokens + distractor_tokens_used
+            context_sizes[target_size] = (actual_context_size, num_distractor_docs)
 
-        return {
-            'status': 'success',
-            'entry': qa_entry
-        }
+        # Create _QAEntry dataclass
+        qa_entry = _QAEntry(
+            id=qa_id,
+            question=question,
+            gold_answer=answer,
+            supporting_docs=supporting_docs,
+            distractor_docs=distractor_docs,
+            context_sizes=context_sizes
+        )
+
+        return qa_entry
 
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Full error traceback for entry {entry_data.get('_id', 'unknown')}: {error_details}")
         return {
             'status': 'error',
             'id': entry_data.get('_id', 'unknown'),
@@ -305,26 +344,33 @@ class Command(BaseCommand):
                 try:
                     result = future.result()
                     
-                    if result['status'] == 'success':
-                        qa_entry = result['entry']
+                    # Check if result is _QAEntry dataclass (success case)
+                    if isinstance(result, _QAEntry):
                         stats['processed'] += 1
+                        
+                        # Get all context size variants
+                        context_entries = result.get_all_context_sizes()
                         
                         # Add to appropriate context size buckets
                         for context_size in context_sizes:
-                            if qa_entry['context_size'] <= context_size:
-                                results[context_size].append(qa_entry)
+                            if context_size in context_entries:
+                                # Convert QAEntry dataclass to dict for JSON serialization
+                                entry_dict = asdict(context_entries[context_size])
+                                results[context_size].append(entry_dict)
                                 
-                    elif result['status'] == 'skipped_missing_articles':
-                        stats['skipped_missing_articles'] += 1
-                        logger.warning(f"Skipping {result['id']}: Missing articles {result['missing_articles']}")
-                        
-                    elif result['status'] == 'skipped_context_overflow':
-                        stats['skipped_context_overflow'] += 1
-                        logger.warning(f"Skipping {result['id']}: Supporting docs exceed context limit ({result['supporting_tokens']} tokens)")
-                        
-                    elif result['status'] == 'error':
-                        stats['errors'] += 1
-                        logger.error(f"Error processing entry {result['id']}: {result['error']}")
+                    # Handle error/skip cases (still dict format)
+                    elif isinstance(result, dict):
+                        if result['status'] == 'skipped_missing_articles':
+                            stats['skipped_missing_articles'] += 1
+                            logger.warning(f"Skipping {result['id']}: Missing articles {result['missing_articles']}")
+                            
+                        elif result['status'] == 'skipped_context_overflow':
+                            stats['skipped_context_overflow'] += 1
+                            logger.warning(f"Skipping {result['id']}: Supporting docs exceed context limit ({result['supporting_tokens']} tokens)")
+                            
+                        elif result['status'] == 'error':
+                            stats['errors'] += 1
+                            logger.error(f"Error processing entry {result['id']}: {result['error']}")
                         
                 except Exception as e:
                     stats['errors'] += 1
