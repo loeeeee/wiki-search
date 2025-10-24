@@ -79,7 +79,31 @@ class NLTKTokenizer(Tokenizer):
         
         # Tokenize and filter
         tokens = self._word_tokenize(text.lower())
-        return [t for t in tokens if t.isalnum() and t not in self._stopwords]
+        # Filter tokens: alphanumeric, not stopwords, reasonable length, and not too many repeated characters
+        filtered_tokens = []
+        for t in tokens:
+            # Skip if too long (more restrictive limit)
+            if len(t) > 50:
+                continue
+            # Skip if all same character (like "aaaaaaa")
+            if len(set(t)) <= 1:
+                continue
+            # Skip if it's a long number
+            if t.isdigit() and len(t) > 10:
+                continue
+            # Skip if it's not alphanumeric
+            if not t.isalnum():
+                continue
+            # Skip if it's a stopword
+            if t in self._stopwords:
+                continue
+            # Skip tokens with too many repeated character patterns (like "ycdbuyfcdghuyedhuedhyuhecduohcfrufrirvfuygrvfuycrfuyecfuvrfuycrfrcubrfhugrvfuygbcrfuybcrfygfuyrvfguy")
+            if len(t) > 20 and len(set(t)) < len(t) * 0.3:  # If more than 20 chars and less than 30% unique chars
+                continue
+            
+            filtered_tokens.append(t)
+        
+        return filtered_tokens
 
 
 class GPTTokenizer(Tokenizer):

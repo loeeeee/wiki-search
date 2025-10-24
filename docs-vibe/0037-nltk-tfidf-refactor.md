@@ -142,11 +142,16 @@ TOKENIZER_TYPE = 'nltk'  # For backward compatibility only
    - **Solution**: Rebuild TF-IDF index with NLTK tokenizer
    - **Command**: `python manage.py clean_db --yes && python manage.py build_tfidf_index --rebuild`
 
-2. **QA generation token counts changed**
+2. **Database error: "value too long for type character varying(128)"**
+   - **Cause**: NLTK tokenizer producing very long tokens from Wikipedia dump artifacts
+   - **Solution**: Fixed in improved NLTK tokenizer with better filtering
+   - **Filters**: Tokens >50 chars, repeated characters, long numbers, low character diversity
+
+3. **QA generation token counts changed**
    - **Expected**: QA generation should still use GPT tokenizer
    - **Check**: Verify `qa_helpers.py` imports `tokenize_gpt`
 
-3. **Import errors with tokenizer**
+4. **Import errors with tokenizer**
    - **Solution**: Ensure NLTK dependencies are installed
    - **Command**: `uv sync` (includes nltk>=3.9.0)
 
