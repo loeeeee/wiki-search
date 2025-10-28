@@ -36,7 +36,7 @@ from search_engine.search import compute_tf, vector_l2_norm, compute_tfidf_batch
 from search_engine.tokenizer import tokenize
 
 
-def _compute_doc_freq_batch(article_tuples: List[Tuple[int, List[str]]]) -> Counter:
+def _compute_doc_freq_batch(article_tuples: List[Tuple[int, List[str]]]) -> Tuple[Counter, List[Tuple[int, List[str], List[int]]]]:
     """
     Worker: tokenize article paragraphs and return local document frequency counter.
     
@@ -50,9 +50,9 @@ def _compute_doc_freq_batch(article_tuples: List[Tuple[int, List[str]]]) -> Coun
             - paragraphs (List[str]): List of paragraph text strings
             
     Returns:
-        Counter: Document frequency counter where:
-            - Keys: Unique terms (vocabulary words)
-            - Values: Number of articles containing each term
+        Tuple:
+            - Counter: Document frequency counter where keys are terms and values are doc counts
+            - List of (article_id, tokens, token_counts_per_paragraph) for reuse in Pass 2
             
     Implementation:
         - Closes inherited database connections for multiprocessing safety
@@ -73,15 +73,19 @@ def _compute_doc_freq_batch(article_tuples: List[Tuple[int, List[str]]]) -> Coun
     
     # Document frequency computation: count unique terms across articles
     doc_freq = Counter()
+    pretokenized: List[Tuple[int, List[str], List[int]]] = []
     for article_id, paragraphs in article_tuples:
-        # Track unique terms per article (each article contributes at most 1 to DF)
         seen_terms = set()
+        tokens: List[str] = []
+        token_counts: List[int] = []
         for para in paragraphs:
-            # Tokenize paragraph and add unique terms to set
-            seen_terms.update(tokenize(para))
-        # Update document frequency counter with unique terms from this article
+            para_tokens = tokenize(para)
+            tokens.extend(para_tokens)
+            token_counts.append(len(para_tokens))
+            seen_terms.update(para_tokens)
         doc_freq.update(seen_terms)
-    return doc_freq
+        pretokenized.append((article_id, tokens, token_counts))
+    return doc_freq, pretokenized
 
 
 def _build_tfidf_batch(
@@ -339,4 +343,75 @@ def _build_tfidf_batch_gpu(
         # Store TF-IDF vector with metadata
         tfidf_tuples.append((article_id, vec, l2_norm, token_counts))
     
+    return tfidf_tuples, inverted_tuples
+
+
+def _build_tfidf_batch_cpu_from_tokens(
+    pretokenized: List[Tuple[int, List[str], List[int]]],
+    term_to_id: Dict[str, int],
+    term_to_idf: Dict[str, float],
+) -> Tuple[
+    List[Tuple[int, Dict[int, float], float, List[int]]],
+    List[Tuple[int, int, float]]
+]:
+    """
+    CPU TF-IDF/inverted index computation from pretokenized input.
+    """
+    tfidf_tuples: List[Tuple[int, Dict[int, float], float, List[int]]] = []
+    inverted_tuples: List[Tuple[int, int, float]] = []
+    for article_id, tokens, token_counts in pretokenized:
+        tf = compute_tf(tokens)
+        vec: Dict[int, float] = {}
+        for term, tf_val in tf.items():
+            term_id = term_to_id.get(term)
+            idf_val = term_to_idf.get(term)
+            if term_id is None or idf_val is None:
+                continue
+            tfidf_score = tf_val * idf_val
+            vec[term_id] = tfidf_score
+            inverted_tuples.append((term_id, article_id, tfidf_score))
+        l2_norm = vector_l2_norm(vec.values()) if vec else 0.0
+        tfidf_tuples.append((article_id, vec, l2_norm, token_counts))
+    return tfidf_tuples, inverted_tuples
+
+
+def _build_tfidf_batch_gpu_from_tokens(
+    pretokenized: List[Tuple[int, List[str], List[int]]],
+    term_to_id: Dict[str, int],
+    term_to_idf: Dict[str, float],
+    device,
+) -> Tuple[
+    List[Tuple[int, Dict[int, float], float, List[int]]],
+    List[Tuple[int, int, float]]
+]:
+    """
+    GPU TF-IDF/inverted index computation from pretokenized input.
+    Avoids re-tokenization in Pass 2 by reusing tokens from Pass 1.
+    """
+    # Close inherited database connections (required for multiprocessing)
+    from django.db import connections
+    for conn in connections.all():
+        conn.close()
+
+    article_ids: List[int] = []
+    article_tokens: List[List[str]] = []
+    token_counts_list: List[List[int]] = []
+    for article_id, tokens, token_counts in pretokenized:
+        article_ids.append(article_id)
+        article_tokens.append(tokens)
+        token_counts_list.append(token_counts)
+
+    tfidf_vectors, l2_norms = compute_tfidf_batch_gpu(
+        article_tokens, term_to_id, term_to_idf, device
+    )
+
+    tfidf_tuples: List[Tuple[int, Dict[int, float], float, List[int]]] = []
+    inverted_tuples: List[Tuple[int, int, float]] = []
+    for article_id, vec, l2_norm, token_counts in zip(
+        article_ids, tfidf_vectors, l2_norms, token_counts_list
+    ):
+        for term_id, tfidf_score in vec.items():
+            inverted_tuples.append((term_id, article_id, tfidf_score))
+        tfidf_tuples.append((article_id, vec, l2_norm, token_counts))
+
     return tfidf_tuples, inverted_tuples
