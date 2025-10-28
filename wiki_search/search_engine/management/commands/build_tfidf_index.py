@@ -100,6 +100,61 @@ def _build_tfidf_batch(
     return tfidf_tuples, inverted_tuples
 
 
+def _build_tfidf_batch_gpu(
+    article_tuples: List[Tuple[int, List[str]]],
+    term_to_id: Dict[str, int],
+    term_to_idf: Dict[str, float],
+    device
+) -> Tuple[
+    List[Tuple[int, Dict[int, float], float, List[int]]],  # (article_id, tfidf_vec, l2_norm, token_counts)
+    List[Tuple[int, int, float]]  # (term_id, article_id, tfidf_score) for InvertedIndex
+]:
+    """GPU-accelerated worker: compute TF-IDF vectors, inverted index tuples, and token counts.
+    
+    Returns lightweight tuples to minimize serialization overhead.
+    """
+    from search_engine.search import compute_tfidf_batch_gpu
+    
+    # Extract tokens for batch processing
+    article_tokens = []
+    article_ids = []
+    token_counts_list = []
+    
+    for article_id, paragraphs in article_tuples:
+        tokens = []
+        token_counts = []
+        
+        # Compute token counts per paragraph
+        for para in paragraphs:
+            para_tokens = tokenize(para)
+            tokens.extend(para_tokens)
+            token_counts.append(len(para_tokens))
+        
+        article_tokens.append(tokens)
+        article_ids.append(article_id)
+        token_counts_list.append(token_counts)
+    
+    # GPU-accelerated batch TF-IDF computation
+    tfidf_vectors, l2_norms = compute_tfidf_batch_gpu(
+        article_tokens, term_to_id, term_to_idf, device
+    )
+    
+    # Convert results to expected format
+    tfidf_tuples = []
+    inverted_tuples = []
+    
+    for i, (article_id, vec, l2_norm, token_counts) in enumerate(
+        zip(article_ids, tfidf_vectors, l2_norms, token_counts_list)
+    ):
+        # Create inverted index tuples
+        for term_id, tfidf_score in vec.items():
+            inverted_tuples.append((term_id, article_id, tfidf_score))
+        
+        tfidf_tuples.append((article_id, vec, l2_norm, token_counts))
+    
+    return tfidf_tuples, inverted_tuples
+
+
 def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List[int]]]) -> int:
     """Synchronous TF-IDF flush using PostgreSQL COPY for high throughput."""
     if not tfidf_tuples:
@@ -179,6 +234,7 @@ class Command(BaseCommand):
         parser.add_argument("--db-workers", type=int, default=96, help="Number of database writer threads (default: 96)")
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
+        parser.add_argument("--use-gpu", action="store_true", help="Use GPU acceleration for TF-IDF computation (requires PyTorch with ROCm/CUDA)")
 
     def handle(self, *args, **options):
         # Setup logging
@@ -192,6 +248,7 @@ class Command(BaseCommand):
         workers = options["workers"]
         db_workers = options["db_workers"]
         enable_profiling = options.get("profile", False)
+        use_gpu = options.get("use_gpu", False)
         
         # Initialize profilers
         profiler_pass1 = None
@@ -199,6 +256,25 @@ class Command(BaseCommand):
         profiler_pass2 = None
         
         start_time = time.perf_counter()
+        
+        # Check GPU availability if requested
+        if use_gpu:
+            try:
+                import torch
+                gpu_available = torch.cuda.is_available()
+                if gpu_available:
+                    gpu_name = torch.cuda.get_device_name(0)
+                    gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                    self.stdout.write(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
+                    logger.info(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
+                else:
+                    self.stdout.write(self.style.WARNING("GPU acceleration requested but no GPU available. Using CPU."))
+                    logger.warning("GPU acceleration requested but no GPU available. Using CPU.")
+                    use_gpu = False
+            except ImportError:
+                self.stdout.write(self.style.WARNING("GPU acceleration requested but PyTorch not available. Using CPU."))
+                logger.warning("GPU acceleration requested but PyTorch not available. Using CPU.")
+                use_gpu = False
         
         if rebuild:
             self.stdout.write("Clearing existing indexes...")
@@ -302,10 +378,26 @@ class Command(BaseCommand):
              ProcessPoolExecutor(max_workers=workers) as process_executor:
             
             # Submit batches for parallel TF-IDF computation
-            futures = [
-                process_executor.submit(_build_tfidf_batch, batch, term_to_id, term_to_idf)
-                for batch in worker_batches
-            ]
+            if use_gpu:
+                try:
+                    import torch
+                    device = torch.device('cuda')
+                    futures = [
+                        process_executor.submit(_build_tfidf_batch_gpu, batch, term_to_id, term_to_idf, device)
+                        for batch in worker_batches
+                    ]
+                except (ImportError, RuntimeError) as e:
+                    self.stdout.write(self.style.WARNING(f"GPU computation failed: {e}. Falling back to CPU."))
+                    logger.warning(f"GPU computation failed, falling back to CPU: {e}")
+                    futures = [
+                        process_executor.submit(_build_tfidf_batch, batch, term_to_id, term_to_idf)
+                        for batch in worker_batches
+                    ]
+            else:
+                futures = [
+                    process_executor.submit(_build_tfidf_batch, batch, term_to_id, term_to_idf)
+                    for batch in worker_batches
+                ]
             
             tfidf_buffer = []
             inverted_buffer = []

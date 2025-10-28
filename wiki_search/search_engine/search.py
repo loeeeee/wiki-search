@@ -12,6 +12,15 @@ except ImportError:
     import math
     np = None
 
+# Try to import PyTorch for GPU acceleration
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    GPU_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    TORCH_AVAILABLE = False
+    GPU_AVAILABLE = False
+
 from django.db.models import QuerySet
 
 from .models import Article, InvertedIndex, PageRank, TFIDFIndex, Vocabulary
@@ -40,6 +49,132 @@ def vector_l2_norm(values: Iterable[float]) -> float:
     else:
         # Fallback implementation using math
         return math.sqrt(sum(x * x for x in values))
+
+
+def vector_l2_norm_gpu(values: torch.Tensor) -> torch.Tensor:
+    """GPU-accelerated L2 norm computation using PyTorch."""
+    return torch.norm(values, p=2)
+
+
+def compute_tfidf_batch_gpu(
+    article_tokens: List[List[str]], 
+    term_to_id: Dict[str, int], 
+    term_to_idf: Dict[str, float],
+    device: torch.device
+) -> Tuple[List[Dict[int, float]], List[float]]:
+    """GPU-accelerated batch TF-IDF computation.
+    
+    Args:
+        article_tokens: List of token lists for each article
+        term_to_id: Mapping from term to vocabulary ID
+        term_to_idf: Mapping from term to IDF value
+        device: PyTorch device (CPU or GPU)
+        
+    Returns:
+        Tuple of (tfidf_vectors, l2_norms) for each article
+    """
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch is required for GPU TF-IDF computation")
+    
+    tfidf_vectors = []
+    l2_norms = []
+    
+    # Process articles in batches for GPU efficiency
+    batch_size = min(1000, len(article_tokens))  # Adjust based on GPU memory
+    
+    for i in range(0, len(article_tokens), batch_size):
+        batch_tokens = article_tokens[i:i + batch_size]
+        
+        # Convert to PyTorch tensors for batch processing
+        batch_vectors = []
+        batch_norms = []
+        
+        for tokens in batch_tokens:
+            # Compute TF for this article
+            tf = compute_tf(tokens)
+            
+            # Create sparse vector representation
+            vec_dict = {}
+            for term, tf_val in tf.items():
+                term_id = term_to_id.get(term)
+                idf_val = term_to_idf.get(term)
+                if term_id is not None and idf_val is not None:
+                    vec_dict[term_id] = tf_val * idf_val
+            
+            tfidf_vectors.append(vec_dict)
+            
+            # Compute L2 norm
+            if vec_dict:
+                values = torch.tensor(list(vec_dict.values()), device=device)
+                norm = vector_l2_norm_gpu(values).item()
+                batch_norms.append(norm)
+            else:
+                batch_norms.append(0.0)
+        
+        l2_norms.extend(batch_norms)
+    
+    return tfidf_vectors, l2_norms
+
+
+def cosine_similarity_batch_gpu(
+    query_vector: Dict[int, float],
+    query_norm: float,
+    document_vectors: List[Dict[int, float]],
+    document_norms: List[float],
+    device: torch.device
+) -> List[float]:
+    """GPU-accelerated batch cosine similarity computation.
+    
+    Args:
+        query_vector: Query TF-IDF vector
+        query_norm: Query vector L2 norm
+        document_vectors: List of document TF-IDF vectors
+        document_norms: List of document L2 norms
+        device: PyTorch device (CPU or GPU)
+        
+    Returns:
+        List of cosine similarity scores
+    """
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch is required for GPU cosine similarity computation")
+    
+    if query_norm == 0.0:
+        return [0.0] * len(document_vectors)
+    
+    # Convert query vector to tensor
+    query_terms = list(query_vector.keys())
+    query_values = torch.tensor([query_vector[term] for term in query_terms], device=device)
+    query_norm_tensor = torch.tensor(query_norm, device=device)
+    
+    similarities = []
+    
+    # Process documents in batches
+    batch_size = min(1000, len(document_vectors))
+    
+    for i in range(0, len(document_vectors), batch_size):
+        batch_docs = document_vectors[i:i + batch_size]
+        batch_norms = document_norms[i:i + batch_size]
+        
+        batch_similarities = []
+        
+        for doc_vec, doc_norm in zip(batch_docs, batch_norms):
+            if doc_norm == 0.0:
+                batch_similarities.append(0.0)
+                continue
+            
+            # Compute dot product
+            dot_product = 0.0
+            for term in query_terms:
+                if term in doc_vec:
+                    dot_product += query_vector[term] * doc_vec[term]
+            
+            # Compute cosine similarity
+            similarity = dot_product / (query_norm * doc_norm)
+            batch_similarities.append(similarity.item() if hasattr(similarity, 'item') else float(similarity))
+        
+        similarities.extend(batch_similarities)
+    
+    return similarities
 
 
 def search_by_title_exact(query: str, limit: int = 10) -> QuerySet[Article]:

@@ -11,12 +11,22 @@ try:
 except ImportError:
     raise ImportError("scipy and numpy are required for PageRank computation. Please install them.")
 
+# Try to import PyTorch for GPU acceleration
+try:
+    import torch
+    import torch.sparse
+    TORCH_AVAILABLE = True
+    GPU_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    TORCH_AVAILABLE = False
+    GPU_AVAILABLE = False
+
 from django.db import connection
 
 logger = logging.getLogger(__name__)
 
 
-def build_adjacency_matrix(limit: int = None) -> Tuple[csr_matrix, List[int], Dict[int, int]]:
+def build_adjacency_matrix(limit: int | None = None) -> Tuple[csr_matrix, List[int], Dict[int, int]]:
     """Build sparse adjacency matrix from InternalLink graph.
     
     Returns:
@@ -79,7 +89,7 @@ def build_adjacency_matrix(limit: int = None) -> Tuple[csr_matrix, List[int], Di
     return adjacency_matrix, article_ids, id_to_index
 
 
-def build_adjacency_matrix_parallel(workers: int = 4, limit: int = None) -> Tuple[csr_matrix, List[int], Dict[int, int]]:
+def build_adjacency_matrix_parallel(workers: int = 4, limit: int | None = None) -> Tuple[csr_matrix, List[int], Dict[int, int]]:
     """Build sparse adjacency matrix using parallel database reads.
     
     Uses ID range-based batching to parallelize database reads, following the pattern
@@ -201,7 +211,7 @@ def compute_pagerank(
     max_iter: int = 100,
     tol: float = 1e-6,
     verbose: bool = True,
-    limit: int = None
+    limit: int | None = None
 ) -> Tuple[Dict[int, float], int, float]:
     """Compute PageRank scores using power iteration.
     
@@ -282,12 +292,136 @@ def compute_pagerank(
     return pagerank_scores, iteration + 1, float(residual)
 
 
+def compute_pagerank_gpu(
+    damping: float = 0.85,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+    verbose: bool = True,
+    limit: int | None = None
+) -> Tuple[Dict[int, float], int, float]:
+    """Compute PageRank scores using GPU acceleration with PyTorch.
+    
+    Args:
+        damping: Damping factor (probability of following links vs random jump)
+        max_iter: Maximum number of iterations
+        tol: Convergence tolerance
+        verbose: Whether to log progress
+        limit: Optional limit on number of links to process
+        
+    Returns:
+        pagerank_scores: Dict mapping article_id -> PageRank score
+        iterations: Number of iterations until convergence
+        residual: Final residual norm
+    """
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch is required for GPU PageRank computation. Install with: pip install torch")
+    
+    if not GPU_AVAILABLE:
+        raise RuntimeError("CUDA/ROCm GPU is not available. Use CPU version instead.")
+    
+    import torch
+    
+    logger.info(f"Computing PageRank with GPU acceleration (damping={damping}, max_iter={max_iter}, tol={tol})")
+    
+    # Build adjacency matrix (same as CPU version)
+    adjacency_matrix, article_ids, id_to_index = build_adjacency_matrix(limit=limit)
+    n = len(article_ids)
+    
+    if n == 0:
+        logger.warning("No articles with links found")
+        return {}, 0, 0.0
+    
+    # Check GPU memory requirements
+    device = torch.device('cuda')
+    matrix_size_mb = (adjacency_matrix.nnz * 8) / (1024 * 1024)  # Rough estimate
+    required_memory_mb = matrix_size_mb * 3  # Need space for matrix + vectors + operations
+    
+    if torch.cuda.get_device_properties(0).total_memory / (1024 * 1024) < required_memory_mb:
+        logger.warning(f"GPU memory may be insufficient. Required: ~{required_memory_mb:.1f}MB, "
+                      f"Available: {torch.cuda.get_device_properties(0).total_memory / (1024 * 1024):.1f}MB")
+    
+    logger.info(f"Transferring {n}x{n} sparse matrix to GPU ({adjacency_matrix.nnz} non-zeros, ~{matrix_size_mb:.1f}MB)")
+    
+    # Convert SciPy sparse matrix to PyTorch sparse tensor
+    # Extract COO format data
+    coo_matrix = adjacency_matrix.tocoo()
+    indices = torch.stack([
+        torch.from_numpy(coo_matrix.row).long(),
+        torch.from_numpy(coo_matrix.col).long()
+    ])
+    values = torch.from_numpy(coo_matrix.data).float()
+    
+    # Create PyTorch sparse tensor on GPU
+    sparse_tensor = torch.sparse_coo_tensor(
+        indices, values, (n, n), device=device
+    ).coalesce()
+    
+    # Normalize columns to get transition matrix
+    col_sums = torch.sparse.sum(sparse_tensor, dim=0).to_dense()
+    col_sums = torch.where(col_sums == 0, torch.ones_like(col_sums), col_sums)  # Avoid division by zero
+    
+    # Create normalized transition matrix
+    # For sparse tensors, we need to handle normalization differently
+    # We'll use dense operations for the transition matrix
+    dense_matrix = sparse_tensor.to_dense()
+    transition_matrix = dense_matrix / col_sums.unsqueeze(0)
+    
+    # Handle dangling nodes (pages with no outgoing links)
+    dangling_mask = (col_sums == 1) & (dense_matrix.sum(dim=0) == 0)
+    dangling_indices = torch.where(dangling_mask)[0]
+    
+    if len(dangling_indices) > 0:
+        logger.info(f"Found {len(dangling_indices)} dangling nodes")
+    
+    # Initialize PageRank vector on GPU
+    pagerank = torch.ones(n, device=device) / n
+    
+    # Power iteration on GPU
+    iteration = 0
+    residual = 0.0
+    
+    for iteration in range(max_iter):
+        pagerank_old = pagerank.clone()
+        
+        # Standard PageRank update: pagerank = (1-damping)/n + damping * P * pagerank
+        pagerank = (1 - damping) / n + damping * torch.mv(transition_matrix, pagerank)
+        
+        # Handle dangling nodes using teleportation formula
+        if len(dangling_indices) > 0:
+            dangling_sum = damping * torch.sum(pagerank[dangling_indices])
+            pagerank += dangling_sum / n
+        
+        # Check convergence
+        residual = torch.norm(pagerank - pagerank_old, p=1).item()
+        
+        if verbose and iteration % 10 == 0:
+            logger.info(f"Iteration {iteration}: residual = {residual:.2e}")
+        
+        if residual < tol:
+            logger.info(f"Converged after {iteration + 1} iterations (residual: {residual:.2e})")
+            break
+    else:
+        logger.warning(f"Did not converge after {max_iter} iterations (residual: {residual:.2e})")
+    
+    # Normalize to ensure sum = 1
+    pagerank = pagerank / pagerank.sum()
+    
+    # Convert back to CPU and dictionary
+    pagerank_cpu = pagerank.cpu().numpy()
+    pagerank_scores = {article_ids[i]: float(pagerank_cpu[i]) for i in range(n)}
+    
+    logger.info(f"GPU PageRank computation complete. Score range: [{min(pagerank_cpu):.6f}, {max(pagerank_cpu):.6f}]")
+    logger.info(f"Sum of all scores: {sum(pagerank_scores.values()):.6f}")
+    
+    return pagerank_scores, iteration + 1, float(residual)
+
+
 def compute_pagerank_parallel(
     damping: float = 0.85,
     max_iter: int = 100,
     tol: float = 1e-6,
     verbose: bool = True,
-    limit: int = None,
+    limit: int | None = None,
     db_read_workers: int = 4
 ) -> Tuple[Dict[int, float], int, float]:
     """Compute PageRank scores using parallel database reads.

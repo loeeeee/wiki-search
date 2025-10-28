@@ -90,6 +90,8 @@ class Command(BaseCommand):
                           help="Enable detailed profiling with cProfile")
         parser.add_argument("--limit", type=int, default=None,
                           help="Limit number of links to process (for testing)")
+        parser.add_argument("--use-gpu", action="store_true",
+                          help="Use GPU acceleration for PageRank computation (requires PyTorch with ROCm/CUDA)")
 
     def _drop_pagerank_indexes(self):
         """Drop PageRank indexes before bulk insert for faster writes."""
@@ -305,20 +307,51 @@ class Command(BaseCommand):
         # The build_adjacency_matrix function will handle the case of no links gracefully
         self.stdout.write("Proceeding with PageRank computation...")
         
-        # Compute PageRank scores using parallel database reads
-        self.stdout.write(f"Computing PageRank scores using {db_read_workers} parallel database workers...")
-        logger.info("Starting computation phase with parallel graph loading")
-        computation_start = time.perf_counter()
-        
-        from search_engine.pagerank import compute_pagerank_parallel
-        pagerank_scores, iterations, residual = compute_pagerank_parallel(
-            damping=damping,
-            max_iter=max_iter,
-            tol=tolerance,
-            verbose=options["verbose"],
-            limit=options["limit"],
-            db_read_workers=db_read_workers
-        )
+        # Compute PageRank scores using GPU or CPU
+        use_gpu = options["use_gpu"]
+        if use_gpu:
+            self.stdout.write("Computing PageRank scores using GPU acceleration...")
+            logger.info("Starting computation phase with GPU acceleration")
+            computation_start = time.perf_counter()
+            
+            from search_engine.pagerank import compute_pagerank_gpu
+            try:
+                pagerank_scores, iterations, residual = compute_pagerank_gpu(
+                    damping=damping,
+                    max_iter=max_iter,
+                    tol=tolerance,
+                    verbose=options["verbose"],
+                    limit=options["limit"]
+                )
+            except (ImportError, RuntimeError) as e:
+                self.stdout.write(
+                    self.style.WARNING(f"GPU computation failed: {e}. Falling back to CPU.")
+                )
+                logger.warning(f"GPU computation failed, falling back to CPU: {e}")
+                
+                from search_engine.pagerank import compute_pagerank_parallel
+                pagerank_scores, iterations, residual = compute_pagerank_parallel(
+                    damping=damping,
+                    max_iter=max_iter,
+                    tol=tolerance,
+                    verbose=options["verbose"],
+                    limit=options["limit"],
+                    db_read_workers=db_read_workers
+                )
+        else:
+            self.stdout.write(f"Computing PageRank scores using {db_read_workers} parallel database workers...")
+            logger.info("Starting computation phase with parallel graph loading")
+            computation_start = time.perf_counter()
+            
+            from search_engine.pagerank import compute_pagerank_parallel
+            pagerank_scores, iterations, residual = compute_pagerank_parallel(
+                damping=damping,
+                max_iter=max_iter,
+                tol=tolerance,
+                verbose=options["verbose"],
+                limit=options["limit"],
+                db_read_workers=db_read_workers
+            )
         
         computation_elapsed = time.perf_counter() - computation_start
         logger.info("Computation phase completed in %.2f seconds", computation_elapsed)

@@ -16,3 +16,6 @@ dependencies = [
     "nltk>=3.9.0", # NLTK tokenizer
     "psutil>=7.1.1",
 ]
+
+[project.optional-dependencies]
+gpu = ["torch>=2.0.0"]  # PyTorch for GPU acceleration (AMD ROCm or NVIDIA CUDA)

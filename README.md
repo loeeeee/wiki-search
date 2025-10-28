@@ -53,6 +53,7 @@ Get up and running in 5 minutes:
 - **Python 3.13+** with virtual environment at `.venv/`
 - **PostgreSQL** database server
 - **uv** package manager for Python dependencies
+- **AMD GPU with ROCm** (optional, for GPU acceleration)
 
 ### NixOS Environment
 
@@ -97,6 +98,35 @@ nix-shell
    ```bash
    python wiki_search/manage.py db_summary
    ```
+
+### GPU Acceleration Setup (Optional)
+
+For AMD GPU acceleration, install PyTorch with ROCm support:
+
+```bash
+# Install PyTorch with ROCm support
+pip install torch --index-url https://download.pytorch.org/whl/rocm5.7
+
+# Verify GPU availability
+python -c "import torch; print(torch.cuda.is_available())"
+
+# Install project with GPU dependencies
+uv sync --extra gpu
+```
+
+**GPU Requirements:**
+- AMD GPU with ROCm 5.0+ support (RX 6000 series or newer)
+- 8GB+ VRAM recommended for large datasets
+- Linux OS
+
+**Usage:**
+```bash
+# GPU-accelerated PageRank
+python wiki_search/manage.py build_pagerank --use-gpu --rebuild
+
+# GPU-accelerated TF-IDF indexing
+python wiki_search/manage.py build_tfidf_index --use-gpu --rebuild
+```
 
 ## Database Management Commands
 
