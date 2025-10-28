@@ -51,7 +51,7 @@ import queue
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from multiprocessing import Process, Queue  # Still needed for Pass 1
 from typing import Any, Dict, List, Tuple
@@ -62,11 +62,9 @@ from django.db import transaction, connection
 from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, TFIDFIndex, Vocabulary
-from search_engine.search import compute_idf, vector_l2_norm
-from search_engine.tokenizer import tokenize
+from search_engine.search import compute_idf
 from .tfidf_workers import (
     _compute_doc_freq_batch,
-    _build_tfidf_batch_cpu_from_tokens,
     _build_tfidf_batch_gpu_from_tokens,
 )
 
@@ -145,10 +143,10 @@ def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List
         return 0
     
     # Get articles for the tuples - use prefetched data if available
-    article_ids = [tup[0] for tup in tfidf_tuples]
     if prefetched_articles is not None:
         articles = prefetched_articles
     else:
+        article_ids = [tup[0] for tup in tfidf_tuples]
         articles = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
     
     # Prepare data for COPY
@@ -1026,6 +1024,7 @@ class Command(BaseCommand):
         
         # Calculate batch slices for GPU threads (no producer needed)
         total_pretokenized = len(pretokenized_all)
+        self.stdout.write(f"Total pretokenized: {total_pretokenized}")
         
         # Adjust number of GPU consumers if dataset is too small
         actual_gpu_consumers = min(gpu_consumers, total_pretokenized)
@@ -1056,14 +1055,11 @@ class Command(BaseCommand):
         # Dynamic flush thresholds: optimize COPY performance while ensuring small runs still flush
         if total_articles >= 10000:
             TFIDF_FLUSH_THRESHOLD = 50000
-            INVERTED_FLUSH_THRESHOLD = 1000000
         else:
             TFIDF_FLUSH_THRESHOLD = max(gpu_batch_size, min(50000, gpu_batch_size * 3))
-            INVERTED_FLUSH_THRESHOLD = max(100000, int(gpu_batch_size * 700 * 3))
         
         # Always use separate writer pools for optimal performance
         tfidf_writer_workers = max(1, db_workers // 2)
-        inverted_writer_workers = max(1, db_workers // 2)
         
         # GPU batch processing with concurrent pipeline and double-buffering
         tfidf_buffer = []
@@ -1075,8 +1071,7 @@ class Command(BaseCommand):
         current_articles = {}  # Articles for current batch
         
         with ThreadPoolExecutor(max_workers=reader_workers) as reader_executor, \
-             ThreadPoolExecutor(max_workers=tfidf_writer_workers) as tfidf_executor, \
-             ThreadPoolExecutor(max_workers=inverted_writer_workers) as inverted_executor:
+             ThreadPoolExecutor(max_workers=tfidf_writer_workers) as tfidf_executor:
             
             # Process results from GPU consumer threads
             completed_gpu_consumers = 0
