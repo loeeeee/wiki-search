@@ -14,6 +14,10 @@ Always use shell.nix to config project environment.
 
 Always use uv for python environment management.
 
+Always run python using nix-shell.
+
+Always update both uv and nix.shell to include new dependency.
+
 ## Coding
 
 Always Python logging system, and default log output to console, in addition to files.
