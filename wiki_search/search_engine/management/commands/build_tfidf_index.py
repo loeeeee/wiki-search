@@ -374,68 +374,88 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_com
             inverted_data.append((term_id, article_id, float(tfidf_score)))
     
     if inverted_data:
-        # Use atomic transactions for COPY operations to ensure consistency
-        # COPY is 3-5x faster than bulk_create for large datasets
-        if defer_commit:
-            with connection.cursor() as cursor:
-                # Create a temporary staging table for robust dedup upsert
-                cursor.execute(
-                    """
-                    CREATE TEMPORARY TABLE temp_inverted (LIKE search_engine_invertedindex INCLUDING DEFAULTS) ON COMMIT DROP;
-                    """
-                )
-                # COPY into temp table first
-                with cursor.copy(
-                    "COPY temp_inverted (term_id, article_id, tf_idf_score) FROM STDIN"
-                ) as copy:
-                    for term_id, article_id, tfidf_score in inverted_data:
-                        copy.write_row((term_id, article_id, tfidf_score))
-                # Insert only new records to avoid duplicates
-                cursor.execute(
-                    """
-                    INSERT INTO search_engine_invertedindex (term_id, article_id, tf_idf_score)
-                    SELECT t.term_id, t.article_id, t.tf_idf_score
-                    FROM temp_inverted AS t
-                    LEFT JOIN search_engine_invertedindex AS s
-                    ON t.term_id = s.term_id AND t.article_id = s.article_id
-                    WHERE s.term_id IS NULL
-                    """
-                )
-        else:
-            with transaction.atomic():
-                with connection.cursor() as cursor:
-                    # Ensure a unique index exists on (term_id, article_id) for fast upserts
-                    cursor.execute(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS idx_inverted_term_article
-                        ON search_engine_invertedindex(term_id, article_id)
-                        """
-                    )
-                    # Create a temporary staging table for robust dedup upsert
-                    cursor.execute(
-                        """
-                        CREATE TEMP TABLE IF NOT EXISTS tmp_invertedindex (
-                            term_id INTEGER,
-                            article_id INTEGER,
-                            tf_idf_score DOUBLE PRECISION,
-                            PRIMARY KEY (term_id, article_id)
-                        ) ON COMMIT DROP
-                        """
-                    )
-                    # COPY into temp table first
-                    with cursor.copy(
-                        "COPY tmp_invertedindex (term_id, article_id, tf_idf_score) FROM STDIN"
-                    ) as copy:
-                        for term_id, article_id, tfidf_score in inverted_data:
-                            copy.write_row((term_id, article_id, tfidf_score))
-                    # Insert into final table ignoring duplicates using ON CONFLICT
-                    cursor.execute(
-                        """
-                        INSERT INTO search_engine_invertedindex (term_id, article_id, tf_idf_score)
-                        SELECT term_id, article_id, tf_idf_score FROM tmp_invertedindex
-                        ON CONFLICT (term_id, article_id) DO NOTHING
-                        """
-                    )
+        # Retry logic for deadlock handling
+        max_retries = 3
+        base_delay = 0.1  # 100ms base delay
+        
+        for attempt in range(max_retries):
+            try:
+                # Use atomic transactions for COPY operations to ensure consistency
+                # COPY is 3-5x faster than bulk_create for large datasets
+                if defer_commit:
+                    with connection.cursor() as cursor:
+                        # Create a temporary staging table for robust dedup upsert
+                        cursor.execute(
+                            """
+                            CREATE TEMPORARY TABLE temp_inverted (LIKE search_engine_invertedindex INCLUDING DEFAULTS) ON COMMIT DROP;
+                            """
+                        )
+                        # COPY into temp table first
+                        with cursor.copy(
+                            "COPY temp_inverted (term_id, article_id, tf_idf_score) FROM STDIN"
+                        ) as copy:
+                            for term_id, article_id, tfidf_score in inverted_data:
+                                copy.write_row((term_id, article_id, tfidf_score))
+                        # Insert only new records to avoid duplicates
+                        cursor.execute(
+                            """
+                            INSERT INTO search_engine_invertedindex (term_id, article_id, tf_idf_score)
+                            SELECT t.term_id, t.article_id, t.tf_idf_score
+                            FROM temp_inverted AS t
+                            LEFT JOIN search_engine_invertedindex AS s
+                            ON t.term_id = s.term_id AND t.article_id = s.article_id
+                            WHERE s.term_id IS NULL
+                            """
+                        )
+                else:
+                    with transaction.atomic():
+                        with connection.cursor() as cursor:
+                            # Ensure a unique index exists on (term_id, article_id) for fast upserts
+                            cursor.execute(
+                                """
+                                CREATE UNIQUE INDEX IF NOT EXISTS idx_inverted_term_article
+                                ON search_engine_invertedindex(term_id, article_id)
+                                """
+                            )
+                            # Create a temporary staging table for robust dedup upsert
+                            cursor.execute(
+                                """
+                                CREATE TEMP TABLE IF NOT EXISTS tmp_invertedindex (
+                                    term_id INTEGER,
+                                    article_id INTEGER,
+                                    tf_idf_score DOUBLE PRECISION,
+                                    PRIMARY KEY (term_id, article_id)
+                                ) ON COMMIT DROP
+                                """
+                            )
+                            # COPY into temp table first
+                            with cursor.copy(
+                                "COPY tmp_invertedindex (term_id, article_id, tf_idf_score) FROM STDIN"
+                            ) as copy:
+                                for term_id, article_id, tfidf_score in inverted_data:
+                                    copy.write_row((term_id, article_id, tfidf_score))
+                            # Insert into final table ignoring duplicates using ON CONFLICT
+                            cursor.execute(
+                                """
+                                INSERT INTO search_engine_invertedindex (term_id, article_id, tf_idf_score)
+                                SELECT term_id, article_id, tf_idf_score FROM tmp_invertedindex
+                                ON CONFLICT (term_id, article_id) DO NOTHING
+                                """
+                            )
+                
+                # If we get here, the operation succeeded
+                break
+                
+            except Exception as e:
+                if "deadlock detected" in str(e) and attempt < max_retries - 1:
+                    # Exponential backoff with jitter
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 0.1)
+                    logging.warning(f"Deadlock detected on attempt {attempt + 1}, retrying in {delay:.2f}s: {e}")
+                    time.sleep(delay)
+                    continue
+                else:
+                    # Re-raise if not a deadlock or max retries exceeded
+                    raise
     
     return len(inverted_data)
 

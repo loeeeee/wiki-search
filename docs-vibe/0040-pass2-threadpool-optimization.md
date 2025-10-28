@@ -16,13 +16,15 @@ Implemented a comprehensive Pass 2 optimization that transforms the single-threa
 
 3. **Separate Writer Threadpools**: Implemented separate threadpools for TF-IDF and inverted index writes, allowing independent tuning and preventing contention.
 
-4. **Prefetch-Ahead Strategy**: Added intelligent prefetching that starts database reads at 80% flush threshold while GPU processes current batch.
+4. **Incremental Inverted Index Flushing**: Added threshold-based incremental flushing for inverted index entries using a dedicated threadpool, preventing memory issues and enabling parallel database writes.
+
+5. **Prefetch-Ahead Strategy**: Added intelligent prefetching that starts database reads at 80% flush threshold while GPU processes current batch.
 
 ### Architecture Improvements
 
 **Before**: Single-threaded main loop → Sequential GPU batches → Single writer threadpool → Blocking database reads
 
-**After**: Producer thread → Multiple GPU consumers → Separate reader/writer threadpools → Async prefetching → Non-blocking writes
+**After**: Producer thread → Multiple GPU consumers → Separate reader/writer threadpools → Async prefetching → Non-blocking writes → Incremental inverted index flushing
 
 ### New Command Line Options
 
@@ -35,6 +37,7 @@ Implemented a comprehensive Pass 2 optimization that transforms the single-threa
 - **GPU throughput**: 2-4x improvement from parallel GPU batch processing
 - **Database I/O**: Eliminate blocking reads via async prefetch
 - **Writer contention**: Reduce contention between TF-IDF and inverted index writes
+- **Memory efficiency**: Incremental flushing prevents excessive memory usage
 - **Overall throughput**: Target 50-100+ articles/second (up from current 22.3 articles/second)
 
 ## Technical Implementation Details
@@ -44,6 +47,7 @@ Implemented a comprehensive Pass 2 optimization that transforms the single-threa
 1. **prefetch_articles_async()**: Async prefetch Article objects using reader threadpool
 2. **prefetch_vocabulary_async()**: Async prefetch Vocabulary objects using reader threadpool  
 3. **gpu_consumer_pass2()**: GPU consumer thread for parallel batch processing
+4. **Incremental flush logic**: Threshold-based flushing for inverted index entries during GPU processing
 
 ### Modified Functions
 
@@ -60,6 +64,7 @@ Replaced the single-threaded main loop with:
   - TF-IDF writer pool
   - Inverted index writer pool
 - Prefetch-ahead strategy for optimal I/O overlap
+- Incremental flushing for inverted index entries with adaptive thresholds
 
 ### Error Handling
 

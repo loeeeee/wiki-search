@@ -2,11 +2,11 @@
 
 **Date**: 2025-01-27  
 **Status**: ✅ COMPLETED  
-**Impact**: Improved error handling, faster failure detection, cleaner codebase
+**Impact**: Improved error handling, faster failure detection, cleaner codebase, and efficient inverted index flushing
 
 ## Overview
 
-Successfully refactored the TF-IDF index builder (`build_tfidf_index.py`) to implement comprehensive fail-fast validation, improve error handling, and remove unused code. The refactoring ensures that all prerequisites are validated before any processing begins, providing immediate feedback on configuration or dependency issues.
+Successfully refactored the TF-IDF index builder (`build_tfidf_index.py`) to implement comprehensive fail-fast validation, improve error handling, remove unused code, and add efficient inverted index flushing. The refactoring ensures that all prerequisites are validated before any processing begins, providing immediate feedback on configuration or dependency issues.
 
 ## Key Improvements
 
@@ -71,7 +71,22 @@ def _validate_database_state(self, rebuild: bool) -> int:
 - Faster debugging and troubleshooting
 - No silent failures that continue processing
 
-### 5. Code Cleanup
+### 5. Efficient Inverted Index Flushing
+
+**Threadpool-Based Incremental Flushing**: Added dedicated threadpool for inverted index writes with threshold-based buffering:
+- **Dedicated executor**: `inverted_executor` with separate worker threads
+- **Adaptive thresholds**: 100k entries for large datasets, `max(1000, total_articles * 50)` for small datasets
+- **Incremental flushing**: Flushes happen during GPU processing, not after
+- **Memory efficiency**: Prevents excessive memory usage from large buffers
+- **Parallel writes**: Multiple inverted index flushes can run concurrently
+
+**Benefits**:
+- **Memory management**: Prevents buffer from growing indefinitely
+- **Parallel operations**: Database writes happen concurrently with GPU processing
+- **Adaptive scaling**: Threshold automatically adjusts to dataset size
+- **Resource isolation**: Dedicated thread pool prevents contention
+
+### 6. Code Cleanup
 
 **Removed Unused Code** (~150 lines):
 - **Deleted functions**: `producer_pass2()` and `gpu_batch_processor()` (never called)
@@ -267,6 +282,8 @@ The fail-fast refactoring successfully improves the TF-IDF index builder by:
 - **Reducing code complexity**: Removed unused code and imports
 - **Improving maintainability**: Single source of truth for validation
 - **Enhancing debugging**: Clear error propagation instead of masked failures
+- **Optimizing memory usage**: Efficient inverted index flushing with adaptive thresholds
+- **Enabling parallel writes**: Dedicated threadpool for inverted index operations
 
 The refactoring maintains full backward compatibility while significantly improving the user experience and code quality. Users now get immediate feedback on configuration issues instead of waiting for processing to fail after minutes of computation.
 
@@ -275,3 +292,5 @@ The refactoring maintains full backward compatibility while significantly improv
 - **Code reduction**: ~150 lines removed
 - **Error clarity**: 100% specific error messages with actionable instructions
 - **Maintainability**: Single validation source instead of scattered checks
+- **Memory efficiency**: Adaptive thresholds prevent excessive memory usage
+- **Parallel writes**: Dedicated threadpool enables concurrent database operations
