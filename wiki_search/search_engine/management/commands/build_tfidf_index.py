@@ -1,26 +1,34 @@
 """
-GPU-Accelerated TF-IDF Index and Inverted Index Builder
+GPU-Accelerated TF-IDF Index and Inverted Index Builder with Fail-Fast Validation
 
 This module implements a high-performance TF-IDF index builder using a two-pass
 producer-consumer architecture with GPU acceleration for Wikipedia article processing.
 
 Architecture:
+    Early Validation (Fail-Fast):
+        - Validates PyTorch availability and GPU compatibility
+        - Checks database connection and required table existence
+        - Validates all command-line parameters before processing
+        - Ensures article count > 0 before starting
+    
     Pass 1: Document Frequency Computation
         - Producer threads fetch articles from database
         - Consumer processes tokenize articles and compute document frequency
         - Uses multiprocessing for CPU-intensive tokenization
     
     Pass 2: GPU-Accelerated TF-IDF Computation
-        - Producer threads fetch articles for GPU processing
+        - Producer threads feed pretokenized data to GPU consumers
         - GPU processes large batches (10k articles) for TF-IDF computation
         - Async database writers flush results using PostgreSQL COPY
 
 Key Features:
+    - Fail-fast validation catches issues in <1 second
     - GPU acceleration with PyTorch (ROCm/CUDA support)
     - Producer-consumer pattern eliminates database bottlenecks
     - PostgreSQL COPY for 3-5x faster bulk inserts
     - Async database writes prevent blocking GPU computation
-    - Comprehensive error handling and profiling support
+    - Comprehensive error handling with clear error messages
+    - Removed unused code for better maintainability
 
 Performance:
     - 19.5 articles/second throughput (1000 articles in 51.33s)
@@ -46,7 +54,7 @@ from typing import Any, Dict, List, Tuple
 import multiprocessing
 
 from django.conf import settings
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction, connection
 from tqdm import tqdm
 
@@ -55,8 +63,6 @@ from search_engine.search import compute_idf, vector_l2_norm
 from search_engine.tokenizer import tokenize
 from .tfidf_workers import (
     _compute_doc_freq_batch,
-    _build_tfidf_batch_gpu,
-    _build_tfidf_batch_cpu_fallback,
     _build_tfidf_batch_cpu_from_tokens,
     _build_tfidf_batch_gpu_from_tokens,
 )
@@ -452,38 +458,25 @@ def gpu_consumer_pass2(
     Implementation:
         - Processes articles in batches of gpu_batch_size for efficiency
         - Uses GPU acceleration via tfidf_workers module
-        - Handles GPU processing errors gracefully by returning empty results
+        - Let GPU processing errors propagate to fail fast
         - Sends None signal when complete to indicate thread finished
         - Logs progress for monitoring and debugging
     """
-    try:
-        logger.info("GPU Consumer Pass 2 starting")
-        current_batch = []
-        processed_count = 0
+    logger.info("GPU Consumer Pass 2 starting")
+    current_batch = []
+    processed_count = 0
+    
+    while True:
+        item = article_queue.get()
+        if item is None:  # End signal
+            logger.info("GPU Consumer Pass 2: received end signal")
+            break
         
-        while True:
-            item = article_queue.get()
-            if item is None:  # End signal
-                logger.info("GPU Consumer Pass 2: received end signal")
-                break
-            
-            current_batch.append(item)
-            
-            if len(current_batch) >= gpu_batch_size:
-                # Process GPU batch
-                logger.info(f"GPU Consumer Pass 2: processing batch of {len(current_batch)} articles")
-                
-                tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
-                    current_batch, term_to_id, term_to_idf, device
-                )
-                
-                result_queue.put((tfidf_tuples, inverted_tuples))
-                processed_count += len(current_batch)
-                current_batch = []
+        current_batch.append(item)
         
-        # Process remaining articles
-        if current_batch:
-            logger.info(f"GPU Consumer Pass 2: processing final batch of {len(current_batch)} articles")
+        if len(current_batch) >= gpu_batch_size:
+            # Process GPU batch
+            logger.info(f"GPU Consumer Pass 2: processing batch of {len(current_batch)} articles")
             
             tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
                 current_batch, term_to_id, term_to_idf, device
@@ -491,15 +484,23 @@ def gpu_consumer_pass2(
             
             result_queue.put((tfidf_tuples, inverted_tuples))
             processed_count += len(current_batch)
+            current_batch = []
+    
+    # Process remaining articles
+    if current_batch:
+        logger.info(f"GPU Consumer Pass 2: processing final batch of {len(current_batch)} articles")
         
-        logger.info(f"GPU Consumer Pass 2: processed {processed_count} articles total")
-        # Signal completion
-        result_queue.put(None)
-        logger.info("GPU Consumer Pass 2: sent completion signal")
+        tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
+            current_batch, term_to_id, term_to_idf, device
+        )
         
-    except Exception as e:
-        logger.error(f"GPU Consumer Pass 2 error: {e}")
-        result_queue.put(None)
+        result_queue.put((tfidf_tuples, inverted_tuples))
+        processed_count += len(current_batch)
+    
+    logger.info(f"GPU Consumer Pass 2: processed {processed_count} articles total")
+    # Signal completion
+    result_queue.put(None)
+    logger.info("GPU Consumer Pass 2: sent completion signal")
 
 
 def producer_pass1(article_queue: Queue, batch_size: int, limit: int, num_consumers: int) -> None:
@@ -521,76 +522,28 @@ def producer_pass1(article_queue: Queue, batch_size: int, limit: int, num_consum
         - Puts (article_id, plain_text_paragraphs) tuples in queue
         - Logs progress every 100 articles
         - CRITICAL: Sends num_consumers None signals to prevent deadlock
-        - Handles exceptions by sending end signals to all consumers
+        - Let errors propagate to fail fast
     """
-    try:
-        logger.info(f"Producer Pass 1 starting with limit={limit}")
-        qs = Article.objects.only("id", "plain_text_paragraphs")
-        if limit > 0:
-            qs = qs.order_by("id")[:limit]
-        
-        articles = qs.iterator(chunk_size=batch_size)
-        count = 0
-        
-        for article in articles:
-            article_queue.put((article.id, article.plain_text_paragraphs))
-            count += 1
-            if count % 100 == 0:
-                logger.info(f"Producer Pass 1: put {count} articles in queue")
-        
-        logger.info(f"Producer Pass 1: finished putting {count} articles")
-        # CRITICAL: Send end signal to ALL consumers to prevent deadlock
-        # Each consumer needs its own None signal to exit cleanly
-        for _ in range(num_consumers):
-            article_queue.put(None)
-        logger.info(f"Producer Pass 1: sent {num_consumers} end signals")
-        
-    except Exception as e:
-        logger.error(f"Producer Pass 1 error: {e}")
-        # Send end signals to all consumers even on error
-        for _ in range(num_consumers):
-            article_queue.put(None)
-
-
-def producer_pass2(article_queue: Queue, batch_size: int, limit: int, num_consumers: int) -> None:
-    """
-    Producer thread for Pass 2: fetch articles from database and put in queue.
+    logger.info(f"Producer Pass 1 starting with limit={limit}")
+    qs = Article.objects.only("id", "plain_text_paragraphs")
+    if limit > 0:
+        qs = qs.order_by("id")[:limit]
     
-    Similar to producer_pass1 but for the TF-IDF computation phase. Fetches articles
-    from the database and queues them for GPU batch processing.
+    articles = qs.iterator(chunk_size=batch_size)
+    count = 0
     
-    Args:
-        article_queue: Multiprocessing Queue for (article_id, paragraphs) tuples
-        batch_size: Number of articles to fetch per database query
-        limit: Maximum number of articles to process (0 = no limit)
-        num_consumers: Number of consumer processes (for end signal count)
-        
-    Implementation:
-        - Fetches articles using Django ORM with iterator for memory efficiency
-        - Puts (article_id, plain_text_paragraphs) tuples in queue
-        - Sends end signals to all consumers when done
-        - Handles exceptions by sending end signals to all consumers
-    """
-    try:
-        qs = Article.objects.only("id", "plain_text_paragraphs")
-        if limit > 0:
-            qs = qs.order_by("id")[:limit]
-        
-        articles = qs.iterator(chunk_size=batch_size)
-        
-        for article in articles:
-            article_queue.put((article.id, article.plain_text_paragraphs))
-        
-        # CRITICAL: Send end signal to ALL consumers to prevent deadlock
-        # Each consumer needs its own None signal to exit cleanly
-        for _ in range(num_consumers):
-            article_queue.put(None)
-        
-    except Exception as e:
-        logger.error(f"Producer Pass 2 error: {e}")
-        # Send end signals to all consumers even on error
-        for _ in range(num_consumers):
-            article_queue.put(None)
+    for article in articles:
+        article_queue.put((article.id, article.plain_text_paragraphs))
+        count += 1
+        if count % 100 == 0:
+            logger.info(f"Producer Pass 1: put {count} articles in queue")
+    
+    logger.info(f"Producer Pass 1: finished putting {count} articles")
+    # CRITICAL: Send end signal to ALL consumers to prevent deadlock
+    # Each consumer needs its own None signal to exit cleanly
+    for _ in range(num_consumers):
+        article_queue.put(None)
+    logger.info(f"Producer Pass 1: sent {num_consumers} end signals")
 
 
 def consumer_pass1(article_queue: Queue, result_queue: Queue) -> None:
@@ -610,94 +563,55 @@ def consumer_pass1(article_queue: Queue, result_queue: Queue) -> None:
         - Tokenizes paragraphs using NLTK tokenizer from search_engine.tokenizer
         - Computes local document frequency counter for unique terms
         - Sends None signal when complete to indicate process finished
-        - Handles exceptions by sending None signal and logging error
+        - Let errors propagate to fail fast
     """
-    try:
-        logger.info("Consumer Pass 1 starting")
-        batch = []
-        batch_size = 100  # Process articles in small batches
-        processed_count = 0
+    logger.info("Consumer Pass 1 starting")
+    batch = []
+    batch_size = 100  # Process articles in small batches
+    processed_count = 0
+    
+    while True:
+        # Avoid per-item log spam in hot loop unless verbose logging is globally enabled
+        # logger.info("Consumer Pass 1: waiting for item from queue")
+        item = article_queue.get()
+        # logger.info(f"Consumer Pass 1: got item {item}")
+        if item is None:  # End signal
+            logger.info("Consumer Pass 1: received end signal")
+            break
         
-        while True:
-            # Avoid per-item log spam in hot loop unless verbose logging is globally enabled
-            # logger.info("Consumer Pass 1: waiting for item from queue")
-            item = article_queue.get()
-            # logger.info(f"Consumer Pass 1: got item {item}")
-            if item is None:  # End signal
-                logger.info("Consumer Pass 1: received end signal")
-                break
-            
-            batch.append(item)
-            processed_count += 1
-            
-            if len(batch) >= batch_size:
-                # Process batch
-                logger.info(f"Consumer Pass 1: processing batch of {len(batch)} articles")
-                doc_freq = _compute_doc_freq_batch(batch)
-                result_queue.put(doc_freq)
-                batch = []
+        batch.append(item)
+        processed_count += 1
         
-        # Process remaining items
-        if batch:
-            logger.info(f"Consumer Pass 1: processing final batch of {len(batch)} articles")
+        if len(batch) >= batch_size:
+            # Process batch
+            logger.info(f"Consumer Pass 1: processing batch of {len(batch)} articles")
             doc_freq = _compute_doc_freq_batch(batch)
             result_queue.put(doc_freq)
-        
-        logger.info(f"Consumer Pass 1: processed {processed_count} articles total")
-        # Signal completion
-        result_queue.put(None)
-        logger.info("Consumer Pass 1: sent completion signal")
-        
-    except Exception as e:
-        logger.error(f"Consumer Pass 1 error: {e}")
-        result_queue.put(None)
-
-
-def gpu_batch_processor(
-    article_batch: List[Tuple[int, List[str]]],
-    term_to_id: Dict[str, int],
-    term_to_idf: Dict[str, float],
-    device,
-    result_queue: Queue
-) -> None:
-    """
-    GPU batch processor for Pass 2: process articles on GPU.
+            batch = []
     
-    Processes a batch of articles on GPU using the tfidf_workers module.
-    Handles GPU processing errors gracefully by returning empty results.
+    # Process remaining items
+    if batch:
+        logger.info(f"Consumer Pass 1: processing final batch of {len(batch)} articles")
+        doc_freq = _compute_doc_freq_batch(batch)
+        result_queue.put(doc_freq)
     
-    Args:
-        article_batch: List of (article_id, paragraphs) tuples to process
-        term_to_id: Mapping from vocabulary terms to term IDs
-        term_to_idf: Mapping from vocabulary terms to IDF values
-        device: PyTorch device (cuda/cpu) for GPU processing
-        result_queue: Queue for sending (tfidf_tuples, inverted_tuples) results
-        
-    Implementation:
-        - Calls _build_tfidf_batch_gpu from tfidf_workers module
-        - Returns empty tuples on error to prevent pipeline failure
-        - Logs errors for debugging
-    """
-    try:
-        tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu(
-            article_batch, term_to_id, term_to_idf, device
-        )
-        result_queue.put((tfidf_tuples, inverted_tuples))
-        
-    except Exception as e:
-        logger.error(f"GPU batch processor error: {e}")
-        result_queue.put(([], []))
+    logger.info(f"Consumer Pass 1: processed {processed_count} articles total")
+    # Signal completion
+    result_queue.put(None)
+    logger.info("Consumer Pass 1: sent completion signal")
 
 
 class Command(BaseCommand):
     """
     Django management command for building TF-IDF index and inverted index.
     
-    Implements a two-pass GPU-accelerated architecture:
-    1. Pass 1: Document frequency computation using producer-consumer pattern
-    2. Pass 2: GPU-accelerated TF-IDF computation with async database writes
+    Implements a two-pass GPU-accelerated architecture with fail-fast validation:
+    1. Early validation of all prerequisites (GPU, database, tables, parameters)
+    2. Pass 1: Document frequency computation using producer-consumer pattern
+    3. Pass 2: GPU-accelerated TF-IDF computation with async database writes
     
     Uses PostgreSQL COPY for optimal database performance and PyTorch for GPU acceleration.
+    All validation happens before processing begins to fail fast with clear error messages.
     """
     help = "Build TF-IDF index and inverted index over Article.plain_text_paragraphs using GPU acceleration with producer-consumer architecture"
 
@@ -737,17 +651,151 @@ class Command(BaseCommand):
         parser.add_argument("--reader-threads", type=int, default=16, help="Number of database reader threads (default: 16)")
         parser.add_argument("--split-writer-pools", action="store_true", help="Enable separate writer pools for TF-IDF vs inverted index")
 
+    def _validate_prerequisites(self, options) -> Any:
+        """
+        Validate all prerequisites before processing. Returns GPU device.
+        
+        Performs comprehensive validation of:
+        - PyTorch availability and version
+        - GPU availability and memory
+        - Database connection
+        - Required table existence
+        - Article count > 0
+        
+        Args:
+            options: Command-line options dictionary
+            
+        Returns:
+            torch.device: Validated GPU device
+            
+        Raises:
+            CommandError: If any prerequisite validation fails
+        """
+        # 1. PyTorch validation
+        try:
+            import torch
+        except ImportError:
+            raise CommandError("PyTorch is required. Install with: pip install torch")
+        
+        # 2. GPU validation
+        if not torch.cuda.is_available():
+            raise CommandError("GPU acceleration required but no GPU detected. Check CUDA/ROCm installation.")
+        
+        # Get GPU info for validation
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        device = torch.device('cuda')
+        
+        self.stdout.write(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
+        logger.info(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
+        
+        # 3. Database connection validation
+        try:
+            from django.db import connection
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+        except Exception as e:
+            raise CommandError(f"Database connection failed: {e}")
+        
+        # 4. Table existence validation
+        self._validate_database_state(options["rebuild"])
+        
+        return device
+
+    def _validate_parameters(self, options) -> Dict[str, Any]:
+        """
+        Validate and normalize all command parameters.
+        
+        Args:
+            options: Command-line options dictionary
+            
+        Returns:
+            Dict[str, Any]: Validated and normalized parameters
+            
+        Raises:
+            CommandError: If any parameter validation fails
+        """
+        params = {}
+        
+        # Extract and validate parameters
+        params['batch_size'] = options["db-fetch-batch-size"]
+        if params['batch_size'] <= 0:
+            raise CommandError(f"db-fetch-batch-size must be > 0, got {params['batch_size']}")
+        
+        params['limit'] = options["max-articles"]
+        if params['limit'] < 0:
+            raise CommandError(f"max-articles must be >= 0, got {params['limit']}")
+        
+        params['workers'] = options["tokenizer-processes"]
+        if params['workers'] < 1:
+            raise CommandError(f"tokenizer-processes must be >= 1, got {params['workers']}")
+        
+        params['db_workers'] = options["writer-threads"]
+        if params['db_workers'] < 1:
+            raise CommandError(f"writer-threads must be >= 1, got {params['db_workers']}")
+        
+        params['reader_workers'] = options["reader-threads"]
+        if params['reader_workers'] < 1:
+            raise CommandError(f"reader-threads must be >= 1, got {params['reader_workers']}")
+        
+        params['gpu_consumers'] = options["gpu-threads"]
+        if params['gpu_consumers'] < 1:
+            raise CommandError(f"gpu-threads must be >= 1, got {params['gpu_consumers']}")
+        
+        params['gpu_batch_size'] = options["gpu-process-batch-size"]
+        if params['gpu_batch_size'] <= 0:
+            raise CommandError(f"gpu-process-batch-size must be > 0, got {params['gpu_batch_size']}")
+        
+        # Additional options
+        params['rebuild'] = options["rebuild"]
+        params['enable_profiling'] = options["profile"]
+        params['use_gpu'] = options["use-gpu"]
+        params['optimize_inverted_bulk'] = options["bulk-inverted-index"]
+        params['separate_writers'] = options["split-writer-pools"]
+        
+        return params
+
+    def _validate_database_state(self, rebuild: bool) -> int:
+        """
+        Validate database state and return article count.
+        
+        Args:
+            rebuild: Whether to rebuild existing indexes
+            
+        Returns:
+            int: Number of articles available for processing
+            
+        Raises:
+            CommandError: If database state is invalid
+        """
+        from django.db import connection
+        
+        # Check required tables exist
+        with connection.cursor() as cursor:
+            tables = ['search_engine_article', 'search_engine_vocabulary', 
+                      'search_engine_tfidfindex', 'search_engine_invertedindex']
+            for table in tables:
+                cursor.execute(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
+                    [table]
+                )
+                if not cursor.fetchone()[0]:
+                    raise CommandError(f"Required table {table} does not exist. Run migrations first.")
+        
+        # Get article count
+        count = Article.objects.count()
+        if count == 0:
+            raise CommandError("No articles found. Run 'python manage.py load_wiki_dump' first.")
+        
+        return count
+
     def handle(self, *args, **options):
         """
         Main command execution handler for TF-IDF index building.
         
-        Implements a two-pass GPU-accelerated architecture with producer-consumer patterns:
+        Implements a two-pass GPU-accelerated architecture with fail-fast validation:
         
-        1. Setup and GPU Validation:
-           - Validates GPU availability and PyTorch installation
-           - Configures multiprocessing context for GPU compatibility
-           - Clears existing indexes if --rebuild specified
-           
+        1. Early validation of all prerequisites (GPU, database, tables, parameters)
         2. Pass 1 - Document Frequency Computation:
            - Producer threads fetch articles from database
            - Consumer processes tokenize articles and compute document frequency
@@ -771,8 +819,7 @@ class Command(BaseCommand):
             **options: Command-line options from add_arguments()
             
         Raises:
-            RuntimeError: If GPU acceleration requested but not available
-            ImportError: If PyTorch not installed when GPU requested
+            CommandError: If any prerequisite validation fails
             
         Performance:
             - 19.5 articles/second throughput (1000 articles in 51.33s)
@@ -784,18 +831,23 @@ class Command(BaseCommand):
             logging.basicConfig(level=logging.INFO, 
                              format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         
-        batch_size = options["db-fetch-batch-size"]
-        limit = options["max-articles"]
-        rebuild = options["rebuild"]
-        workers = options["tokenizer-processes"]
-        db_workers = options["writer-threads"]
-        enable_profiling = options["profile"]
-        use_gpu = options["use-gpu"]
-        gpu_batch_size = options["gpu-process-batch-size"]
-        optimize_inverted_bulk = options["bulk-inverted-index"]
-        gpu_consumers = options["gpu-threads"]
-        reader_workers = options["reader-threads"]
-        separate_writers = options["split-writer-pools"]
+        # IMMEDIATE validation - fail fast
+        device = self._validate_prerequisites(options)
+        params = self._validate_parameters(options)
+        
+        # Extract validated parameters
+        batch_size = params['batch_size']
+        limit = params['limit']
+        rebuild = params['rebuild']
+        workers = params['workers']
+        db_workers = params['db_workers']
+        enable_profiling = params['enable_profiling']
+        use_gpu = params['use_gpu']
+        gpu_batch_size = params['gpu_batch_size']
+        optimize_inverted_bulk = params['optimize_inverted_bulk']
+        gpu_consumers = params['gpu_consumers']
+        reader_workers = params['reader_workers']
+        separate_writers = params['separate_writers']
         
         # Initialize profilers
         profiler_pass1 = None
@@ -804,42 +856,22 @@ class Command(BaseCommand):
         
         start_time = time.perf_counter()
         
-        # GPU validation - fail fast if not available
-        # Fail fast if GPU not available - no CPU fallback allowed
-        if use_gpu:
-            try:
-                import torch
-                if not torch.cuda.is_available():
-                    raise RuntimeError("GPU acceleration requested but no GPU available")
-                
-                gpu_name = torch.cuda.get_device_name(0)
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                self.stdout.write(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
-                logger.info(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
-                
-                device = torch.device('cuda')
-
-                # Auto-scale GPU batch size if user left default (opt-in heuristic)
-                if options["gpu-process-batch-size"] in (None, 1000):
-                    # Heuristic based on observed tokens/article and memory overhead
-                    # Conservative targets to avoid OOM; user can override explicitly
-                    if gpu_memory >= 24:
-                        gpu_batch_size = 25000
-                    elif gpu_memory >= 16:
-                        gpu_batch_size = 15000
-                    elif gpu_memory >= 12:
-                        gpu_batch_size = 10000
-                    elif gpu_memory >= 8:
-                        gpu_batch_size = 6000
-                    else:
-                        gpu_batch_size = 3000
-                
-            except ImportError:
-                raise RuntimeError("GPU acceleration requested but PyTorch not available")
-            except RuntimeError as e:
-                raise RuntimeError(f"GPU acceleration failed: {e}")
-        else:
-            raise RuntimeError("GPU acceleration is required - CPU fallback not supported")
+        # Auto-scale GPU batch size if user left default (opt-in heuristic)
+        if options["gpu-process-batch-size"] in (None, 1000):
+            import torch
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            # Heuristic based on observed tokens/article and memory overhead
+            # Conservative targets to avoid OOM; user can override explicitly
+            if gpu_memory >= 24:
+                gpu_batch_size = 25000
+            elif gpu_memory >= 16:
+                gpu_batch_size = 15000
+            elif gpu_memory >= 12:
+                gpu_batch_size = 10000
+            elif gpu_memory >= 8:
+                gpu_batch_size = 6000
+            else:
+                gpu_batch_size = 3000
         
         if rebuild:
             self.stdout.write("Clearing existing indexes...")
@@ -853,9 +885,6 @@ class Command(BaseCommand):
             qs = qs.order_by("id")[:limit]
         
         total_articles = qs.count()
-        if total_articles == 0:
-            self.stdout.write(self.style.WARNING("No articles found to process"))
-            return
         
         # Limit workers for small datasets to avoid too many consumers
         workers = min(workers, max(1, total_articles // 100))
