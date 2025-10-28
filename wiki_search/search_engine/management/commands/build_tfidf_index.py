@@ -439,7 +439,7 @@ class Command(BaseCommand):
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
         parser.add_argument("--use-gpu", action="store_true", default=True, help="Use GPU acceleration (default: True)")
-        parser.add_argument("--gpu-batch-size", type=int, default=1000, help="Articles per GPU batch (default: 1000)")
+        parser.add_argument("--gpu-batch-size", type=int, default=1000, help="Articles per GPU batch (default: 10000)")
         parser.add_argument("--test-mode", action="store_true", help="Test mode - bypass GPU requirements for development testing")
 
     def handle(self, *args, **options):
@@ -642,17 +642,32 @@ class Command(BaseCommand):
         with tqdm(total=total_terms, desc="Building vocabulary", unit="terms") as pbar:
             for i in range(0, total_terms, batch_size):
                 batch = vocab_data[i:i + batch_size]
-
-                for term, df, idf in batch:
-                    try:
-                        Vocabulary.objects.create(
-                            term=term,
-                            document_frequency=df,
-                            idf_value=idf
-                        )
-                    except Exception as individual_error:
-                        self.stdout.write(f"Failed to insert term '{term}': {individual_error}")
-                pbar.update(len(batch))
+                
+                try:
+                    with transaction.atomic():
+                        with connection.cursor() as cursor:
+                            # Use COPY for vocabulary insertion
+                            with cursor.copy(
+                                "COPY search_engine_vocabulary (term, document_frequency, idf_value) FROM STDIN"
+                            ) as copy:
+                                for term, df, idf in batch:
+                                    copy.write_row((term, df, idf))
+                    
+                    pbar.update(len(batch))
+                    
+                except Exception as e:
+                    self.stdout.write(f"Error inserting batch {i//batch_size + 1}: {e}")
+                    # Fallback to individual inserts for this batch
+                    for term, df, idf in batch:
+                        try:
+                            Vocabulary.objects.create(
+                                term=term,
+                                document_frequency=df,
+                                idf_value=idf
+                            )
+                        except Exception as individual_error:
+                            self.stdout.write(f"Failed to insert term '{term}': {individual_error}")
+                    pbar.update(len(batch))
         
         if enable_profiling and profiler_vocab is not None:
             profiler_vocab.disable()
