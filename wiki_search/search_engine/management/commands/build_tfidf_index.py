@@ -439,7 +439,7 @@ class Command(BaseCommand):
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
         parser.add_argument("--use-gpu", action="store_true", default=True, help="Use GPU acceleration (default: True)")
-        parser.add_argument("--gpu-batch-size", type=int, default=10000, help="Articles per GPU batch (default: 10000)")
+        parser.add_argument("--gpu-batch-size", type=int, default=100000, help="Articles per GPU batch (default: 100000)")
         parser.add_argument("--test-mode", action="store_true", help="Test mode - bypass GPU requirements for development testing")
 
     def handle(self, *args, **options):
@@ -496,7 +496,7 @@ class Command(BaseCommand):
         db_workers = options["db_workers"]
         enable_profiling = options.get("profile", False)
         use_gpu = options.get("use_gpu", True)  # Default to True
-        gpu_batch_size = options.get("gpu_batch_size", 10000)
+        gpu_batch_size = options.get("gpu_batch_size", 100000)
         test_mode = options.get("test_mode", False)
         
         # Initialize profilers
