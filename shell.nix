@@ -50,7 +50,7 @@ pkgs.mkShell {
         (torchvision.override { inherit torch; })
 
         django
-        psycopg2-binary
+        psycopg
         lxml
         orjson
         tqdm
