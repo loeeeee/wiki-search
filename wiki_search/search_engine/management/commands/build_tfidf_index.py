@@ -1,13 +1,12 @@
 """
-GPU-Accelerated TF-IDF Index and Inverted Index Builder with Fail-Fast Validation
+CPU-Based TF-IDF Index and Inverted Index Builder with Fail-Fast Validation
 
 This module implements a high-performance TF-IDF index builder using a two-pass
-producer-consumer architecture with GPU acceleration for Wikipedia article processing.
+producer-consumer architecture with CPU-only processing for Wikipedia article processing.
 
 Architecture:
     Early Validation (Fail-Fast):
-        - Validates PyTorch availability and GPU compatibility
-        - Checks database connection and required table existence
+        - Validates database connection and required table existence
         - Validates all command-line parameters before processing
         - Ensures article count > 0 before starting
     
@@ -16,28 +15,28 @@ Architecture:
         - Consumer processes tokenize articles and compute document frequency
         - Uses multiprocessing for CPU-intensive tokenization
     
-    Pass 2: GPU-Accelerated TF-IDF Computation
-        - Producer threads feed pretokenized data to GPU consumers
-        - GPU processes large batches (10k articles) for TF-IDF computation
+    Pass 2: CPU-Based TF-IDF Computation
+        - ProcessPool feeds pretokenized data to CPU consumer processes
+        - CPU processes large batches (10k articles) for TF-IDF computation
         - Async database writers flush results using PostgreSQL COPY
         - Separate writer pools for TF-IDF vs inverted index optimization
         - Bulk inverted index mode with single-session COPY
 
 Key Features:
     - Fail-fast validation catches issues in <1 second
-    - GPU acceleration with PyTorch (ROCm/CUDA support) - always enabled
+    - CPU-only processing with ProcessPool for true parallelism
     - Producer-consumer pattern eliminates database bottlenecks
     - PostgreSQL COPY for 3-5x faster bulk inserts
-    - Async database writes prevent blocking GPU computation
+    - Async database writes prevent blocking CPU computation
     - Separate writer thread pools for optimal performance
-    - Bulk inverted index processing for maximum efficiency
+    - ProcessPool-based CPU processing for maximum efficiency
     - Comprehensive error handling with clear error messages
     - Removed unused code for better maintainability
 
 Performance:
-    - 19.5 articles/second throughput (1000 articles in 51.33s)
+    - CPU-based computation with ProcessPool parallelism
     - Pass 1: 312 articles/second (document frequency)
-    - Pass 2: 22.3 articles/second (TF-IDF computation)
+    - Pass 2: CPU-optimized TF-IDF computation
 """
 
 from __future__ import annotations
@@ -48,12 +47,13 @@ import logging
 import os
 import pstats
 import queue
+import random
 import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from multiprocessing import Process, Queue  # Still needed for Pass 1
+from multiprocessing import Process, Queue, Manager  # Still needed for Pass 1, Manager for Pass 2
 from typing import Any, Dict, List, Tuple
 
 from django.conf import settings
@@ -460,55 +460,49 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_com
     return len(inverted_data)
 
 
-def gpu_consumer_pass2_threaded(
-    pretokenized_data: List[Tuple[int, List[str], List[int]]],
-    start_idx: int,
-    end_idx: int,
+def cpu_consumer_pass2_process(
+    batch: List[Tuple[int, List[str], List[int]]],
     term_to_id: Dict[str, int],
     term_to_idf: Dict[str, float],
-    device,
-    result_queue: queue.Queue
+    result_queue: Queue
 ) -> None:
     """
-    Thread-based GPU consumer for Pass 2: process batch slice without serialization overhead.
+    Process-based CPU consumer for Pass 2: process batch using CPU computation.
     
-    Processes a slice of pretokenized data using GPU acceleration and puts results
-    into a threading queue. This eliminates multiprocessing serialization overhead
-    by using shared memory access to pretokenized data and vocabulary mappings.
+    Processes a batch of pretokenized data using CPU-based TF-IDF computation and puts results
+    into a multiprocessing queue. Each process performs CPU-only computation for true parallelism
+    and process isolation.
     
     Args:
-        pretokenized_data: Complete list of pretokenized articles (shared memory)
-        start_idx: Starting index for this thread's batch slice
-        end_idx: Ending index for this thread's batch slice
-        term_to_id: Shared vocabulary mapping (no duplication)
-        term_to_idf: Shared IDF mapping (no duplication)
-        device: PyTorch device for GPU processing
-        result_queue: Threading queue for results (no serialization)
+        batch: List of pretokenized articles (article_id, tokens, token_counts)
+        term_to_id: Vocabulary mapping from term to term_id
+        term_to_idf: IDF mapping from term to IDF value
+        result_queue: Multiprocessing queue for results
         
     Implementation:
-        - Processes slice of pretokenized data directly from shared memory
-        - Uses GPU acceleration via tfidf_workers module
-        - Puts results into threading queue (no pickling/unpickling)
-        - Let GPU processing errors propagate to fail fast
+        - Uses CPU-based TF-IDF computation via tfidf_workers module
+        - Puts results into multiprocessing queue
+        - Let processing errors propagate to fail fast
         - Logs progress for monitoring and debugging
     """
-    batch = pretokenized_data[start_idx:end_idx]
-    logger.info(f"GPU Consumer Thread: processing batch slice [{start_idx}:{end_idx}] = {len(batch)} articles")
+    from .tfidf_workers import _build_tfidf_batch_cpu_from_tokens
+    
+    logger.info(f"CPU Consumer Process: processing batch of {len(batch)} articles")
     
     try:
-        tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
-            batch, term_to_id, term_to_idf, device
+        tfidf_tuples, inverted_tuples = _build_tfidf_batch_cpu_from_tokens(
+            batch, term_to_id, term_to_idf
         )
         
         result_queue.put((tfidf_tuples, inverted_tuples))
-        logger.info(f"GPU Consumer Thread: completed batch slice [{start_idx}:{end_idx}] - {len(tfidf_tuples)} TF-IDF vectors")
+        logger.info(f"CPU Consumer Process: completed batch - {len(tfidf_tuples)} TF-IDF vectors")
         
         # Send completion signal
         result_queue.put(None)
-        logger.info(f"GPU Consumer Thread: sent completion signal for slice [{start_idx}:{end_idx}]")
+        logger.info(f"CPU Consumer Process: sent completion signal")
         
     except Exception as e:
-        logger.error(f"GPU Consumer Thread error in slice [{start_idx}:{end_idx}]: {e}")
+        logger.error(f"CPU Consumer Process error: {e}")
         # Put empty result to prevent deadlock
         result_queue.put(([], []))
         result_queue.put(None)  # Send completion signal even on error
@@ -616,17 +610,17 @@ class Command(BaseCommand):
     """
     Django management command for building TF-IDF index and inverted index.
     
-    Implements a two-pass GPU-accelerated architecture with fail-fast validation:
-    1. Early validation of all prerequisites (GPU, database, tables, parameters)
+    Implements a two-pass CPU-only architecture with fail-fast validation:
+    1. Early validation of all prerequisites (database, tables, parameters)
     2. Pass 1: Document frequency computation using producer-consumer pattern
-    3. Pass 2: GPU-accelerated TF-IDF computation with async database writes
+    3. Pass 2: CPU-based TF-IDF computation with async database writes
     4. Separate writer pools for TF-IDF vs inverted index optimization
     5. Bulk inverted index processing with single-session COPY
     
-    Uses PostgreSQL COPY for optimal database performance and PyTorch for GPU acceleration.
+    Uses PostgreSQL COPY for optimal database performance and CPU-only processing.
     All validation happens before processing begins to fail fast with clear error messages.
     """
-    help = "Build TF-IDF index and inverted index over Article.plain_text_paragraphs using GPU acceleration with producer-consumer architecture"
+    help = "Build TF-IDF index and inverted index over Article.plain_text_paragraphs using CPU-only processing with producer-consumer architecture"
 
     def add_arguments(self, parser) -> None:
         """
@@ -654,17 +648,15 @@ class Command(BaseCommand):
         parser.add_argument("--writer-threads", type=int, default=96, help="Number of database writer threads (default: 96)")
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
-        parser.add_argument("--gpu-process-batch-size", type=int, default=1_000, help="Articles per GPU batch (default: 1_000)")
-        parser.add_argument("--gpu-threads", type=int, default=4, help="Number of parallel GPU consumer threads (default: 4)")
+        parser.add_argument("--cpu-process-batch-size", type=int, default=1_000, help="Articles per CPU batch (default: 1_000)")
+        parser.add_argument("--cpu-threads", type=int, default=os.cpu_count() or 4, help="Number of parallel CPU consumer processes (default: CPU cores)")
         parser.add_argument("--reader-threads", type=int, default=16, help="Number of database reader threads (default: 16)")
 
-    def _validate_prerequisites(self, options) -> Any:
+    def _validate_prerequisites(self, options) -> None:
         """
-        Validate all prerequisites before processing. Returns GPU device.
+        Validate all prerequisites before processing.
         
         Performs comprehensive validation of:
-        - PyTorch availability and version
-        - GPU availability and memory
         - Database connection
         - Required table existence
         - Article count > 0
@@ -672,31 +664,10 @@ class Command(BaseCommand):
         Args:
             options: Command-line options dictionary
             
-        Returns:
-            torch.device: Validated GPU device
-            
         Raises:
             CommandError: If any prerequisite validation fails
         """
-        # 1. PyTorch validation
-        try:
-            import torch
-        except ImportError:
-            raise CommandError("PyTorch is required. Install with: pip install torch")
-        
-        # 2. GPU validation
-        if not torch.cuda.is_available():
-            raise CommandError("GPU acceleration required but no GPU detected. Check CUDA/ROCm installation.")
-        
-        # Get GPU info for validation
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        device = torch.device('cuda')
-        
-        self.stdout.write(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
-        logger.info(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
-        
-        # 3. Database connection validation
+        # Database connection validation
         try:
             from django.db import connection
             with connection.cursor() as cursor:
@@ -704,10 +675,11 @@ class Command(BaseCommand):
         except Exception as e:
             raise CommandError(f"Database connection failed: {e}")
         
-        # 4. Table existence validation
+        # Table existence validation
         self._validate_database_state(options["rebuild"])
         
-        return device
+        self.stdout.write("CPU-only processing enabled")
+        logger.info("CPU-only processing enabled")
 
     def _validate_parameters(self, options) -> Dict[str, Any]:
         """
@@ -745,13 +717,13 @@ class Command(BaseCommand):
         if params['reader_workers'] < 1:
             raise CommandError(f"reader-threads must be >= 1, got {params['reader_workers']}")
         
-        params['gpu_consumers'] = options["gpu_threads"]
-        if params['gpu_consumers'] < 1:
-            raise CommandError(f"gpu-threads must be >= 1, got {params['gpu_consumers']}")
+        params['cpu_consumers'] = options["cpu_threads"]
+        if params['cpu_consumers'] < 1:
+            raise CommandError(f"cpu-threads must be >= 1, got {params['cpu_consumers']}")
         
-        params['gpu_batch_size'] = options["gpu_process_batch_size"]
-        if params['gpu_batch_size'] <= 0:
-            raise CommandError(f"gpu-process-batch-size must be > 0, got {params['gpu_batch_size']}")
+        params['cpu_batch_size'] = options["cpu_process_batch_size"]
+        if params['cpu_batch_size'] <= 0:
+            raise CommandError(f"cpu-process-batch-size must be > 0, got {params['cpu_batch_size']}")
         
         # Additional options
         params['rebuild'] = options["rebuild"]
@@ -797,9 +769,9 @@ class Command(BaseCommand):
         """
         Main command execution handler for TF-IDF index building.
         
-        Implements a two-pass GPU-accelerated architecture with fail-fast validation:
+        Implements a two-pass CPU-only architecture with fail-fast validation:
         
-        1. Early validation of all prerequisites (GPU, database, tables, parameters)
+        1. Early validation of all prerequisites (database, tables, parameters)
         2. Pass 1 - Document Frequency Computation:
            - Producer threads fetch articles from database
            - Consumer processes tokenize articles and compute document frequency
@@ -809,9 +781,9 @@ class Command(BaseCommand):
            - Computes IDF values from document frequencies
            - Uses PostgreSQL COPY for bulk vocabulary insertion
            
-        4. Pass 2 - GPU TF-IDF Computation:
-           - Producer threads fetch articles for GPU processing
-           - GPU processes large batches (10k articles) for TF-IDF computation
+        4. Pass 2 - CPU TF-IDF Computation:
+           - ProcessPool feeds pretokenized data to CPU consumer processes
+           - CPU processes large batches (10k articles) for TF-IDF computation
            - Async database writers flush results using PostgreSQL COPY
            
         5. Results and Statistics:
@@ -826,9 +798,9 @@ class Command(BaseCommand):
             CommandError: If any prerequisite validation fails
             
         Performance:
-            - 19.5 articles/second throughput (1000 articles in 51.33s)
+            - CPU-based computation with ProcessPool parallelism
             - Pass 1: 312 articles/second (document frequency)
-            - Pass 2: 22.3 articles/second (TF-IDF computation)
+            - Pass 2: CPU-optimized TF-IDF computation
         """
         # Setup logging
         if options["verbose"]:
@@ -836,7 +808,7 @@ class Command(BaseCommand):
                              format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         
         # IMMEDIATE validation - fail fast
-        device = self._validate_prerequisites(options)
+        self._validate_prerequisites(options)
         params = self._validate_parameters(options)
         
         # Extract validated parameters
@@ -846,8 +818,8 @@ class Command(BaseCommand):
         workers = params['workers']
         db_workers = params['db_workers']
         enable_profiling = params['enable_profiling']
-        gpu_batch_size = params['gpu_batch_size']
-        gpu_consumers = params['gpu_consumers']
+        cpu_batch_size = params['cpu_batch_size']
+        cpu_consumers = params['cpu_consumers']
         reader_workers = params['reader_workers']
         
         # Initialize profilers
@@ -856,23 +828,6 @@ class Command(BaseCommand):
         profiler_pass2 = None
         
         start_time = time.perf_counter()
-        
-        # Auto-scale GPU batch size if user left default (opt-in heuristic)
-        if options["gpu_process_batch_size"] in (None, 1000):
-            import torch
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            # Heuristic based on observed tokens/article and memory overhead
-            # Conservative targets to avoid OOM; user can override explicitly
-            if gpu_memory >= 24:
-                gpu_batch_size = 25000
-            elif gpu_memory >= 16:
-                gpu_batch_size = 15000
-            elif gpu_memory >= 12:
-                gpu_batch_size = 10000
-            elif gpu_memory >= 8:
-                gpu_batch_size = 6000
-            else:
-                gpu_batch_size = 3000
         
         if rebuild:
             self.stdout.write("Clearing existing indexes...")
@@ -891,7 +846,7 @@ class Command(BaseCommand):
         workers = min(workers, max(1, total_articles // 100))
         
         self.stdout.write(f"Processing {total_articles} articles with {workers} tokenizer processes, {db_workers} writer threads")
-        self.stdout.write(f"GPU process batch size: {gpu_batch_size} articles")
+        self.stdout.write(f"CPU process batch size: {cpu_batch_size} articles")
         
         # ============================================================================
         # Pass 1: Document Frequency Computation (Producer-Consumer with CPU)
@@ -1029,59 +984,56 @@ class Command(BaseCommand):
         term_to_idf = {v.term: float(v.idf_value) for v in Vocabulary.objects.only("term", "idf_value")}
         
         # ============================================================================
-        # Pass 2: GPU-Accelerated TF-IDF Computation (Threading Architecture with Concurrent Pipeline)
+        # Pass 2: CPU-Based TF-IDF Computation (ProcessPool Architecture with Concurrent Pipeline)
         # ============================================================================
         self.stdout.write("Pass 2: Building TF-IDF vectors and inverted index...")
-        self.stdout.write(f"Using {gpu_consumers} GPU threads, {reader_workers} reader threads")
+        self.stdout.write(f"Using {cpu_consumers} CPU processes, {reader_workers} reader threads")
         pass2_start = time.perf_counter()
         
         if enable_profiling:
             profiler_pass2 = cProfile.Profile()
             profiler_pass2.enable()
         
-        # Create threading queue for Pass 2 (no serialization overhead)
-        gpu_result_queue = queue.Queue()  # Results from GPU consumer threads
+        # Create multiprocessing manager for shared queue
+        manager = Manager()
+        cpu_result_queue = manager.Queue()  # Results from CPU consumer processes
         
-        # Calculate batch slices for GPU threads (no producer needed)
+        # Calculate batch slices for CPU processes
         total_pretokenized = len(pretokenized_all)
         self.stdout.write(f"Total pretokenized: {total_pretokenized}")
         
-        # Adjust number of GPU consumers if dataset is too small
-        actual_gpu_consumers = min(gpu_consumers, total_pretokenized)
-        articles_per_thread = max(1, total_pretokenized // actual_gpu_consumers)
+        # Adjust number of CPU consumers if dataset is too small
+        actual_cpu_consumers = min(cpu_consumers, total_pretokenized)
+        articles_per_process = max(1, total_pretokenized // actual_cpu_consumers)
         
-        logger.info(f"Pass 2: Using {actual_gpu_consumers} GPU threads for {total_pretokenized} articles")
+        logger.info(f"Pass 2: Using {actual_cpu_consumers} CPU processes for {total_pretokenized} articles")
         
-        # Start GPU consumer threads with slice indices (shared memory access)
-        gpu_consumer_threads = []
-        for i in range(actual_gpu_consumers):
-            start_idx = i * articles_per_thread
-            end_idx = min((i + 1) * articles_per_thread, total_pretokenized) if i < actual_gpu_consumers - 1 else total_pretokenized
+        # Split pretokenized data into batches for processes
+        batches = []
+        for i in range(actual_cpu_consumers):
+            start_idx = i * articles_per_process
+            end_idx = min((i + 1) * articles_per_process, total_pretokenized) if i < actual_cpu_consumers - 1 else total_pretokenized
             
-            # Skip empty slices
+            # Skip empty batches
             if start_idx >= end_idx:
                 continue
                 
-            thread = threading.Thread(
-                target=gpu_consumer_pass2_threaded,
-                args=(pretokenized_all, start_idx, end_idx, term_to_id, term_to_idf, device, gpu_result_queue)
-            )
-            thread.start()
-            gpu_consumer_threads.append(thread)
+            batch = pretokenized_all[start_idx:end_idx]
+            batches.append(batch)
         
-        # Update the expected number of consumers
-        gpu_consumers = len(gpu_consumer_threads)
+        # Update the actual number of processes based on non-empty batches
+        actual_cpu_consumers = len(batches)
         
         # Dynamic flush thresholds: optimize COPY performance while ensuring small runs still flush
         if total_articles >= 10000:
             TFIDF_FLUSH_THRESHOLD = 50000
         else:
-            TFIDF_FLUSH_THRESHOLD = max(gpu_batch_size, min(50000, gpu_batch_size * 3))
+            TFIDF_FLUSH_THRESHOLD = max(cpu_batch_size, min(50000, cpu_batch_size * 3))
         
         # Always use separate writer pools for optimal performance
         tfidf_writer_workers = max(1, db_workers // 2)
         
-        # GPU batch processing with concurrent pipeline and double-buffering
+        # CPU batch processing with concurrent pipeline and double-buffering
         tfidf_buffer = []
         inverted_all: List[Tuple[int, int, float]] = []
         db_futures = []
@@ -1093,21 +1045,32 @@ class Command(BaseCommand):
         with ThreadPoolExecutor(max_workers=reader_workers) as reader_executor, \
              ThreadPoolExecutor(max_workers=tfidf_writer_workers) as tfidf_executor:
             
-            # Process results from GPU consumer threads
-            completed_gpu_consumers = 0
+            # Start CPU consumer processes
+            cpu_processes = []
+            
+            for i, batch in enumerate(batches):
+                process = Process(
+                    target=cpu_consumer_pass2_process,
+                    args=(batch, term_to_id, term_to_idf, cpu_result_queue)
+                )
+                process.start()
+                cpu_processes.append(process)
+            
+            # Process results from CPU consumer processes
+            completed_cpu_processes = 0
             batch_idx = 0
             
             with tqdm(total=total_articles, desc="Pass 2 - TF-IDF") as pbar:
-                while completed_gpu_consumers < gpu_consumers:
+                while completed_cpu_processes < actual_cpu_consumers:
                     try:
-                        result = gpu_result_queue.get(timeout=30)  # Add timeout to prevent infinite hang
+                        result = cpu_result_queue.get(timeout=30)  # Add timeout to prevent infinite hang
                     except queue.Empty:
-                        logger.error(f"Timeout waiting for GPU result. Completed consumers: {completed_gpu_consumers}/{gpu_consumers}")
+                        logger.error(f"Timeout waiting for CPU result. Completed processes: {completed_cpu_processes}/{actual_cpu_consumers}")
                         break
                     
                     if result is None:
-                        completed_gpu_consumers += 1
-                        logger.info(f"GPU consumer completed: {completed_gpu_consumers}/{gpu_consumers}")
+                        completed_cpu_processes += 1
+                        logger.info(f"CPU process completed: {completed_cpu_processes}/{actual_cpu_consumers}")
                         continue
                     
                     tfidf_tuples, inverted_tuples = result
@@ -1119,11 +1082,10 @@ class Command(BaseCommand):
                     pbar.update(len(tfidf_tuples))
                     
                     # Submit prefetch for NEXT batch (while processing current)
-                    if batch_idx + 1 < gpu_consumers:
+                    if batch_idx + 1 < actual_cpu_consumers:
                         # Peek next batch article IDs
-                        next_start = (batch_idx + 1) * articles_per_thread
-                        next_end = min((batch_idx + 2) * articles_per_thread, total_pretokenized) if batch_idx + 1 < gpu_consumers - 1 else total_pretokenized
-                        next_article_ids = [pretokenized_all[i][0] for i in range(next_start, next_end)]
+                        next_batch = batches[batch_idx + 1]
+                        next_article_ids = [article_id for article_id, _, _ in next_batch]
                         
                         prefetch_buffer[batch_idx + 1] = reader_executor.submit(
                             prefetch_articles_async, next_article_ids, reader_executor
@@ -1166,8 +1128,8 @@ class Command(BaseCommand):
             inverted_created += flush_inverted_sync(inverted_all)
         
         # Cleanup
-        for thread in gpu_consumer_threads:
-            thread.join()
+        for process in cpu_processes:
+            process.join()
         
         if enable_profiling and profiler_pass2 is not None:
             profiler_pass2.disable()
@@ -1187,9 +1149,9 @@ class Command(BaseCommand):
         self.stdout.write(f"  - TF-IDF vectors created: {tfidf_created}")
         self.stdout.write(f"  - Inverted index entries: {inverted_created}")
         self.stdout.write(f"  - Tokenizer processes used: {workers}")
-        self.stdout.write(f"  - GPU threads: {gpu_consumers}")
+        self.stdout.write(f"  - CPU processes: {cpu_consumers}")
         self.stdout.write(f"  - Reader threads: {reader_workers}")
-        self.stdout.write(f"  - GPU process batch size: {gpu_batch_size}")
+        self.stdout.write(f"  - CPU process batch size: {cpu_batch_size}")
         self.stdout.write(f"  - Throughput: {total_articles/total_time:.1f} articles/second")
         
         # Show some statistics
@@ -1208,8 +1170,8 @@ class Command(BaseCommand):
         
         self.stdout.write(
             self.style.SUCCESS(
-                f"Optimized GPU-accelerated TF-IDF indexing complete. "
-                f"Processed {total_articles} articles in {total_time:.2f}s using {gpu_consumers} GPU threads "
+                f"Optimized CPU-based TF-IDF indexing complete. "
+                f"Processed {total_articles} articles in {total_time:.2f}s using {cpu_consumers} CPU processes "
                 f"and {reader_workers} reader threads."
             )
         )

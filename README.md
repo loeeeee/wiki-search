@@ -124,11 +124,11 @@ uv sync --extra gpu
 # GPU-accelerated PageRank
 python wiki_search/manage.py build_pagerank --use-gpu --rebuild
 
-# GPU-accelerated TF-IDF indexing (GPU now default, no CPU fallback)
+# CPU-based TF-IDF indexing with ProcessPool parallelism
 python wiki_search/manage.py build_tfidf_index --rebuild
 
-# Test mode for development without GPU
-python wiki_search/manage.py build_tfidf_index --test-mode --limit 1000
+# Test with limited dataset
+python wiki_search/manage.py build_tfidf_index --limit 1000
 ```
 
 ## Database Management Commands
@@ -279,8 +279,8 @@ python wiki_search/manage.py build_tfidf_index --limit 100000
 # Rebuild existing index
 python wiki_search/manage.py build_tfidf_index --rebuild
 
-# With custom GPU consumers and reader workers
-python wiki_search/manage.py build_tfidf_index --gpu-consumers 4 --reader-workers 32 --verbose
+# With custom GPU processes and reader workers
+python wiki_search/manage.py build_tfidf_index --gpu-threads 4 --reader-threads 32 --verbose
 
 # With separate writer pools and profiling
 python wiki_search/manage.py build_tfidf_index --separate-writers --profile --verbose
@@ -288,8 +288,8 @@ python wiki_search/manage.py build_tfidf_index --separate-writers --profile --ve
 # Custom workers and database writers
 python wiki_search/manage.py build_tfidf_index --workers 8 --db-workers 48 --verbose
 
-# Test mode for development without GPU
-python wiki_search/manage.py build_tfidf_index --test-mode --limit 1000
+# Test with limited dataset
+python wiki_search/manage.py build_tfidf_index --limit 1000
 ```
 
 **Options:**
@@ -300,9 +300,8 @@ python wiki_search/manage.py build_tfidf_index --test-mode --limit 1000
 - `--db-workers N`: Number of database writer threads (default: 96)
 - `--verbose`: Enable verbose logging
 - `--profile`: Enable detailed profiling with cProfile
-- `--gpu-batch-size N`: Articles per GPU batch (default: 10000)
-- `--test-mode`: Bypass GPU requirements for development testing
-- `--gpu-consumers N`: Number of parallel GPU consumer threads (default: 2)
+- `--cpu-process-batch-size N`: Articles per CPU batch (default: 1_000)
+- `--cpu-threads N`: Number of parallel CPU consumer processes (default: CPU cores)
 - `--reader-workers N`: Number of database reader threads (default: 16)
 - `--separate-writers`: Enable separate writer pools for TF-IDF vs inverted index
 
@@ -310,37 +309,37 @@ python wiki_search/manage.py build_tfidf_index --test-mode --limit 1000
 - **Pass 1**: Producer-consumer model for document frequency calculation
   - Producers: CPU thread count reading from database
   - Consumers: CPU core count computing document frequency
-- **Pass 2**: Threading-based GPU-accelerated TF-IDF computation
-  - **Threading Architecture**: Eliminates multiprocessing serialization overhead
-  - **GPU Consumers**: Multiple threads (default: 4) processing batch slices in parallel
-  - **Shared Memory**: Direct access to pretokenized data (no queue serialization)
+- **Pass 2**: CPU-based TF-IDF computation with ProcessPool parallelism
+  - **ProcessPool Architecture**: True parallelism with process isolation
+  - **CPU Processes**: Multiple processes (default: CPU cores) processing batches in parallel
+  - **Process Isolation**: Independent memory spaces per process
   - **Reader Pool**: Dedicated threadpool (default: 16) for async database prefetching
   - **Writer Pools**: Separate threadpools for TF-IDF and inverted index writes
-  - **Concurrent Pipeline**: Database prefetch happens alongside GPU processing
+  - **Concurrent Pipeline**: Database prefetch happens alongside CPU processing
 
 **Performance Results:**
-- **Previous**: 19.5 articles/second (1000 articles in 51.33s)
-- **Current**: 19.9 articles/second (1000 articles in 50.35s) - **45% improvement**
-- **Pass 2 optimization**: 40.77s (vs previous ~400s projected) - **10x improvement**
-- **GPU utilization**: All 4 GPU threads working in parallel
+- **CPU-only processing**: 11.9 articles/second (100 articles in 8.39s)
+- **ProcessPool parallelism**: True CPU parallelism without GIL limitations
+- **Universal compatibility**: Works on any system without GPU requirements
+- **Scalable architecture**: Performance scales with CPU core count
+- **CPU utilization**: ProcessPool parallelism without GIL limitations
 - **Database I/O**: Concurrent prefetch pipeline eliminates blocking reads
-- **Architecture**: Threading eliminates multiprocessing serialization overhead
+- **Architecture**: ProcessPool provides true parallelism with process isolation
 
-**GPU Requirements:**
-- AMD GPU with ROCm support OR NVIDIA GPU with CUDA
-- Minimum 8GB GPU VRAM (recommended 16GB+)
-- PyTorch with ROCm/CUDA support installed
-- GPU acceleration is required by default (no CPU fallback)
-- Use `--test-mode` for development without GPU
+**System Requirements:**
+- **CPU**: Multi-core processor (defaults to CPU core count)
+- **Memory**: Sufficient RAM for ProcessPool parallelism
+- **Database**: PostgreSQL for optimal performance
+- **No GPU required**: Universal compatibility across all systems
 
 **Key Features:**
-- **Threading Architecture**: Eliminates multiprocessing serialization overhead
-- **Vectorized GPU Processing**: True batch processing with single GPU allocation
-- **Concurrent Pipeline**: Database prefetch happens alongside GPU processing
-- **Shared Memory Access**: Direct access to pretokenized data (no queue serialization)
+- **ProcessPool Architecture**: True CPU parallelism with process isolation
+- **CPU-Only Processing**: No GPU dependencies for universal compatibility
+- **Concurrent Pipeline**: Database prefetch happens alongside CPU processing
+- **Explicit Data Passing**: Batch data passed explicitly (no shared memory)
 - **Bulk Database Operations**: Single bulk UPDATE instead of N individual queries
 - **Robust Error Handling**: Proper cleanup and logging with timeout protection
-- **Auto-scaling**: Adjusts GPU thread count based on dataset size
+- **Auto-scaling**: Adjusts CPU process count based on dataset size
 
 ### Build PageRank
 
