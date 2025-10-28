@@ -533,9 +533,6 @@ class Command(BaseCommand):
         else:
             raise RuntimeError("GPU acceleration is required - CPU fallback not supported")
         
-        # Configure multiprocessing context for GPU compatibility
-        mp_context = multiprocessing.get_context('spawn')
-        
         if rebuild:
             self.stdout.write("Clearing existing indexes...")
             InvertedIndex.objects.all().delete()

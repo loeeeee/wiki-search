@@ -592,3 +592,4 @@ For detailed implementation information, see the documentation in `docs-vibe/`:
 - [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md) - Original tokenizer configuration
 - [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/0037-nltk-tfidf-refactor.md) - NLTK TF-IDF refactor
 - [docs-vibe/0022-tfidf-gpu-overhaul.md](docs-vibe/0022-tfidf-gpu-overhaul.md) - TF-IDF GPU overhaul
+- [docs-vibe/0040-django-init-cleanup.md](docs-vibe/0040-django-init-cleanup.md) - Django initialization cleanup in TF-IDF workers
