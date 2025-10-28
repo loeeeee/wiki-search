@@ -44,6 +44,8 @@ For computational tasks, never fallback to slower procedure, always raise errors
 
 Always use fail-fast design.
 
+Always check and remove dead code in the script.
+
 ## Documentation
 
 Always document concise implementation details and basic usage in docs-vibe/ with a sequential file name.
