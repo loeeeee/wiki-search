@@ -55,3 +55,5 @@ Always create documentation in docs-vibe/ before start writing any code.
 Always update the newly created documentation at the end of the task to reflect the latest status of the code.
 
 Always update README.md after each task.
+
+If the task could not be finished in one-shot, always create a reflection documentation in docs-vibe/reflection after each task. The reflection document needs to describe the circumenstance that is causing the issues, and the solution, in addition to other important information. When a reflection document is created, never repeat its content in development report in docs-vibe.
