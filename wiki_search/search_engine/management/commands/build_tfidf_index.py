@@ -1026,20 +1026,32 @@ class Command(BaseCommand):
         
         # Calculate batch slices for GPU threads (no producer needed)
         total_pretokenized = len(pretokenized_all)
-        articles_per_thread = max(1, total_pretokenized // gpu_consumers)
+        
+        # Adjust number of GPU consumers if dataset is too small
+        actual_gpu_consumers = min(gpu_consumers, total_pretokenized)
+        articles_per_thread = max(1, total_pretokenized // actual_gpu_consumers)
+        
+        logger.info(f"Pass 2: Using {actual_gpu_consumers} GPU threads for {total_pretokenized} articles")
         
         # Start GPU consumer threads with slice indices (shared memory access)
         gpu_consumer_threads = []
-        for i in range(gpu_consumers):
+        for i in range(actual_gpu_consumers):
             start_idx = i * articles_per_thread
-            end_idx = min((i + 1) * articles_per_thread, total_pretokenized) if i < gpu_consumers - 1 else total_pretokenized
+            end_idx = min((i + 1) * articles_per_thread, total_pretokenized) if i < actual_gpu_consumers - 1 else total_pretokenized
             
+            # Skip empty slices
+            if start_idx >= end_idx:
+                continue
+                
             thread = threading.Thread(
                 target=gpu_consumer_pass2_threaded,
                 args=(pretokenized_all, start_idx, end_idx, term_to_id, term_to_idf, device, gpu_result_queue)
             )
             thread.start()
             gpu_consumer_threads.append(thread)
+        
+        # Update the expected number of consumers
+        gpu_consumers = len(gpu_consumer_threads)
         
         # Dynamic flush thresholds: optimize COPY performance while ensuring small runs still flush
         if total_articles >= 10000:
