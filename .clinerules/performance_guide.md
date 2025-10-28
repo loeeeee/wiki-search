@@ -8,3 +8,4 @@
 - The script should by default spawn the same number of consumer processes as the number of CPU cores.
 - The consumer process should never need Django context to start. They should take lean data types, and return lean data types.
 - When converting data from and to Django objects overwhelms the main process, the script should skip the Django ORM and directly interact with database.
+- Always submit job as early as possible, and leave the blocking operations at the end of each iteration.
