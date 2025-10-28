@@ -53,9 +53,8 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue  # Still needed for Pass 1
 from typing import Any, Dict, List, Tuple
-import multiprocessing
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
@@ -218,11 +217,19 @@ def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List
                         """
                     )
         
-        # Update paragraph_token_counts for articles (outside both branches)
-        for article_id, _vec, _l2_norm, token_counts_json in tfidf_data:
-            Article.objects.filter(id=article_id).update(
-                paragraph_token_counts=json.loads(token_counts_json)
-            )
+        # Bulk UPDATE paragraph_token_counts for articles (single query instead of N queries)
+        if tfidf_data:
+            with connection.cursor() as cursor:
+                # Use VALUES clause for bulk UPDATE - fix parameter binding
+                values_data = [(aid, json.dumps(tc)) for aid, _, _, tc in tfidf_data]
+                # Create VALUES string with proper parameter placeholders
+                values_str = ','.join(['(%s,%s)'] * len(values_data))
+                cursor.execute(f"""
+                    UPDATE search_engine_article AS a
+                    SET paragraph_token_counts = t.paragraph_token_counts::jsonb
+                    FROM (VALUES {values_str}) AS t(id, paragraph_token_counts)
+                    WHERE a.id = t.id::integer
+                """, [item for sublist in values_data for item in sublist])
     
     return len(tfidf_data)
 
@@ -435,76 +442,58 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_com
     return len(inverted_data)
 
 
-def gpu_consumer_pass2(
-    article_queue: Queue,
-    result_queue: Queue,
+def gpu_consumer_pass2_threaded(
+    pretokenized_data: List[Tuple[int, List[str], List[int]]],
+    start_idx: int,
+    end_idx: int,
     term_to_id: Dict[str, int],
     term_to_idf: Dict[str, float],
     device,
-    gpu_batch_size: int
+    result_queue: queue.Queue
 ) -> None:
     """
-    GPU consumer thread for Pass 2: process batches from queue in parallel.
+    Thread-based GPU consumer for Pass 2: process batch slice without serialization overhead.
     
-    Processes articles from the article_queue in GPU batches, computes TF-IDF vectors
-    and inverted index tuples, then sends results to the main process via result_queue.
-    This enables parallel GPU processing by having multiple consumer threads work
-    simultaneously on different batches.
+    Processes a slice of pretokenized data using GPU acceleration and puts results
+    into a threading queue. This eliminates multiprocessing serialization overhead
+    by using shared memory access to pretokenized data and vocabulary mappings.
     
     Args:
-        article_queue: Multiprocessing Queue containing (article_id, tokens, token_counts) tuples
-        result_queue: Multiprocessing Queue for sending (tfidf_tuples, inverted_tuples) results
-        term_to_id: Mapping from vocabulary terms to term IDs
-        term_to_idf: Mapping from vocabulary terms to IDF values
-        device: PyTorch device (cuda/cpu) for GPU processing
-        gpu_batch_size: Number of articles to process per GPU batch
+        pretokenized_data: Complete list of pretokenized articles (shared memory)
+        start_idx: Starting index for this thread's batch slice
+        end_idx: Ending index for this thread's batch slice
+        term_to_id: Shared vocabulary mapping (no duplication)
+        term_to_idf: Shared IDF mapping (no duplication)
+        device: PyTorch device for GPU processing
+        result_queue: Threading queue for results (no serialization)
         
     Implementation:
-        - Processes articles in batches of gpu_batch_size for efficiency
+        - Processes slice of pretokenized data directly from shared memory
         - Uses GPU acceleration via tfidf_workers module
+        - Puts results into threading queue (no pickling/unpickling)
         - Let GPU processing errors propagate to fail fast
-        - Sends None signal when complete to indicate thread finished
         - Logs progress for monitoring and debugging
     """
-    logger.info("GPU Consumer Pass 2 starting")
-    current_batch = []
-    processed_count = 0
+    batch = pretokenized_data[start_idx:end_idx]
+    logger.info(f"GPU Consumer Thread: processing batch slice [{start_idx}:{end_idx}] = {len(batch)} articles")
     
-    while True:
-        item = article_queue.get()
-        if item is None:  # End signal
-            logger.info("GPU Consumer Pass 2: received end signal")
-            break
-        
-        current_batch.append(item)
-        
-        if len(current_batch) >= gpu_batch_size:
-            # Process GPU batch
-            logger.info(f"GPU Consumer Pass 2: processing batch of {len(current_batch)} articles")
-            
-            tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
-                current_batch, term_to_id, term_to_idf, device
-            )
-            
-            result_queue.put((tfidf_tuples, inverted_tuples))
-            processed_count += len(current_batch)
-            current_batch = []
-    
-    # Process remaining articles
-    if current_batch:
-        logger.info(f"GPU Consumer Pass 2: processing final batch of {len(current_batch)} articles")
-        
+    try:
         tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
-            current_batch, term_to_id, term_to_idf, device
+            batch, term_to_id, term_to_idf, device
         )
         
         result_queue.put((tfidf_tuples, inverted_tuples))
-        processed_count += len(current_batch)
-    
-    logger.info(f"GPU Consumer Pass 2: processed {processed_count} articles total")
-    # Signal completion
-    result_queue.put(None)
-    logger.info("GPU Consumer Pass 2: sent completion signal")
+        logger.info(f"GPU Consumer Thread: completed batch slice [{start_idx}:{end_idx}] - {len(tfidf_tuples)} TF-IDF vectors")
+        
+        # Send completion signal
+        result_queue.put(None)
+        logger.info(f"GPU Consumer Thread: sent completion signal for slice [{start_idx}:{end_idx}]")
+        
+    except Exception as e:
+        logger.error(f"GPU Consumer Thread error in slice [{start_idx}:{end_idx}]: {e}")
+        # Put empty result to prevent deadlock
+        result_queue.put(([], []))
+        result_queue.put(None)  # Send completion signal even on error
 
 
 def producer_pass1(article_queue: Queue, batch_size: int, limit: int, num_consumers: int) -> None:
@@ -589,15 +578,15 @@ def consumer_pass1(article_queue: Queue, result_queue: Queue) -> None:
         if len(batch) >= batch_size:
             # Process batch
             logger.info(f"Consumer Pass 1: processing batch of {len(batch)} articles")
-            doc_freq = _compute_doc_freq_batch(batch)
-            result_queue.put(doc_freq)
+            doc_freq, pretokenized = _compute_doc_freq_batch(batch)
+            result_queue.put((doc_freq, pretokenized))
             batch = []
     
     # Process remaining items
     if batch:
         logger.info(f"Consumer Pass 1: processing final batch of {len(batch)} articles")
-        doc_freq = _compute_doc_freq_batch(batch)
-        result_queue.put(doc_freq)
+        doc_freq, pretokenized = _compute_doc_freq_batch(batch)
+        result_queue.put((doc_freq, pretokenized))
     
     logger.info(f"Consumer Pass 1: processed {processed_count} articles total")
     # Signal completion
@@ -927,9 +916,15 @@ class Command(BaseCommand):
         
         with tqdm(total=total_articles, desc="Pass 1 - Doc Freq") as pbar:
             while completed_consumers < workers:
-                result = result_queue.get()
+                try:
+                    result = result_queue.get(timeout=30)  # Add timeout to prevent infinite hang
+                except queue.Empty:
+                    logger.error(f"Timeout waiting for Pass 1 result. Completed consumers: {completed_consumers}/{workers}")
+                    break
+                
                 if result is None:
                     completed_consumers += 1
+                    logger.info(f"Pass 1 consumer completed: {completed_consumers}/{workers}")
                 else:
                     # result is a tuple: (doc_freq_counter, pretokenized_list)
                     doc_freq_part, pretokenized_part = result
@@ -1016,7 +1011,7 @@ class Command(BaseCommand):
         term_to_idf = {v.term: float(v.idf_value) for v in Vocabulary.objects.only("term", "idf_value")}
         
         # ============================================================================
-        # Pass 2: GPU-Accelerated TF-IDF Computation (Optimized Producer-Consumer with Multiple Threadpools)
+        # Pass 2: GPU-Accelerated TF-IDF Computation (Threading Architecture with Concurrent Pipeline)
         # ============================================================================
         self.stdout.write("Pass 2: Building TF-IDF vectors and inverted index...")
         self.stdout.write(f"Using {gpu_consumers} GPU threads, {reader_workers} reader threads")
@@ -1026,35 +1021,22 @@ class Command(BaseCommand):
             profiler_pass2 = cProfile.Profile()
             profiler_pass2.enable()
         
-        # Create queues for Pass 2
-        article_queue_pass2 = Queue()  # Unbounded queue for GPU processing
-        gpu_result_queue = Queue()  # Results from GPU consumers
+        # Create threading queue for Pass 2 (no serialization overhead)
+        gpu_result_queue = queue.Queue()  # Results from GPU consumer threads
         
-        # Start producer thread for Pass 2 - feed pretokenized tokens instead of paragraphs
-        def _producer_pass2_pretokenized(q: Queue, items: List[Tuple[int, List[str], List[int]]]):
-            try:
-                for item in items:
-                    q.put(item)
-                # Send end signal to ALL GPU consumers to prevent deadlock
-                for _ in range(gpu_consumers):
-                    q.put(None)
-            except Exception as e:
-                logger.error(f"Producer Pass 2 pretokenized error: {e}")
-                for _ in range(gpu_consumers):
-                    q.put(None)
-
-        producer_thread_pass2 = threading.Thread(
-            target=_producer_pass2_pretokenized,
-            args=(article_queue_pass2, pretokenized_all)
-        )
-        producer_thread_pass2.start()
+        # Calculate batch slices for GPU threads (no producer needed)
+        total_pretokenized = len(pretokenized_all)
+        articles_per_thread = max(1, total_pretokenized // gpu_consumers)
         
-        # Start GPU consumer threads for parallel processing
+        # Start GPU consumer threads with slice indices (shared memory access)
         gpu_consumer_threads = []
         for i in range(gpu_consumers):
+            start_idx = i * articles_per_thread
+            end_idx = min((i + 1) * articles_per_thread, total_pretokenized) if i < gpu_consumers - 1 else total_pretokenized
+            
             thread = threading.Thread(
-                target=gpu_consumer_pass2,
-                args=(article_queue_pass2, gpu_result_queue, term_to_id, term_to_idf, device, gpu_batch_size)
+                target=gpu_consumer_pass2_threaded,
+                args=(pretokenized_all, start_idx, end_idx, term_to_id, term_to_idf, device, gpu_result_queue)
             )
             thread.start()
             gpu_consumer_threads.append(thread)
@@ -1071,58 +1053,68 @@ class Command(BaseCommand):
         tfidf_writer_workers = max(1, db_workers // 2)
         inverted_writer_workers = max(1, db_workers // 2)
         
-        # GPU batch processing with async database writes and prefetching
+        # GPU batch processing with concurrent pipeline and double-buffering
         tfidf_buffer = []
-        inverted_buffer = []
         inverted_all: List[Tuple[int, int, float]] = []
         db_futures = []
         
-        # Prefetch queues for next batches
-        next_tfidf_article_ids = set()
-        next_inverted_term_ids = set()
-        next_inverted_article_ids = set()
+        # Double-buffering for continuous prefetch
+        prefetch_buffer = {}  # Future for next batch
+        current_articles = {}  # Articles for current batch
         
         with ThreadPoolExecutor(max_workers=reader_workers) as reader_executor, \
              ThreadPoolExecutor(max_workers=tfidf_writer_workers) as tfidf_executor, \
              ThreadPoolExecutor(max_workers=inverted_writer_workers) as inverted_executor:
             
-            # Process results from GPU consumers
+            # Process results from GPU consumer threads
             completed_gpu_consumers = 0
+            batch_idx = 0
             
             with tqdm(total=total_articles, desc="Pass 2 - TF-IDF") as pbar:
                 while completed_gpu_consumers < gpu_consumers:
-                    result = gpu_result_queue.get()
+                    try:
+                        result = gpu_result_queue.get(timeout=30)  # Add timeout to prevent infinite hang
+                    except queue.Empty:
+                        logger.error(f"Timeout waiting for GPU result. Completed consumers: {completed_gpu_consumers}/{gpu_consumers}")
+                        break
+                    
                     if result is None:
                         completed_gpu_consumers += 1
-                    else:
-                        tfidf_tuples, inverted_tuples = result
+                        logger.info(f"GPU consumer completed: {completed_gpu_consumers}/{gpu_consumers}")
+                        continue
+                    
+                    tfidf_tuples, inverted_tuples = result
+                    
+                    # Add to buffers
+                    tfidf_buffer.extend(tfidf_tuples)
+                    inverted_all.extend(inverted_tuples)
+                    
+                    pbar.update(len(tfidf_tuples))
+                    
+                    # Submit prefetch for NEXT batch (while processing current)
+                    if batch_idx + 1 < gpu_consumers:
+                        # Peek next batch article IDs
+                        next_start = (batch_idx + 1) * articles_per_thread
+                        next_end = min((batch_idx + 2) * articles_per_thread, total_pretokenized) if batch_idx + 1 < gpu_consumers - 1 else total_pretokenized
+                        next_article_ids = [pretokenized_all[i][0] for i in range(next_start, next_end)]
                         
-                        # Add to buffers
-                        tfidf_buffer.extend(tfidf_tuples)
-                        inverted_buffer.extend(inverted_tuples)
-                        # Always use bulk mode for inverted index
-                        inverted_all.extend(inverted_tuples)
-                        
-                        pbar.update(len(tfidf_tuples))
-                        
-                        # Prefetch data for next flush operations
-                        if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD * 0.8:  # Prefetch at 80% threshold
-                            article_ids = [tup[0] for tup in tfidf_buffer]
-                            next_tfidf_article_ids.update(article_ids)
-                        
-                        # Submit async writes with prefetched data
-                        if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD:
-                            # Prefetch articles for this flush
-                            prefetched_articles = prefetch_articles_async(
-                                list(next_tfidf_article_ids), reader_executor
-                            )
-                            next_tfidf_article_ids.clear()
-                            
-                            db_future = tfidf_executor.submit(
-                                flush_tfidf_sync, tfidf_buffer[:], False, prefetched_articles
-                            )
-                            db_futures.append(('tfidf', db_future))
-                            tfidf_buffer.clear()
+                        prefetch_buffer[batch_idx + 1] = reader_executor.submit(
+                            prefetch_articles_async, next_article_ids, reader_executor
+                        )
+                    
+                    # Wait for current batch prefetch
+                    if batch_idx in prefetch_buffer:
+                        current_articles = prefetch_buffer[batch_idx].result()
+                    
+                    # Submit async write (non-blocking)
+                    if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD:
+                        db_future = tfidf_executor.submit(
+                            flush_tfidf_sync, tfidf_buffer[:], False, current_articles
+                        )
+                        db_futures.append(('tfidf', db_future))
+                        tfidf_buffer.clear()
+                    
+                    batch_idx += 1
             
             # Wait for all DB writes to complete
             self.stdout.write("Waiting for database writes to complete...")
@@ -1144,10 +1136,9 @@ class Command(BaseCommand):
                 tfidf_created += flush_tfidf_sync(tfidf_buffer, False, prefetched_articles)
             
             # Always use bulk mode for inverted index - single-session COPY using all accumulated tuples
-            inverted_created += flush_inverted_sync(inverted_all if inverted_all else inverted_buffer)
+            inverted_created += flush_inverted_sync(inverted_all)
         
         # Cleanup
-        producer_thread_pass2.join()
         for thread in gpu_consumer_threads:
             thread.join()
         

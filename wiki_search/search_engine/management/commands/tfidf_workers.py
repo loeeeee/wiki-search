@@ -396,7 +396,12 @@ def _build_tfidf_batch_gpu_from_tokens(
     article_ids: List[int] = []
     article_tokens: List[List[str]] = []
     token_counts_list: List[List[int]] = []
-    for article_id, tokens, token_counts in pretokenized:
+    for item in pretokenized:
+        # Handle optional timestamp (4th element) from profiling
+        if len(item) == 4:
+            article_id, tokens, token_counts, _timestamp = item
+        else:
+            article_id, tokens, token_counts = item
         article_ids.append(article_id)
         article_tokens.append(tokens)
         token_counts_list.append(token_counts)
