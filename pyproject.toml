@@ -15,6 +15,7 @@ dependencies = [
     "tiktoken>=0.8.0", # GPT tokenizer
     "nltk>=3.9.0", # NLTK tokenizer
     "psutil>=7.1.1",
+    "torch>=2.9.0",
 ]
 
 [project.optional-dependencies]
