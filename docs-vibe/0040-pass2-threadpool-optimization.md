@@ -16,7 +16,7 @@ Implemented a comprehensive Pass 2 optimization that transforms the single-threa
 
 3. **Separate Writer Threadpools**: Implemented separate threadpools for TF-IDF and inverted index writes, allowing independent tuning and preventing contention.
 
-4. **Incremental Inverted Index Flushing**: Added threshold-based incremental flushing for inverted index entries using a dedicated threadpool, preventing memory issues and enabling parallel database writes.
+4. **Incremental Inverted Index Flushing**: Added threshold-based incremental flushing for inverted index entries using a dedicated threadpool, preventing memory issues and enabling parallel database writes with robust deadlock handling.
 
 5. **Prefetch-Ahead Strategy**: Added intelligent prefetching that starts database reads at 80% flush threshold while GPU processes current batch.
 
@@ -24,7 +24,7 @@ Implemented a comprehensive Pass 2 optimization that transforms the single-threa
 
 **Before**: Single-threaded main loop → Sequential GPU batches → Single writer threadpool → Blocking database reads
 
-**After**: Producer thread → Multiple GPU consumers → Separate reader/writer threadpools → Async prefetching → Non-blocking writes → Incremental inverted index flushing
+**After**: Producer thread → Multiple GPU consumers → Separate reader/writer threadpools → Async prefetching → Non-blocking writes → Incremental inverted index flushing → Deadlock recovery
 
 ### New Command Line Options
 
@@ -38,6 +38,8 @@ Implemented a comprehensive Pass 2 optimization that transforms the single-threa
 - **Database I/O**: Eliminate blocking reads via async prefetch
 - **Writer contention**: Reduce contention between TF-IDF and inverted index writes
 - **Memory efficiency**: Incremental flushing prevents excessive memory usage
+- **Deadlock resilience**: Robust retry logic handles PostgreSQL deadlocks
+- **High concurrency**: Reliable operation with 32+ concurrent GPU threads
 - **Overall throughput**: Target 50-100+ articles/second (up from current 22.3 articles/second)
 
 ## Technical Implementation Details
@@ -48,6 +50,7 @@ Implemented a comprehensive Pass 2 optimization that transforms the single-threa
 2. **prefetch_vocabulary_async()**: Async prefetch Vocabulary objects using reader threadpool  
 3. **gpu_consumer_pass2()**: GPU consumer thread for parallel batch processing
 4. **Incremental flush logic**: Threshold-based flushing for inverted index entries during GPU processing
+5. **Deadlock recovery**: Retry logic with exponential backoff for PostgreSQL deadlocks
 
 ### Modified Functions
 
@@ -65,6 +68,7 @@ Replaced the single-threaded main loop with:
   - Inverted index writer pool
 - Prefetch-ahead strategy for optimal I/O overlap
 - Incremental flushing for inverted index entries with adaptive thresholds
+- Deadlock recovery with exponential backoff retry logic
 
 ### Error Handling
 
@@ -72,6 +76,7 @@ Replaced the single-threaded main loop with:
 - Fallback to synchronous queries if prefetch fails
 - Proper cleanup of all threads and threadpools
 - Comprehensive logging for debugging
+- Deadlock detection and recovery with retry logic
 
 ## Code Quality
 

@@ -85,6 +85,8 @@ def _validate_database_state(self, rebuild: bool) -> int:
 - **Parallel operations**: Database writes happen concurrently with GPU processing
 - **Adaptive scaling**: Threshold automatically adjusts to dataset size
 - **Resource isolation**: Dedicated thread pool prevents contention
+- **Deadlock resilience**: Robust retry logic handles PostgreSQL deadlocks
+- **High concurrency**: Reliable operation with 32+ concurrent GPU threads
 
 ### 6. Code Cleanup
 
