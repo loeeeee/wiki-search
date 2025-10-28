@@ -647,7 +647,7 @@ class Command(BaseCommand):
         parser.add_argument("--writer-threads", type=int, default=96, help="Number of database writer threads (default: 96)")
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
-        parser.add_argument("--gpu-process-batch-size", type=int, default=100_000, help="Articles per GPU batch (default: 100_000)")
+        parser.add_argument("--gpu-process-batch-size", type=int, default=1_000, help="Articles per GPU batch (default: 1_000)")
         parser.add_argument("--gpu-threads", type=int, default=4, help="Number of parallel GPU consumer threads (default: 4)")
         parser.add_argument("--reader-threads", type=int, default=16, help="Number of database reader threads (default: 16)")
 
