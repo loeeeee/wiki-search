@@ -97,7 +97,7 @@ def compute_tfidf_batch_gpu(
             tf = compute_tf(tokens)
             # ... GPU-accelerated vector operations
             values = torch.tensor(list(vec_dict.values()), device=device)
-            norm = vector_l2_norm_gpu(values).item()
+            norm = torch.norm(values, p=2).item()
 ```
 
 **Performance Benefits:**
@@ -311,8 +311,6 @@ python manage.py build_tfidf_index --use-gpu
 
 **TF-IDF GPU Functions:**
 - `compute_tfidf_batch_gpu()` - Batch GPU TF-IDF computation
-- `vector_l2_norm_gpu()` - GPU-accelerated L2 norm
-- `cosine_similarity_batch_gpu()` - Batch GPU cosine similarity
 - `_build_tfidf_batch_gpu()` - GPU worker function
 
 ## Success Criteria Met
