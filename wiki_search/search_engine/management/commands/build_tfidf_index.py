@@ -645,9 +645,9 @@ class Command(BaseCommand):
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
         parser.add_argument("--use-gpu", action="store_true", default=True, help="Use GPU acceleration (default: True)")
-        parser.add_argument("--gpu-process-batch-size", type=int, default=1000, help="Articles per GPU batch (default: 10000)")
+        parser.add_argument("--gpu-process-batch-size", type=int, default=100_000, help="Articles per GPU batch (default: 100_000)")
         parser.add_argument("--bulk-inverted-index", action="store_true", help="Drop/recreate inverted unique index and use single-session COPY")
-        parser.add_argument("--gpu-threads", type=int, default=2, help="Number of parallel GPU consumer threads (default: 2)")
+        parser.add_argument("--gpu-threads", type=int, default=4, help="Number of parallel GPU consumer threads (default: 4)")
         parser.add_argument("--reader-threads", type=int, default=16, help="Number of database reader threads (default: 16)")
         parser.add_argument("--split-writer-pools", action="store_true", help="Enable separate writer pools for TF-IDF vs inverted index")
 
@@ -718,40 +718,40 @@ class Command(BaseCommand):
         params = {}
         
         # Extract and validate parameters
-        params['batch_size'] = options["db-fetch-batch-size"]
+        params['batch_size'] = options["db_fetch_batch_size"]
         if params['batch_size'] <= 0:
             raise CommandError(f"db-fetch-batch-size must be > 0, got {params['batch_size']}")
         
-        params['limit'] = options["max-articles"]
+        params['limit'] = options["max_articles"]
         if params['limit'] < 0:
             raise CommandError(f"max-articles must be >= 0, got {params['limit']}")
         
-        params['workers'] = options["tokenizer-processes"]
+        params['workers'] = options["tokenizer_processes"]
         if params['workers'] < 1:
             raise CommandError(f"tokenizer-processes must be >= 1, got {params['workers']}")
         
-        params['db_workers'] = options["writer-threads"]
+        params['db_workers'] = options["writer_threads"]
         if params['db_workers'] < 1:
             raise CommandError(f"writer-threads must be >= 1, got {params['db_workers']}")
         
-        params['reader_workers'] = options["reader-threads"]
+        params['reader_workers'] = options["reader_threads"]
         if params['reader_workers'] < 1:
             raise CommandError(f"reader-threads must be >= 1, got {params['reader_workers']}")
         
-        params['gpu_consumers'] = options["gpu-threads"]
+        params['gpu_consumers'] = options["gpu_threads"]
         if params['gpu_consumers'] < 1:
             raise CommandError(f"gpu-threads must be >= 1, got {params['gpu_consumers']}")
         
-        params['gpu_batch_size'] = options["gpu-process-batch-size"]
+        params['gpu_batch_size'] = options["gpu_process_batch_size"]
         if params['gpu_batch_size'] <= 0:
             raise CommandError(f"gpu-process-batch-size must be > 0, got {params['gpu_batch_size']}")
         
         # Additional options
         params['rebuild'] = options["rebuild"]
         params['enable_profiling'] = options["profile"]
-        params['use_gpu'] = options["use-gpu"]
-        params['optimize_inverted_bulk'] = options["bulk-inverted-index"]
-        params['separate_writers'] = options["split-writer-pools"]
+        params['use_gpu'] = options["use_gpu"]
+        params['optimize_inverted_bulk'] = options["bulk_inverted_index"]
+        params['separate_writers'] = options["split_writer_pools"]
         
         return params
 
@@ -857,7 +857,7 @@ class Command(BaseCommand):
         start_time = time.perf_counter()
         
         # Auto-scale GPU batch size if user left default (opt-in heuristic)
-        if options["gpu-process-batch-size"] in (None, 1000):
+        if options["gpu_process_batch_size"] in (None, 1000):
             import torch
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             # Heuristic based on observed tokens/article and memory overhead
