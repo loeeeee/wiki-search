@@ -270,17 +270,20 @@ python wiki_search/manage.py resolve_links --rebuild --batch-size 5000 --db-work
 
 ### Build TF-IDF Index
 
-Build TF-IDF index and inverted index for search functionality using GPU acceleration with producer-consumer architecture:
+Build TF-IDF index and inverted index for search functionality using optimized GPU acceleration with multiple threadpools:
 
 ```bash
-# Build TF-IDF index with GPU acceleration (default)
+# Build TF-IDF index with optimized GPU acceleration (default)
 python wiki_search/manage.py build_tfidf_index --limit 100000
 
 # Rebuild existing index
 python wiki_search/manage.py build_tfidf_index --rebuild
 
-# With custom GPU batch size and profiling
-python wiki_search/manage.py build_tfidf_index --gpu-batch-size 5000 --profile --verbose
+# With custom GPU consumers and reader workers
+python wiki_search/manage.py build_tfidf_index --gpu-consumers 4 --reader-workers 32 --verbose
+
+# With separate writer pools and profiling
+python wiki_search/manage.py build_tfidf_index --separate-writers --profile --verbose
 
 # Custom workers and database writers
 python wiki_search/manage.py build_tfidf_index --workers 8 --db-workers 48 --verbose
@@ -299,22 +302,27 @@ python wiki_search/manage.py build_tfidf_index --test-mode --limit 1000
 - `--profile`: Enable detailed profiling with cProfile
 - `--gpu-batch-size N`: Articles per GPU batch (default: 10000)
 - `--test-mode`: Bypass GPU requirements for development testing
+- `--gpu-consumers N`: Number of parallel GPU consumer threads (default: 2)
+- `--reader-workers N`: Number of database reader threads (default: 16)
+- `--separate-writers`: Enable separate writer pools for TF-IDF vs inverted index
 
-**Architecture:**
+**Optimized Architecture:**
 - **Pass 1**: Producer-consumer model for document frequency calculation
-  - Producers: CPU thread count (32 threads) reading from database
-  - Consumers: CPU core count (16 processes) computing document frequency
-- **Pass 2**: GPU-accelerated TF-IDF computation
   - Producers: CPU thread count reading from database
-  - GPU Processing: Fixed 10k article batches on GPU
-  - Database Writers: Async ThreadPoolExecutor with large flush thresholds
+  - Consumers: CPU core count computing document frequency
+- **Pass 2**: Multi-threaded GPU-accelerated TF-IDF computation
+  - Producer: Single thread feeding pretokenized articles
+  - GPU Consumers: Multiple threads (default: 2) processing batches in parallel
+  - Reader Pool: Dedicated threadpool (default: 16) for async database prefetching
+  - Writer Pools: Separate threadpools for TF-IDF and inverted index writes
+  - Prefetch Strategy: Intelligent prefetching at 80% flush threshold
 
 **Performance Results:**
-- **10 articles**: 1.19s (8.4 articles/second)
-- **100 articles**: 8.84s (11.3 articles/second)
-- **1000 articles**: 51.33s (19.5 articles/second)
-- **Pass 1**: 3.21s for 1000 articles (312 articles/second)
-- **Pass 2**: 44.85s for 1000 articles (22.3 articles/second)
+- **Previous**: 19.5 articles/second (1000 articles in 51.33s)
+- **Expected**: 50-100+ articles/second with parallel GPU processing and async prefetching
+- **GPU throughput**: 2-4x improvement from parallel GPU batch processing
+- **Database I/O**: Eliminate blocking reads via async prefetch
+- **Writer contention**: Reduced contention between TF-IDF and inverted index writes
 
 **GPU Requirements:**
 - AMD GPU with ROCm support OR NVIDIA GPU with CUDA
@@ -324,10 +332,11 @@ python wiki_search/manage.py build_tfidf_index --test-mode --limit 1000
 - Use `--test-mode` for development without GPU
 
 **Key Features:**
+- **Parallel GPU Processing**: Multiple GPU consumer threads process batches simultaneously
+- **Async Database Prefetching**: Dedicated reader threadpool eliminates blocking reads
+- **Separate Writer Pools**: Independent threadpools for TF-IDF and inverted index writes
+- **Intelligent Prefetching**: Prefetch data at 80% flush threshold for optimal I/O overlap
 - **Producer-Consumer Architecture**: Eliminates database bottlenecks
-- **GPU Batch Processing**: Processes 10k articles simultaneously on GPU
-- **Async Database Writes**: Non-blocking database operations
-- **Auto-scaling**: Worker count optimized based on system resources
 - **Robust Error Handling**: Proper cleanup and logging
 - **Test Mode**: Development support without GPU requirements
 
@@ -585,6 +594,7 @@ For detailed information, see [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/
 
 For detailed implementation information, see the documentation in `docs-vibe/`:
 
+- [docs-vibe/0040-pass2-threadpool-optimization.md](docs-vibe/0040-pass2-threadpool-optimization.md) - Pass 2 threadpool optimization details
 - [docs-vibe/0027-pagerank-optimization.md](docs-vibe/0027-pagerank-optimization.md) - PageRank optimization details
 - [docs-vibe/0029-multiprocessing-pagerank-feasibility.md](docs-vibe/0029-multiprocessing-pagerank-feasibility.md) - Multiprocessing PageRank analysis
 - [docs-vibe/0031-qa-dataset-generation.md](docs-vibe/0031-qa-dataset-generation.md) - QA dataset generation
@@ -592,4 +602,4 @@ For detailed implementation information, see the documentation in `docs-vibe/`:
 - [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md) - Original tokenizer configuration
 - [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/0037-nltk-tfidf-refactor.md) - NLTK TF-IDF refactor
 - [docs-vibe/0022-tfidf-gpu-overhaul.md](docs-vibe/0022-tfidf-gpu-overhaul.md) - TF-IDF GPU overhaul
-- [docs-vibe/0040-django-init-cleanup.md](docs-vibe/0040-django-init-cleanup.md) - Django initialization cleanup in TF-IDF workers
+- [docs-vibe/0039-tfidf-gpu-overhaul-complete.md](docs-vibe/0039-tfidf-gpu-overhaul-complete.md) - TF-IDF GPU overhaul completion

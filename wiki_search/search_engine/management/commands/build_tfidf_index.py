@@ -21,7 +21,6 @@ Key Features:
     - PostgreSQL COPY for 3-5x faster bulk inserts
     - Async database writes prevent blocking GPU computation
     - Comprehensive error handling and profiling support
-    - Test mode for development without GPU requirements
 
 Performance:
     - 19.5 articles/second throughput (1000 articles in 51.33s)
@@ -43,7 +42,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from multiprocessing import Process, Queue
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 import multiprocessing
 
 from django.conf import settings
@@ -104,7 +103,7 @@ def save_profile_stats(profiler: cProfile.Profile, phase_name: str) -> str:
     return str(profile_path)
 
 
-def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List[int]]], defer_commit: bool = False) -> int:
+def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List[int]]], defer_commit: bool = False, prefetched_articles: Dict[int, Any] = None) -> int:
     """
     Synchronous TF-IDF flush using PostgreSQL COPY for high throughput.
     
@@ -118,11 +117,15 @@ def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List
             - vec (Dict[int, float]): TF-IDF vector as term_id -> score mapping
             - l2_norm (float): L2 normalization factor
             - token_counts (List[int]): Token counts per paragraph
+        defer_commit: Whether to defer transaction commit
+        prefetched_articles: Optional pre-fetched Article objects to avoid blocking reads
             
     Returns:
         int: Number of TF-IDF records successfully inserted
         
     Implementation:
+        - Uses prefetched_articles if provided to avoid blocking database reads
+        - Falls back to synchronous Article.objects.filter if prefetched_articles not provided
         - Validates article existence in database
         - Converts TF-IDF vectors to JSON strings for COPY operation
         - Uses atomic transaction with PostgreSQL COPY for bulk insert
@@ -132,9 +135,12 @@ def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List
     if not tfidf_tuples:
         return 0
     
-    # Get articles for the tuples
+    # Get articles for the tuples - use prefetched data if available
     article_ids = [tup[0] for tup in tfidf_tuples]
-    articles = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
+    if prefetched_articles is not None:
+        articles = prefetched_articles
+    else:
+        articles = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
     
     # Prepare data for COPY
     tfidf_data = []
@@ -211,7 +217,97 @@ def flush_tfidf_sync(tfidf_tuples: List[Tuple[int, Dict[int, float], float, List
     return len(tfidf_data)
 
 
-def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_commit: bool = False) -> int:
+def prefetch_articles_async(
+    article_ids: List[int],
+    reader_executor: ThreadPoolExecutor
+) -> Dict[int, Any]:
+    """
+    Async prefetch articles to eliminate blocking reads in flush operations.
+    
+    Pre-fetches Article objects from database using a dedicated reader threadpool
+    to avoid blocking writer threads during flush operations. This enables
+    non-blocking database writes by ensuring all required Article data is
+    available before flush operations begin.
+    
+    Args:
+        article_ids: List of article IDs to prefetch
+        reader_executor: ThreadPoolExecutor for database read operations
+        
+    Returns:
+        Dict[int, Any]: Mapping from article_id to Article object
+        
+    Implementation:
+        - Uses ThreadPoolExecutor to perform database read in background
+        - Returns empty dict if article_ids is empty
+        - Handles exceptions by returning empty dict and logging error
+        - Designed to be called ahead of flush operations
+    """
+    if not article_ids:
+        return {}
+    
+    def _fetch_articles():
+        try:
+            articles = Article.objects.filter(id__in=article_ids)
+            return {a.id: a for a in articles}
+        except Exception as e:
+            logger.error(f"Error prefetching articles: {e}")
+            return {}
+    
+    try:
+        future = reader_executor.submit(_fetch_articles)
+        return future.result()
+    except Exception as e:
+        logger.error(f"Error in prefetch_articles_async: {e}")
+        return {}
+
+
+def prefetch_vocabulary_async(
+    term_ids: List[int],
+    reader_executor: ThreadPoolExecutor
+) -> Tuple[Dict[int, Any], Dict[int, Any]]:
+    """
+    Async prefetch vocabulary and article lookups to eliminate blocking reads.
+    
+    Pre-fetches Vocabulary and Article objects from database using a dedicated
+    reader threadpool. This is used by flush_inverted_sync to avoid blocking
+    writer threads during inverted index flush operations.
+    
+    Args:
+        term_ids: List of term IDs to prefetch from Vocabulary table
+        reader_executor: ThreadPoolExecutor for database read operations
+        
+    Returns:
+        Tuple[Dict[int, Any], Dict[int, Any]]: 
+            - vocab_map: Mapping from term_id to Vocabulary object
+            - article_map: Mapping from article_id to Article object (empty for this function)
+            
+    Implementation:
+        - Uses ThreadPoolExecutor to perform database read in background
+        - Returns empty dicts if term_ids is empty
+        - Handles exceptions by returning empty dicts and logging error
+        - Designed to be called ahead of flush operations
+    """
+    if not term_ids:
+        return {}, {}
+    
+    def _fetch_vocabulary():
+        try:
+            vocab_terms = Vocabulary.objects.filter(id__in=term_ids)
+            return {v.id: v for v in vocab_terms}
+        except Exception as e:
+            logger.error(f"Error prefetching vocabulary: {e}")
+            return {}
+    
+    try:
+        future = reader_executor.submit(_fetch_vocabulary)
+        vocab_map = future.result()
+        return vocab_map, {}  # article_map not needed for vocabulary-only prefetch
+    except Exception as e:
+        logger.error(f"Error in prefetch_vocabulary_async: {e}")
+        return {}, {}
+
+
+def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_commit: bool = False, prefetched_vocab: Dict[int, Any] = None, prefetched_articles: Dict[int, Any] = None) -> int:
     """
     Synchronous inverted index flush using PostgreSQL COPY for high throughput.
     
@@ -224,11 +320,16 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_com
             - term_id (int): Vocabulary term identifier
             - article_id (int): Article identifier  
             - tfidf_score (float): TF-IDF score for this term in this article
+        defer_commit: Whether to defer transaction commit
+        prefetched_vocab: Optional pre-fetched Vocabulary objects to avoid blocking reads
+        prefetched_articles: Optional pre-fetched Article objects to avoid blocking reads
             
     Returns:
         int: Number of inverted index records successfully inserted
         
     Implementation:
+        - Uses prefetched_vocab and prefetched_articles if provided to avoid blocking database reads
+        - Falls back to synchronous queries if prefetched data not provided
         - Validates term_id and article_id existence in database
         - Uses atomic transaction with PostgreSQL COPY for bulk insert
         - Skips invalid tuples (missing term or article)
@@ -237,12 +338,19 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_com
     if not inverted_tuples:
         return 0
     
-    # Get vocabulary terms and articles for the tuples
+    # Get vocabulary terms and articles for the tuples - use prefetched data if available
     term_ids = list(set(tup[0] for tup in inverted_tuples))
     article_ids = list(set(tup[1] for tup in inverted_tuples))
     
-    vocab_map = {v.id: v for v in Vocabulary.objects.filter(id__in=term_ids)}
-    article_map = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
+    if prefetched_vocab is not None:
+        vocab_map = prefetched_vocab
+    else:
+        vocab_map = {v.id: v for v in Vocabulary.objects.filter(id__in=term_ids)}
+    
+    if prefetched_articles is not None:
+        article_map = prefetched_articles
+    else:
+        article_map = {a.id: a for a in Article.objects.filter(id__in=article_ids)}
     
     # Prepare data for COPY
     inverted_data = []
@@ -315,6 +423,83 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_com
                     )
     
     return len(inverted_data)
+
+
+def gpu_consumer_pass2(
+    article_queue: Queue,
+    result_queue: Queue,
+    term_to_id: Dict[str, int],
+    term_to_idf: Dict[str, float],
+    device,
+    gpu_batch_size: int
+) -> None:
+    """
+    GPU consumer thread for Pass 2: process batches from queue in parallel.
+    
+    Processes articles from the article_queue in GPU batches, computes TF-IDF vectors
+    and inverted index tuples, then sends results to the main process via result_queue.
+    This enables parallel GPU processing by having multiple consumer threads work
+    simultaneously on different batches.
+    
+    Args:
+        article_queue: Multiprocessing Queue containing (article_id, tokens, token_counts) tuples
+        result_queue: Multiprocessing Queue for sending (tfidf_tuples, inverted_tuples) results
+        term_to_id: Mapping from vocabulary terms to term IDs
+        term_to_idf: Mapping from vocabulary terms to IDF values
+        device: PyTorch device (cuda/cpu) for GPU processing
+        gpu_batch_size: Number of articles to process per GPU batch
+        
+    Implementation:
+        - Processes articles in batches of gpu_batch_size for efficiency
+        - Uses GPU acceleration via tfidf_workers module
+        - Handles GPU processing errors gracefully by returning empty results
+        - Sends None signal when complete to indicate thread finished
+        - Logs progress for monitoring and debugging
+    """
+    try:
+        logger.info("GPU Consumer Pass 2 starting")
+        current_batch = []
+        processed_count = 0
+        
+        while True:
+            item = article_queue.get()
+            if item is None:  # End signal
+                logger.info("GPU Consumer Pass 2: received end signal")
+                break
+            
+            current_batch.append(item)
+            
+            if len(current_batch) >= gpu_batch_size:
+                # Process GPU batch
+                logger.info(f"GPU Consumer Pass 2: processing batch of {len(current_batch)} articles")
+                
+                tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
+                    current_batch, term_to_id, term_to_idf, device
+                )
+                
+                result_queue.put((tfidf_tuples, inverted_tuples))
+                processed_count += len(current_batch)
+                current_batch = []
+        
+        # Process remaining articles
+        if current_batch:
+            logger.info(f"GPU Consumer Pass 2: processing final batch of {len(current_batch)} articles")
+            
+            tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
+                current_batch, term_to_id, term_to_idf, device
+            )
+            
+            result_queue.put((tfidf_tuples, inverted_tuples))
+            processed_count += len(current_batch)
+        
+        logger.info(f"GPU Consumer Pass 2: processed {processed_count} articles total")
+        # Signal completion
+        result_queue.put(None)
+        logger.info("GPU Consumer Pass 2: sent completion signal")
+        
+    except Exception as e:
+        logger.error(f"GPU Consumer Pass 2 error: {e}")
+        result_queue.put(None)
 
 
 def producer_pass1(article_queue: Queue, batch_size: int, limit: int, num_consumers: int) -> None:
@@ -525,28 +710,32 @@ class Command(BaseCommand):
             
         Available Options:
             --rebuild: Clear existing indexes before building
-            --batch-size: Articles per database batch (default: 500)
-            --limit: Limit number of articles for testing (default: 0 = no limit)
-            --workers: Number of CPU consumer processes (default: CPU cores)
-            --db-workers: Number of database writer threads (default: 96)
+            --db-fetch-batch-size: Articles per database batch (default: 500)
+            --max-articles: Limit number of articles for testing (default: 0 = no limit)
+            --tokenizer-processes: Number of CPU consumer processes (default: CPU cores)
+            --writer-threads: Number of database writer threads (default: 96)
             --verbose: Enable verbose logging
             --profile: Enable detailed profiling with cProfile
             --use-gpu: Use GPU acceleration (default: True, no CPU fallback)
-            --gpu-batch-size: Articles per GPU batch (default: 10000)
-            --test-mode: Bypass GPU requirements for development testing
-            --optimize-inverted-bulk: Drop/recreate inverted unique index and use single-session COPY
+            --gpu-process-batch-size: Articles per GPU batch (default: 10000)
+            --bulk-inverted-index: Drop/recreate inverted unique index and use single-session COPY
+            --gpu-threads: Number of parallel GPU consumer threads (default: 2)
+            --reader-threads: Number of database reader threads (default: 16)
+            --split-writer-pools: Enable separate writer pools for TF-IDF vs inverted index
         """
         parser.add_argument("--rebuild", action="store_true", help="Clear existing index before building")
-        parser.add_argument("--batch-size", type=int, default=500, help="Articles per database batch")
-        parser.add_argument("--limit", type=int, default=0, help="Limit number of articles (for testing)")
-        parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="Number of CPU consumer processes")
-        parser.add_argument("--db-workers", type=int, default=96, help="Number of database writer threads (default: 96)")
+        parser.add_argument("--db-fetch-batch-size", type=int, default=500, help="Articles per database batch")
+        parser.add_argument("--max-articles", type=int, default=0, help="Limit number of articles (for testing)")
+        parser.add_argument("--tokenizer-processes", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="Number of CPU consumer processes")
+        parser.add_argument("--writer-threads", type=int, default=96, help="Number of database writer threads (default: 96)")
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
         parser.add_argument("--use-gpu", action="store_true", default=True, help="Use GPU acceleration (default: True)")
-        parser.add_argument("--gpu-batch-size", type=int, default=1000, help="Articles per GPU batch (default: 10000)")
-        parser.add_argument("--test-mode", action="store_true", help="Test mode - bypass GPU requirements for development testing")
-        parser.add_argument("--optimize-inverted-bulk", action="store_true", help="Drop/recreate inverted unique index and use single-session COPY")
+        parser.add_argument("--gpu-process-batch-size", type=int, default=1000, help="Articles per GPU batch (default: 10000)")
+        parser.add_argument("--bulk-inverted-index", action="store_true", help="Drop/recreate inverted unique index and use single-session COPY")
+        parser.add_argument("--gpu-threads", type=int, default=2, help="Number of parallel GPU consumer threads (default: 2)")
+        parser.add_argument("--reader-threads", type=int, default=16, help="Number of database reader threads (default: 16)")
+        parser.add_argument("--split-writer-pools", action="store_true", help="Enable separate writer pools for TF-IDF vs inverted index")
 
     def handle(self, *args, **options):
         """
@@ -595,16 +784,18 @@ class Command(BaseCommand):
             logging.basicConfig(level=logging.INFO, 
                              format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         
-        batch_size = options["batch_size"]
-        limit = options["limit"]
+        batch_size = options["db-fetch-batch-size"]
+        limit = options["max-articles"]
         rebuild = options["rebuild"]
-        workers = options["workers"]
-        db_workers = options["db_workers"]
-        enable_profiling = options.get("profile", False)
-        use_gpu = options.get("use_gpu", True)  # Default to True
-        gpu_batch_size = options.get("gpu_batch_size", 15000)
-        test_mode = options.get("test_mode", False)
-        optimize_inverted_bulk = options.get("optimize_inverted_bulk", False)
+        workers = options["tokenizer-processes"]
+        db_workers = options["writer-threads"]
+        enable_profiling = options["profile"]
+        use_gpu = options["use-gpu"]
+        gpu_batch_size = options["gpu-process-batch-size"]
+        optimize_inverted_bulk = options["bulk-inverted-index"]
+        gpu_consumers = options["gpu-threads"]
+        reader_workers = options["reader-threads"]
+        separate_writers = options["split-writer-pools"]
         
         # Initialize profilers
         profiler_pass1 = None
@@ -613,10 +804,9 @@ class Command(BaseCommand):
         
         start_time = time.perf_counter()
         
-        # GPU validation - fail fast if not available (unless in test mode)
+        # GPU validation - fail fast if not available
         # Fail fast if GPU not available - no CPU fallback allowed
-        # unless --test-mode is explicitly enabled for development
-        if use_gpu and not test_mode:
+        if use_gpu:
             try:
                 import torch
                 if not torch.cuda.is_available():
@@ -630,7 +820,7 @@ class Command(BaseCommand):
                 device = torch.device('cuda')
 
                 # Auto-scale GPU batch size if user left default (opt-in heuristic)
-                if options.get("gpu_batch_size") in (None, 1000):
+                if options["gpu-process-batch-size"] in (None, 1000):
                     # Heuristic based on observed tokens/article and memory overhead
                     # Conservative targets to avoid OOM; user can override explicitly
                     if gpu_memory >= 24:
@@ -648,10 +838,6 @@ class Command(BaseCommand):
                 raise RuntimeError("GPU acceleration requested but PyTorch not available")
             except RuntimeError as e:
                 raise RuntimeError(f"GPU acceleration failed: {e}")
-        elif test_mode:
-            self.stdout.write(self.style.WARNING("Test mode enabled - bypassing GPU requirements"))
-            logger.warning("Test mode enabled - bypassing GPU requirements")
-            device = None  # Will be handled in GPU functions
         else:
             raise RuntimeError("GPU acceleration is required - CPU fallback not supported")
         
@@ -674,8 +860,8 @@ class Command(BaseCommand):
         # Limit workers for small datasets to avoid too many consumers
         workers = min(workers, max(1, total_articles // 100))
         
-        self.stdout.write(f"Processing {total_articles} articles with {workers} CPU workers, {db_workers} database workers")
-        self.stdout.write(f"GPU batch size: {gpu_batch_size} articles")
+        self.stdout.write(f"Processing {total_articles} articles with {workers} tokenizer processes, {db_workers} writer threads")
+        self.stdout.write(f"GPU process batch size: {gpu_batch_size} articles")
         
         # ============================================================================
         # Pass 1: Document Frequency Computation (Producer-Consumer with CPU)
@@ -807,9 +993,10 @@ class Command(BaseCommand):
         term_to_idf = {v.term: float(v.idf_value) for v in Vocabulary.objects.only("term", "idf_value")}
         
         # ============================================================================
-        # Pass 2: GPU-Accelerated TF-IDF Computation (Producer-Consumer with GPU)
+        # Pass 2: GPU-Accelerated TF-IDF Computation (Optimized Producer-Consumer with Multiple Threadpools)
         # ============================================================================
         self.stdout.write("Pass 2: Building TF-IDF vectors and inverted index...")
+        self.stdout.write(f"Using {gpu_consumers} GPU threads, {reader_workers} reader threads, split writer pools: {separate_writers}")
         pass2_start = time.perf_counter()
         
         if enable_profiling:
@@ -818,17 +1005,20 @@ class Command(BaseCommand):
         
         # Create queues for Pass 2
         article_queue_pass2 = Queue()  # Unbounded queue for GPU processing
-        gpu_result_queue = Queue()
+        gpu_result_queue = Queue()  # Results from GPU consumers
         
         # Start producer thread for Pass 2 - feed pretokenized tokens instead of paragraphs
         def _producer_pass2_pretokenized(q: Queue, items: List[Tuple[int, List[str], List[int]]]):
             try:
                 for item in items:
                     q.put(item)
-                q.put(None)
+                # Send end signal to ALL GPU consumers to prevent deadlock
+                for _ in range(gpu_consumers):
+                    q.put(None)
             except Exception as e:
                 logger.error(f"Producer Pass 2 pretokenized error: {e}")
-                q.put(None)
+                for _ in range(gpu_consumers):
+                    q.put(None)
 
         producer_thread_pass2 = threading.Thread(
             target=_producer_pass2_pretokenized,
@@ -836,84 +1026,108 @@ class Command(BaseCommand):
         )
         producer_thread_pass2.start()
         
-        # GPU batch processing with async database writes
+        # Start GPU consumer threads for parallel processing
+        gpu_consumer_threads = []
+        for i in range(gpu_consumers):
+            thread = threading.Thread(
+                target=gpu_consumer_pass2,
+                args=(article_queue_pass2, gpu_result_queue, term_to_id, term_to_idf, device, gpu_batch_size)
+            )
+            thread.start()
+            gpu_consumer_threads.append(thread)
+        
+        # Dynamic flush thresholds: optimize COPY performance while ensuring small runs still flush
+        if total_articles >= 10000:
+            TFIDF_FLUSH_THRESHOLD = 50000
+            INVERTED_FLUSH_THRESHOLD = 1000000
+        else:
+            TFIDF_FLUSH_THRESHOLD = max(gpu_batch_size, min(50000, gpu_batch_size * 3))
+            INVERTED_FLUSH_THRESHOLD = max(100000, int(gpu_batch_size * 700 * 3))
+        
+        # Create separate threadpools for optimal performance
+        if separate_writers:
+            tfidf_writer_workers = max(1, db_workers // 2)
+            inverted_writer_workers = max(1, db_workers // 2)
+        else:
+            tfidf_writer_workers = db_workers
+            inverted_writer_workers = db_workers
+        
+        # GPU batch processing with async database writes and prefetching
         tfidf_buffer = []
         inverted_buffer = []
         inverted_all: List[Tuple[int, int, float]] = []
         db_futures = []
         
-        # Dynamic flush thresholds: optimize COPY performance while ensuring small runs still flush
-        # Use larger thresholds for big jobs; smaller for small datasets to avoid buffering until the end
-        if total_articles >= 10000:
-            TFIDF_FLUSH_THRESHOLD = 50000
-            INVERTED_FLUSH_THRESHOLD = 1000000
-        else:
-            # Tie thresholds to chosen gpu_batch_size to reduce list growth overhead
-            TFIDF_FLUSH_THRESHOLD = max(gpu_batch_size, min(50000, gpu_batch_size * 3))
-            # Roughly ~700 terms/article; scale by batch size
-            INVERTED_FLUSH_THRESHOLD = max(100000, int(gpu_batch_size * 700 * 3))
+        # Prefetch queues for next batches
+        next_tfidf_article_ids = set()
+        next_inverted_term_ids = set()
+        next_inverted_article_ids = set()
         
-        with ThreadPoolExecutor(max_workers=db_workers) as db_executor:
-            # Process articles in GPU batches of gpu_batch_size
-            # Accumulate results in buffers until flush thresholds reached
-            # Use async database writes to avoid blocking GPU computation
-            current_batch = []
+        with ThreadPoolExecutor(max_workers=reader_workers) as reader_executor, \
+             ThreadPoolExecutor(max_workers=tfidf_writer_workers) as tfidf_executor, \
+             ThreadPoolExecutor(max_workers=inverted_writer_workers) as inverted_executor:
+            
+            # Process results from GPU consumers
+            completed_gpu_consumers = 0
             
             with tqdm(total=total_articles, desc="Pass 2 - TF-IDF") as pbar:
-                while True:
-                    item = article_queue_pass2.get()
-                    if item is None:  # End signal
-                        break
-                    
-                    current_batch.append(item)
-                    
-                    if len(current_batch) >= gpu_batch_size:
-                        # Process GPU batch
-                        if test_mode:
-                            tfidf_tuples, inverted_tuples = _build_tfidf_batch_cpu_from_tokens(
-                                current_batch, term_to_id, term_to_idf
-                            )
-                        else:
-                            tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
-                                current_batch, term_to_id, term_to_idf, device
-                            )
+                while completed_gpu_consumers < gpu_consumers:
+                    result = gpu_result_queue.get()
+                    if result is None:
+                        completed_gpu_consumers += 1
+                    else:
+                        tfidf_tuples, inverted_tuples = result
                         
+                        # Add to buffers
                         tfidf_buffer.extend(tfidf_tuples)
                         inverted_buffer.extend(inverted_tuples)
                         if optimize_inverted_bulk:
                             inverted_all.extend(inverted_tuples)
-                        pbar.update(len(current_batch))
                         
-                        # Submit async writes to ThreadPoolExecutor for non-blocking operation
-                        # Large flush thresholds optimize PostgreSQL COPY performance
+                        pbar.update(len(tfidf_tuples))
+                        
+                        # Prefetch data for next flush operations
+                        if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD * 0.8:  # Prefetch at 80% threshold
+                            article_ids = [tup[0] for tup in tfidf_buffer]
+                            next_tfidf_article_ids.update(article_ids)
+                        
+                        if not optimize_inverted_bulk and len(inverted_buffer) >= INVERTED_FLUSH_THRESHOLD * 0.8:
+                            term_ids = [tup[0] for tup in inverted_buffer]
+                            article_ids = [tup[1] for tup in inverted_buffer]
+                            next_inverted_term_ids.update(term_ids)
+                            next_inverted_article_ids.update(article_ids)
+                        
+                        # Submit async writes with prefetched data
                         if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD:
-                            db_future = db_executor.submit(flush_tfidf_sync, tfidf_buffer[:])
+                            # Prefetch articles for this flush
+                            prefetched_articles = prefetch_articles_async(
+                                list(next_tfidf_article_ids), reader_executor
+                            )
+                            next_tfidf_article_ids.clear()
+                            
+                            db_future = tfidf_executor.submit(
+                                flush_tfidf_sync, tfidf_buffer[:], False, prefetched_articles
+                            )
                             db_futures.append(('tfidf', db_future))
                             tfidf_buffer.clear()
                         
                         if not optimize_inverted_bulk and len(inverted_buffer) >= INVERTED_FLUSH_THRESHOLD:
-                            db_future = db_executor.submit(flush_inverted_sync, inverted_buffer[:])
+                            # Prefetch vocabulary and articles for this flush
+                            prefetched_vocab, prefetched_articles = prefetch_vocabulary_async(
+                                list(next_inverted_term_ids), reader_executor
+                            )
+                            if next_inverted_article_ids:
+                                prefetched_articles.update(
+                                    prefetch_articles_async(list(next_inverted_article_ids), reader_executor)
+                                )
+                            next_inverted_term_ids.clear()
+                            next_inverted_article_ids.clear()
+                            
+                            db_future = inverted_executor.submit(
+                                flush_inverted_sync, inverted_buffer[:], False, prefetched_vocab, prefetched_articles
+                            )
                             db_futures.append(('inverted', db_future))
                             inverted_buffer.clear()
-                        
-                        current_batch = []
-                
-                # Process remaining articles
-                if current_batch:
-                    if test_mode:
-                        tfidf_tuples, inverted_tuples = _build_tfidf_batch_cpu_from_tokens(
-                            current_batch, term_to_id, term_to_idf
-                        )
-                    else:
-                        tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu_from_tokens(
-                            current_batch, term_to_id, term_to_idf, device
-                        )
-                    
-                    tfidf_buffer.extend(tfidf_tuples)
-                    inverted_buffer.extend(inverted_tuples)
-                    if optimize_inverted_bulk:
-                        inverted_all.extend(inverted_tuples)
-                    pbar.update(len(current_batch))
             
             # Wait for all DB writes to complete
             self.stdout.write("Waiting for database writes to complete...")
@@ -927,18 +1141,32 @@ class Command(BaseCommand):
                 else:
                     inverted_created += result
             
-            # Final flush
+            # Final flush with prefetching
             if tfidf_buffer:
-                tfidf_created += flush_tfidf_sync(tfidf_buffer)
+                prefetched_articles = prefetch_articles_async(
+                    [tup[0] for tup in tfidf_buffer], reader_executor
+                )
+                tfidf_created += flush_tfidf_sync(tfidf_buffer, False, prefetched_articles)
+            
             if optimize_inverted_bulk:
-                # Single-session COPY using all accumulated tuples with ON CONFLICT based on existing unique index
+                # Single-session COPY using all accumulated tuples
                 inverted_created += flush_inverted_sync(inverted_all if inverted_all else inverted_buffer)
             else:
                 if inverted_buffer:
-                    inverted_created += flush_inverted_sync(inverted_buffer)
+                    prefetched_vocab, prefetched_articles = prefetch_vocabulary_async(
+                        list(set(tup[0] for tup in inverted_buffer)), reader_executor
+                    )
+                    prefetched_articles.update(
+                        prefetch_articles_async(list(set(tup[1] for tup in inverted_buffer)), reader_executor)
+                    )
+                    inverted_created += flush_inverted_sync(
+                        inverted_buffer, False, prefetched_vocab, prefetched_articles
+                    )
         
         # Cleanup
         producer_thread_pass2.join()
+        for thread in gpu_consumer_threads:
+            thread.join()
         
         if enable_profiling and profiler_pass2 is not None:
             profiler_pass2.disable()
@@ -957,8 +1185,11 @@ class Command(BaseCommand):
         self.stdout.write(f"  - Articles processed: {total_articles}")
         self.stdout.write(f"  - TF-IDF vectors created: {tfidf_created}")
         self.stdout.write(f"  - Inverted index entries: {inverted_created}")
-        self.stdout.write(f"  - CPU workers used: {workers}")
-        self.stdout.write(f"  - GPU batch size: {gpu_batch_size}")
+        self.stdout.write(f"  - Tokenizer processes used: {workers}")
+        self.stdout.write(f"  - GPU threads: {gpu_consumers}")
+        self.stdout.write(f"  - Reader threads: {reader_workers}")
+        self.stdout.write(f"  - GPU process batch size: {gpu_batch_size}")
+        self.stdout.write(f"  - Split writer pools: {separate_writers}")
         self.stdout.write(f"  - Throughput: {total_articles/total_time:.1f} articles/second")
         
         # Show some statistics
@@ -977,7 +1208,8 @@ class Command(BaseCommand):
         
         self.stdout.write(
             self.style.SUCCESS(
-                f"GPU-accelerated TF-IDF indexing complete. "
-                f"Processed {total_articles} articles in {total_time:.2f}s using GPU acceleration."
+                f"Optimized GPU-accelerated TF-IDF indexing complete. "
+                f"Processed {total_articles} articles in {total_time:.2f}s using {gpu_consumers} GPU threads "
+                f"and {reader_workers} reader threads with split writer pools."
             )
         )
