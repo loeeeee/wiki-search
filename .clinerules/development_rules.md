@@ -40,6 +40,8 @@ Always avoid module level constant.
 
 Always import module at the top of the file, unless specifically consent by the user.
 
+For computational tasks, never fallback to slower procedure, always raise errors when command cannot be completed.
+
 ## Documentation
 
 Always document concise implementation details and basic usage in docs-vibe/ with a sequential file name.
