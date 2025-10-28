@@ -56,13 +56,57 @@ def vector_l2_norm_gpu(values: torch.Tensor) -> torch.Tensor:
     return torch.norm(values, p=2)
 
 
+def compute_tf_batch_gpu(
+    article_tokens: List[List[str]], 
+    device: torch.device
+) -> List[Dict[str, float]]:
+    """GPU-accelerated batch TF computation.
+    
+    Args:
+        article_tokens: List of token lists for each article
+        device: PyTorch device (CPU or GPU)
+        
+    Returns:
+        List of TF dictionaries for each article
+    """
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch is required for GPU TF computation")
+    
+    tf_vectors = []
+    
+    for tokens in article_tokens:
+        if not tokens:
+            tf_vectors.append({})
+            continue
+            
+        # Convert tokens to tensor for GPU processing
+        # Create vocabulary mapping for this article
+        unique_tokens = list(set(tokens))
+        token_to_idx = {token: idx for idx, token in enumerate(unique_tokens)}
+        
+        # Count tokens
+        token_counts = torch.zeros(len(unique_tokens), device=device)
+        for token in tokens:
+            token_counts[token_to_idx[token]] += 1
+        
+        # Compute TF (term frequency)
+        total_tokens = len(tokens)
+        tf_values = token_counts / total_tokens
+        
+        # Convert back to dictionary
+        tf_dict = {token: tf_values[idx].item() for token, idx in token_to_idx.items()}
+        tf_vectors.append(tf_dict)
+    
+    return tf_vectors
+
+
 def compute_tfidf_batch_gpu(
     article_tokens: List[List[str]], 
     term_to_id: Dict[str, int], 
     term_to_idf: Dict[str, float],
     device: torch.device
 ) -> Tuple[List[Dict[int, float]], List[float]]:
-    """GPU-accelerated batch TF-IDF computation.
+    """GPU-accelerated batch TF-IDF computation with full pipeline.
     
     Args:
         article_tokens: List of token lists for each article
@@ -79,39 +123,28 @@ def compute_tfidf_batch_gpu(
     tfidf_vectors = []
     l2_norms = []
     
-    # Process articles in batches for GPU efficiency
-    batch_size = min(1000, len(article_tokens))  # Adjust based on GPU memory
+    # Compute TF for all articles on GPU
+    tf_vectors = compute_tf_batch_gpu(article_tokens, device)
     
-    for i in range(0, len(article_tokens), batch_size):
-        batch_tokens = article_tokens[i:i + batch_size]
+    # Process TF-IDF computation
+    for tf_dict in tf_vectors:
+        # Create sparse vector representation
+        vec_dict = {}
+        for term, tf_val in tf_dict.items():
+            term_id = term_to_id.get(term)
+            idf_val = term_to_idf.get(term)
+            if term_id is not None and idf_val is not None:
+                vec_dict[term_id] = tf_val * idf_val
         
-        # Convert to PyTorch tensors for batch processing
-        batch_vectors = []
-        batch_norms = []
+        tfidf_vectors.append(vec_dict)
         
-        for tokens in batch_tokens:
-            # Compute TF for this article
-            tf = compute_tf(tokens)
-            
-            # Create sparse vector representation
-            vec_dict = {}
-            for term, tf_val in tf.items():
-                term_id = term_to_id.get(term)
-                idf_val = term_to_idf.get(term)
-                if term_id is not None and idf_val is not None:
-                    vec_dict[term_id] = tf_val * idf_val
-            
-            tfidf_vectors.append(vec_dict)
-            
-            # Compute L2 norm
-            if vec_dict:
-                values = torch.tensor(list(vec_dict.values()), device=device)
-                norm = vector_l2_norm_gpu(values).item()
-                batch_norms.append(norm)
-            else:
-                batch_norms.append(0.0)
-        
-        l2_norms.extend(batch_norms)
+        # Compute L2 norm on GPU
+        if vec_dict:
+            values = torch.tensor(list(vec_dict.values()), device=device)
+            norm = vector_l2_norm_gpu(values).item()
+            l2_norms.append(norm)
+        else:
+            l2_norms.append(0.0)
     
     return tfidf_vectors, l2_norms
 

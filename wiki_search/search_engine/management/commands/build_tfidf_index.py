@@ -5,10 +5,13 @@ import json
 import logging
 import os
 import pstats
+import queue
+import threading
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from multiprocessing import Process, Queue
 from typing import Dict, List, Tuple
 import multiprocessing
 
@@ -18,9 +21,9 @@ from django.db import transaction, connection
 from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, TFIDFIndex, Vocabulary
-from search_engine.search import compute_idf, compute_tf, vector_l2_norm
+from search_engine.search import compute_idf, vector_l2_norm
 from search_engine.tokenizer import tokenize
-from .tfidf_workers import _compute_doc_freq_batch, _build_tfidf_batch, _build_tfidf_batch_gpu
+from .tfidf_workers import _compute_doc_freq_batch, _build_tfidf_batch_gpu, _build_tfidf_batch_cpu_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -113,18 +116,134 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]]) -> int:
     return len(inverted_data)
 
 
+def producer_pass1(article_queue: Queue, batch_size: int, limit: int, num_consumers: int) -> None:
+    """Producer thread for Pass 1: fetch articles from database and put in queue."""
+    try:
+        logger.info(f"Producer Pass 1 starting with limit={limit}")
+        qs = Article.objects.only("id", "plain_text_paragraphs")
+        if limit > 0:
+            qs = qs.order_by("id")[:limit]
+        
+        articles = qs.iterator(chunk_size=batch_size)
+        count = 0
+        
+        for article in articles:
+            article_queue.put((article.id, article.plain_text_paragraphs))
+            count += 1
+            if count % 100 == 0:
+                logger.info(f"Producer Pass 1: put {count} articles in queue")
+        
+        logger.info(f"Producer Pass 1: finished putting {count} articles")
+        # Signal end of data to all consumers
+        for _ in range(num_consumers):
+            article_queue.put(None)
+        logger.info(f"Producer Pass 1: sent {num_consumers} end signals")
+        
+    except Exception as e:
+        logger.error(f"Producer Pass 1 error: {e}")
+        # Send end signals to all consumers even on error
+        for _ in range(num_consumers):
+            article_queue.put(None)
+
+
+def producer_pass2(article_queue: Queue, batch_size: int, limit: int, num_consumers: int) -> None:
+    """Producer thread for Pass 2: fetch articles from database and put in queue."""
+    try:
+        qs = Article.objects.only("id", "plain_text_paragraphs")
+        if limit > 0:
+            qs = qs.order_by("id")[:limit]
+        
+        articles = qs.iterator(chunk_size=batch_size)
+        
+        for article in articles:
+            article_queue.put((article.id, article.plain_text_paragraphs))
+        
+        # Signal end of data to all consumers
+        for _ in range(num_consumers):
+            article_queue.put(None)
+        
+    except Exception as e:
+        logger.error(f"Producer Pass 2 error: {e}")
+        # Send end signals to all consumers even on error
+        for _ in range(num_consumers):
+            article_queue.put(None)
+
+
+def consumer_pass1(article_queue: Queue, result_queue: Queue) -> None:
+    """Consumer process for Pass 1: tokenize articles and compute document frequency."""
+    try:
+        logger.info("Consumer Pass 1 starting")
+        batch = []
+        batch_size = 100  # Process articles in small batches
+        processed_count = 0
+        
+        while True:
+            logger.info("Consumer Pass 1: waiting for item from queue")
+            item = article_queue.get()
+            logger.info(f"Consumer Pass 1: got item {item}")
+            if item is None:  # End signal
+                logger.info("Consumer Pass 1: received end signal")
+                break
+            
+            batch.append(item)
+            processed_count += 1
+            
+            if len(batch) >= batch_size:
+                # Process batch
+                logger.info(f"Consumer Pass 1: processing batch of {len(batch)} articles")
+                doc_freq = _compute_doc_freq_batch(batch)
+                result_queue.put(doc_freq)
+                batch = []
+        
+        # Process remaining items
+        if batch:
+            logger.info(f"Consumer Pass 1: processing final batch of {len(batch)} articles")
+            doc_freq = _compute_doc_freq_batch(batch)
+            result_queue.put(doc_freq)
+        
+        logger.info(f"Consumer Pass 1: processed {processed_count} articles total")
+        # Signal completion
+        result_queue.put(None)
+        logger.info("Consumer Pass 1: sent completion signal")
+        
+    except Exception as e:
+        logger.error(f"Consumer Pass 1 error: {e}")
+        result_queue.put(None)
+
+
+def gpu_batch_processor(
+    article_batch: List[Tuple[int, List[str]]],
+    term_to_id: Dict[str, int],
+    term_to_idf: Dict[str, float],
+    device,
+    result_queue: Queue
+) -> None:
+    """GPU batch processor for Pass 2: process articles on GPU."""
+    try:
+        tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu(
+            article_batch, term_to_id, term_to_idf, device
+        )
+        result_queue.put((tfidf_tuples, inverted_tuples))
+        
+    except Exception as e:
+        logger.error(f"GPU batch processor error: {e}")
+        result_queue.put(([], []))
+
+
 class Command(BaseCommand):
-    help = "Build TF-IDF index and inverted index over Article.plain_text_paragraphs using CPU cores with optional GPU acceleration"
+    help = "Build TF-IDF index and inverted index over Article.plain_text_paragraphs using GPU acceleration with producer-consumer architecture"
 
     def add_arguments(self, parser) -> None:
         parser.add_argument("--rebuild", action="store_true", help="Clear existing index before building")
-        parser.add_argument("--batch-size", type=int, default=500, help="Articles per worker batch")
+        parser.add_argument("--batch-size", type=int, default=500, help="Articles per database batch")
         parser.add_argument("--limit", type=int, default=0, help="Limit number of articles (for testing)")
-        parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+        parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="Number of CPU consumer processes")
         parser.add_argument("--db-workers", type=int, default=96, help="Number of database writer threads (default: 96)")
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
-        parser.add_argument("--use-gpu", action="store_true", help="Use GPU acceleration for TF-IDF computation (requires PyTorch with ROCm/CUDA)")
+        parser.add_argument("--use-gpu", action="store_true", default=True, help="Use GPU acceleration (default: True)")
+        parser.add_argument("--gpu-batch-size", type=int, default=10000, help="Articles per GPU batch (default: 10000)")
+        parser.add_argument("--test-mode", action="store_true", help="Test mode - bypass GPU requirements for development testing")
 
     def handle(self, *args, **options):
         # Setup logging
@@ -138,7 +257,9 @@ class Command(BaseCommand):
         workers = options["workers"]
         db_workers = options["db_workers"]
         enable_profiling = options.get("profile", False)
-        use_gpu = options.get("use_gpu", False)
+        use_gpu = options.get("use_gpu", True)  # Default to True
+        gpu_batch_size = options.get("gpu_batch_size", 10000)
+        test_mode = options.get("test_mode", False)
         
         # Initialize profilers
         profiler_pass1 = None
@@ -147,30 +268,33 @@ class Command(BaseCommand):
         
         start_time = time.perf_counter()
         
-        # Check GPU availability if requested
-        if use_gpu:
+        # GPU validation - fail fast if not available (unless in test mode)
+        if use_gpu and not test_mode:
             try:
                 import torch
-                gpu_available = torch.cuda.is_available()
-                if gpu_available:
-                    gpu_name = torch.cuda.get_device_name(0)
-                    gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                    self.stdout.write(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
-                    logger.info(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
-                else:
-                    self.stdout.write(self.style.WARNING("GPU acceleration requested but no GPU available. Using CPU."))
-                    logger.warning("GPU acceleration requested but no GPU available. Using CPU.")
-                    raise RuntimeError("GPU acceleration requested but no GPU available. Using CPU.")
+                if not torch.cuda.is_available():
+                    raise RuntimeError("GPU acceleration requested but no GPU available")
+                
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                self.stdout.write(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
+                logger.info(f"GPU acceleration enabled: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
+                
+                device = torch.device('cuda')
+                
             except ImportError:
-                self.stdout.write(self.style.WARNING("GPU acceleration requested but PyTorch not available. Using CPU."))
-                logger.warning("GPU acceleration requested but PyTorch not available. Using CPU.")
-                use_gpu = False
+                raise RuntimeError("GPU acceleration requested but PyTorch not available")
+            except RuntimeError as e:
+                raise RuntimeError(f"GPU acceleration failed: {e}")
+        elif test_mode:
+            self.stdout.write(self.style.WARNING("Test mode enabled - bypassing GPU requirements"))
+            logger.warning("Test mode enabled - bypassing GPU requirements")
+            device = None  # Will be handled in GPU functions
+        else:
+            raise RuntimeError("GPU acceleration is required - CPU fallback not supported")
         
         # Configure multiprocessing context for GPU compatibility
-        if use_gpu:
-            mp_context = multiprocessing.get_context('spawn')
-        else:
-            mp_context = None  # Use default (fork on Linux)
+        mp_context = multiprocessing.get_context('spawn')
         
         if rebuild:
             self.stdout.write("Clearing existing indexes...")
@@ -178,7 +302,7 @@ class Command(BaseCommand):
             TFIDFIndex.objects.all().delete()
             Vocabulary.objects.all().delete()
         
-        # Get articles to process
+        # Get total articles count
         qs = Article.objects.only("id", "plain_text_paragraphs")
         if limit > 0:
             qs = qs.order_by("id")[:limit]
@@ -188,19 +312,13 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("No articles found to process"))
             return
         
-        self.stdout.write(f"Processing {total_articles} articles with {workers} workers, {db_workers} database workers")
+        # Limit workers for small datasets to avoid too many consumers
+        workers = min(workers, max(1, total_articles // 100))
         
-        # Convert to lightweight tuples for worker processing
-        self.stdout.write("Loading article data...")
-        article_tuples = [(a.id, a.plain_text_paragraphs) for a in qs]
+        self.stdout.write(f"Processing {total_articles} articles with {workers} CPU workers, {db_workers} database workers")
+        self.stdout.write(f"GPU batch size: {gpu_batch_size} articles")
         
-        # Split into worker batches
-        worker_batches = [article_tuples[i:i+batch_size] 
-                         for i in range(0, len(article_tuples), batch_size)]
-        
-        self.stdout.write(f"Split into {len(worker_batches)} batches of ~{batch_size} articles each")
-        
-        # Pass 1: Parallel document frequency computation
+        # Pass 1: Document frequency computation with producer-consumer
         self.stdout.write("Pass 1: Computing document frequencies...")
         pass1_start = time.perf_counter()
         
@@ -208,15 +326,44 @@ class Command(BaseCommand):
             profiler_pass1 = cProfile.Profile()
             profiler_pass1.enable()
         
-        with ProcessPoolExecutor(max_workers=workers, mp_context=mp_context) as executor:
-            # Submit all batches for parallel processing
-            futures = [executor.submit(_compute_doc_freq_batch, batch) 
-                      for batch in worker_batches]
-            
-            # Aggregate results with progress bar
-            global_df = Counter()
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Pass 1 - Doc Freq"):
-                global_df.update(future.result())
+        # Create queues for producer-consumer
+        article_queue = Queue()  # Buffer for articles (unbounded)
+        result_queue = Queue()  # Results from consumers
+        
+        # Start producer thread
+        producer_thread = threading.Thread(
+            target=producer_pass1,
+            args=(article_queue, batch_size, limit, workers)
+        )
+        producer_thread.start()
+        
+        # Start consumer processes
+        consumer_processes = []
+        for _ in range(workers):
+            process = Process(
+                target=consumer_pass1,
+                args=(article_queue, result_queue)
+            )
+            process.start()
+            consumer_processes.append(process)
+        
+        # Collect results
+        global_df = Counter()
+        completed_consumers = 0
+        
+        with tqdm(total=total_articles, desc="Pass 1 - Doc Freq") as pbar:
+            while completed_consumers < workers:
+                result = result_queue.get()
+                if result is None:
+                    completed_consumers += 1
+                else:
+                    global_df.update(result)
+                    pbar.update(len(result))
+        
+        # Cleanup
+        producer_thread.join()
+        for process in consumer_processes:
+            process.join()
         
         if enable_profiling and profiler_pass1 is not None:
             profiler_pass1.disable()
@@ -233,7 +380,7 @@ class Command(BaseCommand):
             profiler_vocab = cProfile.Profile()
             profiler_vocab.enable()
         
-        total_docs = len(article_tuples)
+        total_docs = total_articles
         vocab_data = []
         for term, df in global_df.items():
             vocab_data.append((
@@ -258,11 +405,11 @@ class Command(BaseCommand):
         vocab_time = time.perf_counter() - vocab_start
         self.stdout.write(f"Vocabulary built in {vocab_time:.2f}s - {len(vocab_data)} terms")
         
-        # Build maps for workers
+        # Build maps for GPU processing
         term_to_id = {v.term: v.id for v in Vocabulary.objects.only("id", "term")}
         term_to_idf = {v.term: float(v.idf_value) for v in Vocabulary.objects.only("term", "idf_value")}
         
-        # Pass 2: Parallel TF-IDF + inverted index with async DB writes
+        # Pass 2: GPU-accelerated TF-IDF computation with producer-consumer
         self.stdout.write("Pass 2: Building TF-IDF vectors and inverted index...")
         pass2_start = time.perf_counter()
         
@@ -270,46 +417,82 @@ class Command(BaseCommand):
             profiler_pass2 = cProfile.Profile()
             profiler_pass2.enable()
         
-        with ThreadPoolExecutor(max_workers=db_workers) as db_executor, \
-             ProcessPoolExecutor(max_workers=workers, mp_context=mp_context) as process_executor:
+        # Create queues for Pass 2
+        article_queue_pass2 = Queue()  # Unbounded queue
+        gpu_result_queue = Queue()
+        
+        # Start producer thread for Pass 2
+        producer_thread_pass2 = threading.Thread(
+            target=producer_pass2,
+            args=(article_queue_pass2, batch_size, limit, 1)
+        )
+        producer_thread_pass2.start()
+        
+        # GPU batch processing
+        tfidf_buffer = []
+        inverted_buffer = []
+        db_futures = []
+        
+        # Large flush thresholds for PostgreSQL efficiency
+        TFIDF_FLUSH_THRESHOLD = 20000
+        INVERTED_FLUSH_THRESHOLD = 500000
+        
+        with ThreadPoolExecutor(max_workers=db_workers) as db_executor:
+            # Process articles in GPU batches
+            current_batch = []
             
-            # Submit batches for parallel TF-IDF computation
-            if use_gpu:
-                import torch
-                device = torch.device('cuda')
-                futures = [
-                    process_executor.submit(_build_tfidf_batch_gpu, batch, term_to_id, term_to_idf, device)
-                    for batch in worker_batches
-                ]
-            else:
-                futures = [
-                    process_executor.submit(_build_tfidf_batch, batch, term_to_id, term_to_idf)
-                    for batch in worker_batches
-                ]
-            
-            tfidf_buffer = []
-            inverted_buffer = []
-            db_futures = []
-            
-            # Large flush thresholds for PostgreSQL efficiency
-            TFIDF_FLUSH_THRESHOLD = 20000
-            INVERTED_FLUSH_THRESHOLD = 500000  # Inverted index is much larger
-            
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Pass 2 - TF-IDF"):
-                tfidf_tuples, inverted_tuples = future.result()
-                tfidf_buffer.extend(tfidf_tuples)
-                inverted_buffer.extend(inverted_tuples)
+            with tqdm(total=total_articles, desc="Pass 2 - TF-IDF") as pbar:
+                while True:
+                    item = article_queue_pass2.get()
+                    if item is None:  # End signal
+                        break
+                    
+                    current_batch.append(item)
+                    
+                    if len(current_batch) >= gpu_batch_size:
+                        # Process GPU batch
+                        if test_mode:
+                            # In test mode, use CPU fallback for GPU functions
+                            tfidf_tuples, inverted_tuples = _build_tfidf_batch_cpu_fallback(
+                                current_batch, term_to_id, term_to_idf
+                            )
+                        else:
+                            tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu(
+                                current_batch, term_to_id, term_to_idf, device
+                            )
+                        
+                        tfidf_buffer.extend(tfidf_tuples)
+                        inverted_buffer.extend(inverted_tuples)
+                        pbar.update(len(current_batch))
+                        
+                        # Async database flush when threshold reached
+                        if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD:
+                            db_future = db_executor.submit(flush_tfidf_sync, tfidf_buffer[:])
+                            db_futures.append(('tfidf', db_future))
+                            tfidf_buffer.clear()
+                        
+                        if len(inverted_buffer) >= INVERTED_FLUSH_THRESHOLD:
+                            db_future = db_executor.submit(flush_inverted_sync, inverted_buffer[:])
+                            db_futures.append(('inverted', db_future))
+                            inverted_buffer.clear()
+                        
+                        current_batch = []
                 
-                # Async database flush when threshold reached
-                if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD:
-                    db_future = db_executor.submit(flush_tfidf_sync, tfidf_buffer[:])
-                    db_futures.append(('tfidf', db_future))
-                    tfidf_buffer.clear()
-                
-                if len(inverted_buffer) >= INVERTED_FLUSH_THRESHOLD:
-                    db_future = db_executor.submit(flush_inverted_sync, inverted_buffer[:])
-                    db_futures.append(('inverted', db_future))
-                    inverted_buffer.clear()
+                # Process remaining articles
+                if current_batch:
+                    if test_mode:
+                        # In test mode, use CPU fallback for GPU functions
+                        tfidf_tuples, inverted_tuples = _build_tfidf_batch_cpu_fallback(
+                            current_batch, term_to_id, term_to_idf
+                        )
+                    else:
+                        tfidf_tuples, inverted_tuples = _build_tfidf_batch_gpu(
+                            current_batch, term_to_id, term_to_idf, device
+                        )
+                    
+                    tfidf_buffer.extend(tfidf_tuples)
+                    inverted_buffer.extend(inverted_tuples)
+                    pbar.update(len(current_batch))
             
             # Wait for all DB writes to complete
             self.stdout.write("Waiting for database writes to complete...")
@@ -329,6 +512,9 @@ class Command(BaseCommand):
             if inverted_buffer:
                 inverted_created += flush_inverted_sync(inverted_buffer)
         
+        # Cleanup
+        producer_thread_pass2.join()
+        
         if enable_profiling and profiler_pass2 is not None:
             profiler_pass2.disable()
             save_profile_stats(profiler_pass2, "pass2_tfidf")
@@ -346,7 +532,8 @@ class Command(BaseCommand):
         self.stdout.write(f"  - Articles processed: {total_articles}")
         self.stdout.write(f"  - TF-IDF vectors created: {tfidf_created}")
         self.stdout.write(f"  - Inverted index entries: {inverted_created}")
-        self.stdout.write(f"  - Workers used: {workers}")
+        self.stdout.write(f"  - CPU workers used: {workers}")
+        self.stdout.write(f"  - GPU batch size: {gpu_batch_size}")
         self.stdout.write(f"  - Throughput: {total_articles/total_time:.1f} articles/second")
         
         # Show some statistics
@@ -365,7 +552,7 @@ class Command(BaseCommand):
         
         self.stdout.write(
             self.style.SUCCESS(
-                f"Optimized TF-IDF indexing complete. "
-                f"Processed {total_articles} articles in {total_time:.2f}s using {workers} workers."
+                f"GPU-accelerated TF-IDF indexing complete. "
+                f"Processed {total_articles} articles in {total_time:.2f}s using GPU acceleration."
             )
         )

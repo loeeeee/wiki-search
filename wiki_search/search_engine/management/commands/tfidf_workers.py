@@ -80,6 +80,59 @@ def _build_tfidf_batch(
     return tfidf_tuples, inverted_tuples
 
 
+def _build_tfidf_batch_cpu_fallback(
+    article_tuples: List[Tuple[int, List[str]]],
+    term_to_id: Dict[str, int],
+    term_to_idf: Dict[str, float]
+) -> Tuple[
+    List[Tuple[int, Dict[int, float], float, List[int]]],  # (article_id, tfidf_vec, l2_norm, token_counts)
+    List[Tuple[int, int, float]]  # (term_id, article_id, tfidf_score) for InvertedIndex
+]:
+    """CPU fallback for GPU functions in test mode.
+    
+    This function provides the same interface as the GPU version but uses CPU computation.
+    Used only for development testing when GPU is not available.
+    """
+    # Initialize Django for spawn multiprocessing - MUST be first
+    import os
+    import django
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'wiki_search.settings')
+    django.setup()
+    
+    # Import Django modules after setup
+    from search_engine.search import compute_tf, vector_l2_norm
+    from search_engine.tokenizer import tokenize
+    
+    tfidf_tuples = []
+    inverted_tuples = []
+    
+    for article_id, paragraphs in article_tuples:
+        tokens = []
+        token_counts = []
+        
+        # Compute token counts per paragraph (CPU tokenization)
+        for para in paragraphs:
+            para_tokens = tokenize(para)
+            tokens.extend(para_tokens)
+            token_counts.append(len(para_tokens))
+        
+        tf = compute_tf(tokens)
+        vec = {}
+        for term, tf_val in tf.items():
+            term_id = term_to_id.get(term)
+            idf_val = term_to_idf.get(term)
+            if term_id is None or idf_val is None:
+                continue
+            tfidf_score = tf_val * idf_val
+            vec[term_id] = tfidf_score
+            inverted_tuples.append((term_id, article_id, tfidf_score))
+        
+        l2_norm = vector_l2_norm(vec.values()) if vec else 0.0
+        tfidf_tuples.append((article_id, vec, l2_norm, token_counts))
+    
+    return tfidf_tuples, inverted_tuples
+
+
 def _build_tfidf_batch_gpu(
     article_tuples: List[Tuple[int, List[str]]],
     term_to_id: Dict[str, int],
@@ -91,6 +144,7 @@ def _build_tfidf_batch_gpu(
 ]:
     """GPU-accelerated worker: compute TF-IDF vectors, inverted index tuples, and token counts.
     
+    Full GPU pipeline with tokenization on CPU, TF-IDF computation on GPU.
     Returns lightweight tuples to minimize serialization overhead.
     """
     # Initialize Django for spawn multiprocessing - MUST be first
@@ -112,7 +166,7 @@ def _build_tfidf_batch_gpu(
         tokens = []
         token_counts = []
         
-        # Compute token counts per paragraph
+        # Compute token counts per paragraph (CPU tokenization)
         for para in paragraphs:
             para_tokens = tokenize(para)
             tokens.extend(para_tokens)
@@ -122,7 +176,7 @@ def _build_tfidf_batch_gpu(
         article_ids.append(article_id)
         token_counts_list.append(token_counts)
     
-    # GPU-accelerated batch TF-IDF computation
+    # GPU-accelerated batch TF-IDF computation (full pipeline)
     tfidf_vectors, l2_norms = compute_tfidf_batch_gpu(
         article_tokens, term_to_id, term_to_idf, device
     )
@@ -138,6 +192,59 @@ def _build_tfidf_batch_gpu(
         for term_id, tfidf_score in vec.items():
             inverted_tuples.append((term_id, article_id, tfidf_score))
         
+        tfidf_tuples.append((article_id, vec, l2_norm, token_counts))
+    
+    return tfidf_tuples, inverted_tuples
+
+
+def _build_tfidf_batch_cpu_fallback(
+    article_tuples: List[Tuple[int, List[str]]],
+    term_to_id: Dict[str, int],
+    term_to_idf: Dict[str, float]
+) -> Tuple[
+    List[Tuple[int, Dict[int, float], float, List[int]]],  # (article_id, tfidf_vec, l2_norm, token_counts)
+    List[Tuple[int, int, float]]  # (term_id, article_id, tfidf_score) for InvertedIndex
+]:
+    """CPU fallback for GPU functions in test mode.
+    
+    This function provides the same interface as the GPU version but uses CPU computation.
+    Used only for development testing when GPU is not available.
+    """
+    # Initialize Django for spawn multiprocessing - MUST be first
+    import os
+    import django
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'wiki_search.settings')
+    django.setup()
+    
+    # Import Django modules after setup
+    from search_engine.search import compute_tf, vector_l2_norm
+    from search_engine.tokenizer import tokenize
+    
+    tfidf_tuples = []
+    inverted_tuples = []
+    
+    for article_id, paragraphs in article_tuples:
+        tokens = []
+        token_counts = []
+        
+        # Compute token counts per paragraph (CPU tokenization)
+        for para in paragraphs:
+            para_tokens = tokenize(para)
+            tokens.extend(para_tokens)
+            token_counts.append(len(para_tokens))
+        
+        tf = compute_tf(tokens)
+        vec = {}
+        for term, tf_val in tf.items():
+            term_id = term_to_id.get(term)
+            idf_val = term_to_idf.get(term)
+            if term_id is None or idf_val is None:
+                continue
+            tfidf_score = tf_val * idf_val
+            vec[term_id] = tfidf_score
+            inverted_tuples.append((term_id, article_id, tfidf_score))
+        
+        l2_norm = vector_l2_norm(vec.values()) if vec else 0.0
         tfidf_tuples.append((article_id, vec, l2_norm, token_counts))
     
     return tfidf_tuples, inverted_tuples
