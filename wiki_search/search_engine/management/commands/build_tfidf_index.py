@@ -20,13 +20,17 @@ Architecture:
         - Producer threads feed pretokenized data to GPU consumers
         - GPU processes large batches (10k articles) for TF-IDF computation
         - Async database writers flush results using PostgreSQL COPY
+        - Separate writer pools for TF-IDF vs inverted index optimization
+        - Bulk inverted index mode with single-session COPY
 
 Key Features:
     - Fail-fast validation catches issues in <1 second
-    - GPU acceleration with PyTorch (ROCm/CUDA support)
+    - GPU acceleration with PyTorch (ROCm/CUDA support) - always enabled
     - Producer-consumer pattern eliminates database bottlenecks
     - PostgreSQL COPY for 3-5x faster bulk inserts
     - Async database writes prevent blocking GPU computation
+    - Separate writer thread pools for optimal performance
+    - Bulk inverted index processing for maximum efficiency
     - Comprehensive error handling with clear error messages
     - Removed unused code for better maintainability
 
@@ -609,6 +613,8 @@ class Command(BaseCommand):
     1. Early validation of all prerequisites (GPU, database, tables, parameters)
     2. Pass 1: Document frequency computation using producer-consumer pattern
     3. Pass 2: GPU-accelerated TF-IDF computation with async database writes
+    4. Separate writer pools for TF-IDF vs inverted index optimization
+    5. Bulk inverted index processing with single-session COPY
     
     Uses PostgreSQL COPY for optimal database performance and PyTorch for GPU acceleration.
     All validation happens before processing begins to fail fast with clear error messages.
@@ -630,12 +636,9 @@ class Command(BaseCommand):
             --writer-threads: Number of database writer threads (default: 96)
             --verbose: Enable verbose logging
             --profile: Enable detailed profiling with cProfile
-            --use-gpu: Use GPU acceleration (default: True, no CPU fallback)
             --gpu-process-batch-size: Articles per GPU batch (default: 10000)
-            --bulk-inverted-index: Drop/recreate inverted unique index and use single-session COPY
             --gpu-threads: Number of parallel GPU consumer threads (default: 2)
             --reader-threads: Number of database reader threads (default: 16)
-            --split-writer-pools: Enable separate writer pools for TF-IDF vs inverted index
         """
         parser.add_argument("--rebuild", action="store_true", help="Clear existing index before building")
         parser.add_argument("--db-fetch-batch-size", type=int, default=500, help="Articles per database batch")
@@ -644,12 +647,9 @@ class Command(BaseCommand):
         parser.add_argument("--writer-threads", type=int, default=96, help="Number of database writer threads (default: 96)")
         parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
         parser.add_argument("--profile", action="store_true", help="Enable detailed profiling with cProfile")
-        parser.add_argument("--use-gpu", action="store_true", default=True, help="Use GPU acceleration (default: True)")
         parser.add_argument("--gpu-process-batch-size", type=int, default=100_000, help="Articles per GPU batch (default: 100_000)")
-        parser.add_argument("--bulk-inverted-index", action="store_true", help="Drop/recreate inverted unique index and use single-session COPY")
         parser.add_argument("--gpu-threads", type=int, default=4, help="Number of parallel GPU consumer threads (default: 4)")
         parser.add_argument("--reader-threads", type=int, default=16, help="Number of database reader threads (default: 16)")
-        parser.add_argument("--split-writer-pools", action="store_true", help="Enable separate writer pools for TF-IDF vs inverted index")
 
     def _validate_prerequisites(self, options) -> Any:
         """
@@ -749,9 +749,6 @@ class Command(BaseCommand):
         # Additional options
         params['rebuild'] = options["rebuild"]
         params['enable_profiling'] = options["profile"]
-        params['use_gpu'] = options["use_gpu"]
-        params['optimize_inverted_bulk'] = options["bulk_inverted_index"]
-        params['separate_writers'] = options["split_writer_pools"]
         
         return params
 
@@ -842,12 +839,9 @@ class Command(BaseCommand):
         workers = params['workers']
         db_workers = params['db_workers']
         enable_profiling = params['enable_profiling']
-        use_gpu = params['use_gpu']
         gpu_batch_size = params['gpu_batch_size']
-        optimize_inverted_bulk = params['optimize_inverted_bulk']
         gpu_consumers = params['gpu_consumers']
         reader_workers = params['reader_workers']
-        separate_writers = params['separate_writers']
         
         # Initialize profilers
         profiler_pass1 = None
@@ -1025,7 +1019,7 @@ class Command(BaseCommand):
         # Pass 2: GPU-Accelerated TF-IDF Computation (Optimized Producer-Consumer with Multiple Threadpools)
         # ============================================================================
         self.stdout.write("Pass 2: Building TF-IDF vectors and inverted index...")
-        self.stdout.write(f"Using {gpu_consumers} GPU threads, {reader_workers} reader threads, split writer pools: {separate_writers}")
+        self.stdout.write(f"Using {gpu_consumers} GPU threads, {reader_workers} reader threads")
         pass2_start = time.perf_counter()
         
         if enable_profiling:
@@ -1073,13 +1067,9 @@ class Command(BaseCommand):
             TFIDF_FLUSH_THRESHOLD = max(gpu_batch_size, min(50000, gpu_batch_size * 3))
             INVERTED_FLUSH_THRESHOLD = max(100000, int(gpu_batch_size * 700 * 3))
         
-        # Create separate threadpools for optimal performance
-        if separate_writers:
-            tfidf_writer_workers = max(1, db_workers // 2)
-            inverted_writer_workers = max(1, db_workers // 2)
-        else:
-            tfidf_writer_workers = db_workers
-            inverted_writer_workers = db_workers
+        # Always use separate writer pools for optimal performance
+        tfidf_writer_workers = max(1, db_workers // 2)
+        inverted_writer_workers = max(1, db_workers // 2)
         
         # GPU batch processing with async database writes and prefetching
         tfidf_buffer = []
@@ -1110,8 +1100,8 @@ class Command(BaseCommand):
                         # Add to buffers
                         tfidf_buffer.extend(tfidf_tuples)
                         inverted_buffer.extend(inverted_tuples)
-                        if optimize_inverted_bulk:
-                            inverted_all.extend(inverted_tuples)
+                        # Always use bulk mode for inverted index
+                        inverted_all.extend(inverted_tuples)
                         
                         pbar.update(len(tfidf_tuples))
                         
@@ -1119,12 +1109,6 @@ class Command(BaseCommand):
                         if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD * 0.8:  # Prefetch at 80% threshold
                             article_ids = [tup[0] for tup in tfidf_buffer]
                             next_tfidf_article_ids.update(article_ids)
-                        
-                        if not optimize_inverted_bulk and len(inverted_buffer) >= INVERTED_FLUSH_THRESHOLD * 0.8:
-                            term_ids = [tup[0] for tup in inverted_buffer]
-                            article_ids = [tup[1] for tup in inverted_buffer]
-                            next_inverted_term_ids.update(term_ids)
-                            next_inverted_article_ids.update(article_ids)
                         
                         # Submit async writes with prefetched data
                         if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD:
@@ -1139,24 +1123,6 @@ class Command(BaseCommand):
                             )
                             db_futures.append(('tfidf', db_future))
                             tfidf_buffer.clear()
-                        
-                        if not optimize_inverted_bulk and len(inverted_buffer) >= INVERTED_FLUSH_THRESHOLD:
-                            # Prefetch vocabulary and articles for this flush
-                            prefetched_vocab, prefetched_articles = prefetch_vocabulary_async(
-                                list(next_inverted_term_ids), reader_executor
-                            )
-                            if next_inverted_article_ids:
-                                prefetched_articles.update(
-                                    prefetch_articles_async(list(next_inverted_article_ids), reader_executor)
-                                )
-                            next_inverted_term_ids.clear()
-                            next_inverted_article_ids.clear()
-                            
-                            db_future = inverted_executor.submit(
-                                flush_inverted_sync, inverted_buffer[:], False, prefetched_vocab, prefetched_articles
-                            )
-                            db_futures.append(('inverted', db_future))
-                            inverted_buffer.clear()
             
             # Wait for all DB writes to complete
             self.stdout.write("Waiting for database writes to complete...")
@@ -1177,20 +1143,8 @@ class Command(BaseCommand):
                 )
                 tfidf_created += flush_tfidf_sync(tfidf_buffer, False, prefetched_articles)
             
-            if optimize_inverted_bulk:
-                # Single-session COPY using all accumulated tuples
-                inverted_created += flush_inverted_sync(inverted_all if inverted_all else inverted_buffer)
-            else:
-                if inverted_buffer:
-                    prefetched_vocab, prefetched_articles = prefetch_vocabulary_async(
-                        list(set(tup[0] for tup in inverted_buffer)), reader_executor
-                    )
-                    prefetched_articles.update(
-                        prefetch_articles_async(list(set(tup[1] for tup in inverted_buffer)), reader_executor)
-                    )
-                    inverted_created += flush_inverted_sync(
-                        inverted_buffer, False, prefetched_vocab, prefetched_articles
-                    )
+            # Always use bulk mode for inverted index - single-session COPY using all accumulated tuples
+            inverted_created += flush_inverted_sync(inverted_all if inverted_all else inverted_buffer)
         
         # Cleanup
         producer_thread_pass2.join()
@@ -1218,7 +1172,6 @@ class Command(BaseCommand):
         self.stdout.write(f"  - GPU threads: {gpu_consumers}")
         self.stdout.write(f"  - Reader threads: {reader_workers}")
         self.stdout.write(f"  - GPU process batch size: {gpu_batch_size}")
-        self.stdout.write(f"  - Split writer pools: {separate_writers}")
         self.stdout.write(f"  - Throughput: {total_articles/total_time:.1f} articles/second")
         
         # Show some statistics
@@ -1239,6 +1192,6 @@ class Command(BaseCommand):
             self.style.SUCCESS(
                 f"Optimized GPU-accelerated TF-IDF indexing complete. "
                 f"Processed {total_articles} articles in {total_time:.2f}s using {gpu_consumers} GPU threads "
-                f"and {reader_workers} reader threads with split writer pools."
+                f"and {reader_workers} reader threads."
             )
         )
