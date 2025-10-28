@@ -173,7 +173,7 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser) -> None:
         parser.add_argument("--rebuild", action="store_true", help="Clear existing index before building")
-        parser.add_argument("--batch-size", type=int, default=500, help="Articles per worker batch")
+        parser.add_argument("--batch-size", type=int, default=500, help="Articles per worker, lower batch size for smaller memory footprint")
         parser.add_argument("--limit", type=int, default=0, help="Limit number of articles (for testing)")
         parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
         parser.add_argument("--db-workers", type=int, default=96, help="Number of database writer threads (default: 96)")
