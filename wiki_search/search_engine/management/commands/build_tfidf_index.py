@@ -600,7 +600,7 @@ class Command(BaseCommand):
                     completed_consumers += 1
                 else:
                     global_df.update(result)
-                    pbar.update(len(result))
+                    pbar.update(100)
         
         # Cleanup
         producer_thread.join()
