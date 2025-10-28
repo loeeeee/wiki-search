@@ -57,7 +57,7 @@ pkgs.mkShell {
         lxml
         orjson
         psutil
-        psycopg2-binary
+        psycopg
         django
 
         ## NLP
