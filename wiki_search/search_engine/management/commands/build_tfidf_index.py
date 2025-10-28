@@ -270,7 +270,7 @@ class Command(BaseCommand):
                 else:
                     self.stdout.write(self.style.WARNING("GPU acceleration requested but no GPU available. Using CPU."))
                     logger.warning("GPU acceleration requested but no GPU available. Using CPU.")
-                    use_gpu = False
+                    raise RuntimeError("GPU acceleration requested but no GPU available. Using CPU.")
             except ImportError:
                 self.stdout.write(self.style.WARNING("GPU acceleration requested but PyTorch not available. Using CPU."))
                 logger.warning("GPU acceleration requested but PyTorch not available. Using CPU.")
@@ -379,20 +379,12 @@ class Command(BaseCommand):
             
             # Submit batches for parallel TF-IDF computation
             if use_gpu:
-                try:
-                    import torch
-                    device = torch.device('cuda')
-                    futures = [
-                        process_executor.submit(_build_tfidf_batch_gpu, batch, term_to_id, term_to_idf, device)
-                        for batch in worker_batches
-                    ]
-                except (ImportError, RuntimeError) as e:
-                    self.stdout.write(self.style.WARNING(f"GPU computation failed: {e}. Falling back to CPU."))
-                    logger.warning(f"GPU computation failed, falling back to CPU: {e}")
-                    futures = [
-                        process_executor.submit(_build_tfidf_batch, batch, term_to_id, term_to_idf)
-                        for batch in worker_batches
-                    ]
+                import torch
+                device = torch.device('cuda')
+                futures = [
+                    process_executor.submit(_build_tfidf_batch_gpu, batch, term_to_id, term_to_idf, device)
+                    for batch in worker_batches
+                ]
             else:
                 futures = [
                     process_executor.submit(_build_tfidf_batch, batch, term_to_id, term_to_idf)
