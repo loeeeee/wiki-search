@@ -24,7 +24,7 @@ Always test run the code after each task is finished.
 
 Never use emoji in the code and documentation.
 
-When needed, prefer using dataclass the normal python objects.
+Always define data structure with dataclass.
 
 Always add tqdm progress bar to the process that would take a long time. (>10s)
 
@@ -36,11 +36,9 @@ Always exam the existing code logic first with a global view of the code, and st
 
 When optimizing CPU utilization, always use concurrent.futures instead of multiprocessing, unless the user explicit agree the usage of multiprocessing.
 
-Always avoid module level constant.
+Never use module level constant.
 
 Always import module at the top of the file, unless specifically consent by the user.
-
-For computational tasks, never fallback to slower procedure, always raise errors when command cannot be completed.
 
 Always use fail-fast design.
 
