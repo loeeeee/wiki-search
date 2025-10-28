@@ -42,7 +42,7 @@ Always import module at the top of the file, unless specifically consent by the 
 
 For computational tasks, never fallback to slower procedure, always raise errors when command cannot be completed.
 
-Always fail fast when exception is encountered.
+Always use fail-fast design.
 
 ## Documentation
 
