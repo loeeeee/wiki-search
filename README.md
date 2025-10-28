@@ -278,22 +278,33 @@ python wiki_search/manage.py build_tfidf_index --rebuild
 
 # With custom workers and profiling
 python wiki_search/manage.py build_tfidf_index --workers 8 --db-workers 48 --profile --verbose
+
+# GPU acceleration (requires PyTorch with ROCm/CUDA support)
+python wiki_search/manage.py build_tfidf_index --use-gpu --rebuild --limit 100000
 ```
 
 **Options:**
 - `--rebuild`: Clear existing index before building
-- `--batch-size N`: Articles per worker batch (default: 1000)
+- `--batch-size N`: Articles per worker batch (default: 500)
 - `--limit N`: Limit number of articles (for testing)
 - `--workers N`: Number of worker processes (default: CPU/2)
 - `--db-workers N`: Number of database writer threads (default: 96)
 - `--verbose`: Enable verbose logging
 - `--profile`: Enable detailed profiling with cProfile
+- `--use-gpu`: Enable GPU acceleration for TF-IDF computation (requires PyTorch with ROCm/CUDA)
 
 **Performance Characteristics:**
 - **Small datasets (100-1k articles)**: 10-25 articles/second
 - **Medium datasets (1k-10k articles)**: 20-40 articles/second
 - **Large datasets (10k+ articles)**: 30-60 articles/second
+- **GPU acceleration**: 2-3x speedup for TF-IDF computation on compatible hardware
 - **Auto-scaling**: Worker count automatically optimized based on dataset size
+
+**GPU Requirements:**
+- PyTorch with ROCm (AMD GPUs) or CUDA (NVIDIA GPUs) support
+- Compatible GPU drivers installed
+- Sufficient GPU memory for batch processing
+- Automatically falls back to CPU if GPU is unavailable
 
 **Token Counting Integration:**
 - Automatically computes token counts for each paragraph
