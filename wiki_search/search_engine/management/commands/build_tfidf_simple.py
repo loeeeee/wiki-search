@@ -1,10 +1,13 @@
 import cProfile
+import concurrent.futures
 import io
 import logging
 import math
+import os
 import pstats
 import time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from io import StringIO
 from typing import Dict, List
@@ -46,6 +49,29 @@ def tokenize_article(paragraphs: List[str], tokenizer: NLTKTokenizer) -> Dict[st
     tf_dict = Counter(tokens)
     
     return dict(tf_dict)
+
+
+def tokenize_article_batch(article_batch: List[tuple]) -> List[tuple]:
+    """Worker function to tokenize a batch of articles in parallel.
+    
+    This function is designed to be used with ProcessPoolExecutor.
+    Each worker process initializes its own NLTKTokenizer instance.
+    
+    Args:
+        article_batch: List of (article_id, paragraphs) tuples
+        
+    Returns:
+        List of (article_id, tf_dict) tuples where tf_dict is {term: count}
+    """
+    # Initialize tokenizer in worker process (avoids pickling issues)
+    tokenizer = NLTKTokenizer()
+    
+    results = []
+    for article_id, paragraphs in article_batch:
+        tf_dict = tokenize_article(paragraphs, tokenizer)
+        results.append((article_id, tf_dict))
+    
+    return results
 
 
 def compute_idf(df_dict: Dict[str, int], total_docs: int) -> Dict[str, float]:
@@ -126,6 +152,95 @@ def pass1_build_tf_df(
             global_df[term] = global_df.get(term, 0) + 1
     
     total_docs = len(articles)
+    
+    logger.info(f"Pass 1 complete:")
+    logger.info(f"  - Processed {total_docs} articles")
+    logger.info(f"  - Unique terms: {len(global_df)}")
+    logger.info(f"  - Avg terms per article: {sum(len(tf) for tf in article_tf_map.values()) / total_docs:.1f}")
+    
+    return Pass1Result(
+        article_tf_map=article_tf_map,
+        global_df=global_df,
+        total_docs=total_docs,
+        article_ids=article_ids
+    )
+
+
+def pass1_build_tf_df_parallel(
+    articles_qs,
+    batch_size_per_worker: int,
+    cpu_workers: int,
+    logger: logging.Logger
+) -> Pass1Result:
+    """Pass 1: Build TF and DF using multiprocess parallelism.
+    
+    Uses ProcessPoolExecutor to parallelize tokenization across CPU cores.
+    Database reads use iterator for memory efficiency.
+    
+    Args:
+        articles_qs: Django QuerySet of Article objects
+        batch_size_per_worker: Number of articles per worker batch
+        cpu_workers: Number of CPU worker processes
+        logger: Logger for output
+        
+    Returns:
+        Pass1Result with cached TF and DF data
+    """
+    logger.info("=== Pass 1: Building TF and DF (Parallel) ===")
+    logger.info(f"CPU workers: {cpu_workers}")
+    logger.info(f"Batch size per worker: {batch_size_per_worker}")
+    
+    article_tf_map = {}
+    global_df = {}
+    article_ids = []
+    
+    # Get total count for progress bar
+    total_articles = articles_qs.count()
+    logger.info(f"Total articles to process: {total_articles}")
+    
+    # Collect batches from iterator
+    logger.info("Collecting articles from database iterator...")
+    current_batch = []
+    batches = []
+    
+    for article_id, paragraphs in articles_qs.values_list('id', 'plain_text_paragraphs').iterator(chunk_size=100):
+        current_batch.append((article_id, paragraphs))
+        
+        if len(current_batch) >= batch_size_per_worker:
+            batches.append(current_batch)
+            current_batch = []
+    
+    # Add remaining articles
+    if current_batch:
+        batches.append(current_batch)
+    
+    logger.info(f"Created {len(batches)} batches for parallel processing")
+    
+    # Process batches in parallel
+    with ProcessPoolExecutor(max_workers=cpu_workers) as executor:
+        # Submit all batches
+        future_to_batch = {
+            executor.submit(tokenize_article_batch, batch): batch 
+            for batch in batches
+        }
+        
+        # Process results as they complete
+        with tqdm(total=total_articles, desc="Pass 1: TF/DF (Parallel)", unit="article") as pbar:
+            for future in concurrent.futures.as_completed(future_to_batch):
+                batch_results = future.result()
+                
+                # Aggregate results
+                for article_id, tf_dict in batch_results:
+                    article_tf_map[article_id] = tf_dict
+                    article_ids.append(article_id)
+                    
+                    # Update global DF
+                    for term in tf_dict.keys():
+                        global_df[term] = global_df.get(term, 0) + 1
+                    
+                    pbar.update(1)
+    
+    total_docs = len(article_ids)
     
     logger.info(f"Pass 1 complete:")
     logger.info(f"  - Processed {total_docs} articles")
@@ -241,7 +356,6 @@ def create_inverted_index_raw_sql(
 
 def pass2_build_tfidf(
     pass1_result: Pass1Result,
-    batch_size: int,
     logger: logging.Logger
 ) -> None:
     """Pass 2: Build IDF values and inverted index, save to database.
@@ -253,7 +367,6 @@ def pass2_build_tfidf(
     
     Args:
         pass1_result: Results from Pass 1
-        batch_size: Batch size for bulk database operations (unused, kept for compatibility)
         logger: Logger for output
     """
     logger.info("=== Pass 2: Building IDF and Inverted Index ===")
@@ -287,7 +400,7 @@ def pass2_build_tfidf(
 
 
 class Command(BaseCommand):
-    help = 'Build TF-IDF index using single-process, single-threaded approach'
+    help = 'Build TF-IDF index using multiprocess parallel approach'
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -307,15 +420,21 @@ class Command(BaseCommand):
             help='Clear existing Vocabulary and InvertedIndex before building'
         )
         parser.add_argument(
-            '--batch-size',
-            type=int,
-            default=500,
-            help='Batch size for bulk database operations (default: 500, unused but kept for compatibility)'
-        )
-        parser.add_argument(
             '--verbose',
             action='store_true',
             help='Enable verbose logging'
+        )
+        parser.add_argument(
+            '--cpu-workers',
+            type=int,
+            default=None,
+            help='Number of CPU worker processes (default: all available cores)'
+        )
+        parser.add_argument(
+            '--batch-size-per-worker',
+            type=int,
+            default=200,
+            help='Number of articles per worker batch (default: 200)'
         )
 
     def handle(self, *args, **options):
@@ -327,13 +446,18 @@ class Command(BaseCommand):
         )
         logger = logging.getLogger(__name__)
         
+        # Determine CPU workers
+        cpu_workers = options['cpu_workers'] or os.cpu_count()
+        
         # Display configuration
         logger.info("=" * 60)
-        logger.info("Single-Thread TF-IDF Builder (PostgreSQL COPY)")
+        logger.info("Multi-Process TF-IDF Builder (PostgreSQL COPY)")
         logger.info("=" * 60)
         logger.info(f"Limit: {options['limit'] or 'None (all articles)'}")
         logger.info(f"Profile: {options['profile']}")
         logger.info(f"Rebuild: {options['rebuild']}")
+        logger.info(f"CPU Workers: {cpu_workers}")
+        logger.info(f"Batch Size Per Worker: {options['batch_size_per_worker']}")
         logger.info("=" * 60)
         
         # Clear existing data if rebuild
@@ -355,19 +479,20 @@ class Command(BaseCommand):
             article_count = articles_qs.count()
             logger.info(f"Processing {article_count} articles")
             
-            # Initialize tokenizer
-            logger.info("Initializing NLTK tokenizer...")
-            tokenizer = NLTKTokenizer()
-            
-            # Pass 1: Build TF and DF
+            # Pass 1: Build TF and DF (multiprocess)
             pass1_start = time.time()
-            pass1_result = pass1_build_tf_df(articles_qs, tokenizer, logger)
+            pass1_result = pass1_build_tf_df_parallel(
+                articles_qs, 
+                options['batch_size_per_worker'],
+                cpu_workers,
+                logger
+            )
             pass1_time = time.time() - pass1_start
             logger.info(f"Pass 1 completed in {pass1_time:.2f}s")
             
             # Pass 2: Build IDF and inverted index
             pass2_start = time.time()
-            pass2_build_tfidf(pass1_result, options['batch_size'], logger)
+            pass2_build_tfidf(pass1_result, logger)
             pass2_time = time.time() - pass2_start
             logger.info(f"Pass 2 completed in {pass2_time:.2f}s")
             

@@ -268,59 +268,72 @@ python wiki_search/manage.py resolve_links --rebuild --batch-size 5000 --db-work
 
 ## Search Index Commands
 
-### Build TF-IDF Index (Simple Single-Thread)
+### Build TF-IDF Index (Multiprocess)
 
-Build TF-IDF index using a simple single-process, single-threaded approach for clarity and debugging:
+Build TF-IDF index using multiprocess parallel approach with PostgreSQL COPY optimization:
 
 ```bash
-# Test with 300 articles
-python wiki_search/manage.py build_tfidf_simple --limit 300
+# Build with default settings (uses all CPU cores)
+python wiki_search/manage.py build_tfidf_simple --limit 10000 --rebuild
 
-# Test with profiling enabled
-python wiki_search/manage.py build_tfidf_simple --limit 300 --profile --rebuild
+# Custom workers and batch size for optimal performance
+python wiki_search/manage.py build_tfidf_simple --rebuild --cpu-workers 16 --batch-size-per-worker 200
 
-# Rebuild all indexes with verbose output
+# Test with profiling
+python wiki_search/manage.py build_tfidf_simple --limit 1000 --profile --rebuild
+
+# Full rebuild with verbose logging
 python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
-
-# Test with 1000 articles
-python wiki_search/manage.py build_tfidf_simple --limit 1000 --profile
 ```
 
 **Options:**
 - `--limit N`: Limit number of articles to process (default: all)
 - `--profile`: Enable cProfile profiling
 - `--rebuild`: Clear existing Vocabulary and InvertedIndex before building
-- `--batch-size N`: Batch size for bulk database operations (default: 500)
 - `--verbose`: Enable verbose logging
+- `--cpu-workers N`: Number of CPU worker processes (default: all available cores)
+- `--batch-size-per-worker N`: Articles per worker batch (default: 200)
 
 **Architecture:**
 - **Pass 1**: Build term frequency (TF) and document frequency (DF)
-  - Tokenize articles using NLTK
-  - Cache TF maps in memory
-  - Build global DF dictionary
+  - Multiprocess tokenization using NLTK with ProcessPoolExecutor
+  - Database reads use `.iterator()` for memory efficiency
+  - Configurable workers and batch size for optimal performance
+  - Cache TF maps in memory, aggregate global DF dictionary
 - **Pass 2**: Build IDF values and inverted index
   - Calculate IDF = log(N / df)
-  - Save Vocabulary table with term statistics
-  - Build and save InvertedIndex entries
+  - Save Vocabulary table with term statistics using PostgreSQL COPY
+  - Build and save InvertedIndex entries using PostgreSQL COPY
 
 **Performance Characteristics:**
-- **Single-thread processing**: **45.76 articles/second** ✓ Target achieved! (300 articles in 6.56s)
-- **Pass 1 (TF/DF)**: 83.80 articles/second (3.58s for 300 articles)
-- **Pass 2 (IDF/Inverted Index)**: 109.09 articles/second (2.75s for 300 articles)
-- **Optimization**: PostgreSQL COPY for 4.2x speedup over Django ORM
-- **Memory efficient**: TF-IDF vectors kept in memory, not persisted
+
+*Test: 1000 articles, 16 workers, batch 200:*
+- **Overall throughput**: 144.11 articles/second
+- **Pass 1 (TF/DF)**: 1.39s (20% of time, 8.1x faster than single-thread)
+- **Pass 2 (IDF/Inverted Index)**: 5.55s (80% of time)
+
+*Test: 10000 articles, 16 workers, batch 200:*
+- **Overall throughput**: 136.67 articles/second
+- **Pass 1 (TF/DF)**: 4.84s (6.6% of time, 2490 articles/second!)
+- **Pass 2 (IDF/Inverted Index)**: 67.86s (92.7% of time, database I/O bottleneck)
+
+**Optimization Notes:**
+- PostgreSQL COPY provides 4.2x speedup over Django ORM
+- Multiprocess tokenization achieves 2000-5000 articles/second in Pass 1
+- Pass 2 database writes are the bottleneck (80-95% of execution time)
+- Optimal configuration: 16 workers with batch size 200
+- CPU utilization: Full parallelism without GIL limitations
 
 **Use Cases:**
-- **Debugging**: Simple, single-threaded for easy debugging
-- **Small datasets**: Fast enough for small to medium datasets (< 10k articles)
-- **Baseline profiling**: Establish performance baseline before optimization
-- **Development**: Clean code structure for understanding TF-IDF algorithm
+- Production builds of TF-IDF indexes
+- Processing large datasets (> 1k articles)
+- Development and debugging with clean code structure
 
 **Database Tables:**
 - **Vocabulary**: Global term statistics (term, document_frequency, idf_value)
 - **InvertedIndex**: Term-article-score mappings for fast search
 
-For detailed performance analysis, see [docs-vibe/0048-single-thread-tfidf-builder.md](docs-vibe/0048-single-thread-tfidf-builder.md).
+For detailed performance analysis, see [docs-vibe/0051-multiprocess-tokenization.md](docs-vibe/0051-multiprocess-tokenization.md).
 
 ### Build TF-IDF Index (Optimized Multi-Thread)
 
