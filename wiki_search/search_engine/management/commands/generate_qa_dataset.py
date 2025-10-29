@@ -1,19 +1,21 @@
 """
 Django management command to generate QA dataset from HotpotQA data.
+Single-threaded implementation with profiling support.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
+import cProfile
+import pstats
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import cpu_count
+from typing import Dict, List, Tuple
 from dataclasses import dataclass, asdict
+from collections import defaultdict
 
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
 from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, Vocabulary
@@ -36,6 +38,7 @@ class QAEntry:
     distractor_docs: List[Dict]
     context_size: int
 
+
 @dataclass
 class _QAEntry:
     id: str
@@ -55,162 +58,6 @@ class _QAEntry:
                 distractor_docs=self.distractor_docs[:self.context_sizes[context_size][1]],
                 context_size=self.context_sizes[context_size][0])
                 for context_size in self.context_sizes
-        }
-
-def process_qa_entry_worker(entry_data: Dict) -> _QAEntry | Dict:
-    """Worker function to process a single QA entry.
-    
-    This function runs in a separate process and handles:
-    - Extracting supporting documents
-    - Finding distractor documents
-    - Calculating context size
-    - Returning processed entry or None if skipped
-    """
-    try:
-        from django.db import connection
-        from search_engine.models import Article
-        from search_engine.search import search_hybrid
-        from search_engine.qa_helpers import (
-            count_article_tokens, 
-            format_article_for_qa, 
-            calculate_context_size
-        )
-        
-        # Close any inherited database connections (required for multiprocessing)
-        from django.db import connections
-        for conn in connections.all():
-            conn.close()
-        
-        # Extract basic fields
-        qa_id = entry_data.get('_id', '')
-        question = entry_data.get('question', '')
-        answer = entry_data.get('answer', '')
-        supporting_facts = entry_data.get('supporting_facts', [])
-
-        # Get supporting documents
-        supporting_docs = []
-        missing_articles = []
-
-        for fact in supporting_facts:
-            if len(fact) >= 1:
-                title = fact[0]
-                try:
-                    article = Article.objects.get(title__iexact=title)
-                    supporting_docs.append(format_article_for_qa(article))
-                except Article.DoesNotExist:
-                    missing_articles.append(title)
-
-        if missing_articles:
-            return {
-                'status': 'skipped_missing_articles',
-                'id': qa_id,
-                'missing_articles': missing_articles
-            }
-
-        # Check if supporting docs exceed context limit (use 8k as minimum)
-        supporting_tokens = sum(
-            count_article_tokens(Article.objects.get(title=doc['title']))
-            for doc in supporting_docs
-        )
-
-        # Get distractor documents using round-robin selection
-        distractor_docs = []
-        supporting_titles = {doc['title'] for doc in supporting_docs}
-        
-        # Use supporting fact titles as search queries (extract title from [title, sentence_index] format)
-        search_results = [search_hybrid(fact[0], limit=20) for fact in supporting_facts if len(fact) > 0]
-        
-        # Round-robin through search results to collect distractors up to 128k limit
-        current_distractor_tokens = 0
-        max_context_tokens = 128000
-        search_result_indices = [0] * len(search_results)  # Track current position in each search result
-        
-        while supporting_tokens + current_distractor_tokens < max_context_tokens:
-            # Find next available article from any search result
-            found_article = False
-            
-            for result_index in range(len(search_results)):
-                if search_result_indices[result_index] < len(search_results[result_index]):
-                    article, score = search_results[result_index][search_result_indices[result_index]]
-                    search_result_indices[result_index] += 1
-                    
-                    # Skip if it's already a supporting doc
-                    if article.title in supporting_titles:
-                        continue
-                        
-                    # Skip if already in distractors
-                    if any(doc['title'] == article.title for doc in distractor_docs):
-                        continue
-                    
-                    # Check if adding this article would exceed the limit
-                    try:
-                        article_tokens = count_article_tokens(article)
-                    except Exception as e:
-                        logger.error(f"Error counting tokens for article {article.title}: {e}")
-                        continue
-                    
-                    if supporting_tokens + current_distractor_tokens + article_tokens > max_context_tokens:
-                        break
-                    
-                    # Add the distractor
-                    distractor_docs.append(format_article_for_qa(article))
-                    current_distractor_tokens += article_tokens
-                    found_article = True
-                    logger.debug(f"Added distractor: {article.title} (score: {score:.4f}, tokens: {article_tokens})")
-                    break
-            
-            # If no more articles available from any search result, break
-            if not found_article:
-                break
-
-        # Calculate context size mapping for different target sizes
-        context_sizes = {}
-        target_sizes = [8000, 32000, 128000]
-        
-        for target_size in target_sizes:
-            # Calculate how many distractor docs fit within this target size
-            distractor_tokens_used = 0
-            num_distractor_docs = 0
-            
-            for doc in distractor_docs:
-                # Count tokens for this distractor doc
-                try:
-                    doc_tokens = count_article_tokens(Article.objects.get(title=doc['title']))
-                except Exception as e:
-                    logger.error(f"Error counting tokens for distractor doc {doc['title']}: {e}")
-                    continue
-                
-                # Check if adding this doc would exceed the target size
-                if supporting_tokens + distractor_tokens_used + doc_tokens <= target_size:
-                    distractor_tokens_used += doc_tokens
-                    num_distractor_docs += 1
-                else:
-                    break
-            
-            # Store the actual context size and number of distractor docs
-            actual_context_size = supporting_tokens + distractor_tokens_used
-            context_sizes[target_size] = (actual_context_size, num_distractor_docs)
-
-        # Create _QAEntry dataclass
-        qa_entry = _QAEntry(
-            id=qa_id,
-            question=question,
-            gold_answer=answer,
-            supporting_docs=supporting_docs,
-            distractor_docs=distractor_docs,
-            context_sizes=context_sizes
-        )
-
-        return qa_entry
-
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        logger.error(f"Full error traceback for entry {entry_data.get('_id', 'unknown')}: {error_details}")
-        return {
-            'status': 'error',
-            'id': entry_data.get('_id', 'unknown'),
-            'error': str(e)
         }
 
 
@@ -240,7 +87,8 @@ class Command(BaseCommand):
         parser.add_argument(
             '--limit',
             type=int,
-            help='Limit number of QA entries to process (for testing)'
+            default=100,
+            help='Limit number of QA entries to process (default: 100)'
         )
         parser.add_argument(
             '--verbose',
@@ -248,15 +96,14 @@ class Command(BaseCommand):
             help='Enable verbose logging'
         )
         parser.add_argument(
-            '--workers',
-            type=int,
-            default=cpu_count(),
-            help=f'Number of worker processes (default: {cpu_count()})'
-        )
-        parser.add_argument(
             '--debug',
             action='store_true',
             help='Enable debug logging for troubleshooting'
+        )
+        parser.add_argument(
+            '--profile',
+            action='store_true',
+            help='Enable cProfile profiling and save results'
         )
 
     def handle(self, *args, **options):
@@ -275,7 +122,7 @@ class Command(BaseCommand):
         output_dir = Path(options['output_dir'])
         context_sizes = options['context_sizes']
         limit = options.get('limit')
-        workers = options['workers']
+        enable_profiling = options['profile']
 
         # Validate input file
         if not input_path.exists():
@@ -309,18 +156,40 @@ class Command(BaseCommand):
             qa_data = qa_data[:limit]
             self.stdout.write(f"Limited to {limit} entries for testing")
 
-        self.stdout.write(f"Processing {len(qa_data)} QA entries with {workers} workers...")
+        self.stdout.write(f"Processing {len(qa_data)} QA entries (single-threaded)...")
 
-        # Process entries with process pool
-        results = self.process_qa_entries_parallel(qa_data, context_sizes, workers)
+        # Process entries with optional profiling
+        if enable_profiling:
+            profiler = cProfile.Profile()
+            profiler.enable()
+            
+            results, timing_stats = self.process_qa_entries(qa_data, context_sizes)
+            
+            profiler.disable()
+            
+            # Save profile stats
+            profile_file = 'qa_dataset_generation.prof'
+            profiler.dump_stats(profile_file)
+            self.stdout.write(f"\nProfile saved to: {profile_file}")
+            
+            # Print profile statistics
+            self.stdout.write("\nTop 30 time-consuming functions:")
+            stats = pstats.Stats(profiler, stream=self.stdout)
+            stats.sort_stats('cumulative')
+            stats.print_stats(30)
+        else:
+            results, timing_stats = self.process_qa_entries(qa_data, context_sizes)
+
+        # Print timing statistics
+        self._print_timing_stats(timing_stats)
 
         # Generate output files
         self.generate_output_files(results, output_dir, context_sizes)
 
-        self.stdout.write(self.style.SUCCESS("QA dataset generation completed!"))
+        self.stdout.write(self.style.SUCCESS("\nQA dataset generation completed!"))
 
-    def process_qa_entries_parallel(self, qa_data: List[Dict], context_sizes: List[int], workers: int) -> Dict[int, List[Dict]]:
-        """Process QA entries in parallel using process pool."""
+    def process_qa_entries(self, qa_data: List[Dict], context_sizes: List[int]) -> Tuple[Dict[int, List[Dict]], Dict]:
+        """Process QA entries in single-threaded manner with timing instrumentation."""
         results = {size: [] for size in context_sizes}
         
         stats = {
@@ -330,53 +199,155 @@ class Command(BaseCommand):
             'skipped_context_overflow': 0,
             'errors': 0
         }
-
-        # Process entries in parallel
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            # Submit all tasks
-            future_to_entry = {
-                executor.submit(process_qa_entry_worker, entry): entry 
-                for entry in qa_data
-            }
+        
+        timing_stats = defaultdict(list)
+        
+        # Process entries with progress bar
+        for entry_data in tqdm(qa_data, desc="Processing QA entries"):
+            entry_start = time.perf_counter()
             
-            # Process completed tasks with progress bar
-            for future in tqdm(as_completed(future_to_entry), 
-                             total=len(qa_data), 
-                             desc="Processing QA entries"):
-                try:
-                    result = future.result()
+            try:
+                # Extract basic fields
+                qa_id = entry_data.get('_id', '')
+                question = entry_data.get('question', '')
+                answer = entry_data.get('answer', '')
+                supporting_facts = entry_data.get('supporting_facts', [])
+
+                # Get supporting documents
+                supporting_docs = []
+                missing_articles = []
+                
+                lookup_start = time.perf_counter()
+                for fact in supporting_facts:
+                    if len(fact) >= 1:
+                        title = fact[0]
+                        try:
+                            article = Article.objects.get(title__iexact=title)
+                            supporting_docs.append(format_article_for_qa(article))
+                        except Article.DoesNotExist:
+                            missing_articles.append(title)
+                timing_stats['article_lookup'].append(time.perf_counter() - lookup_start)
+
+                if missing_articles:
+                    stats['skipped_missing_articles'] += 1
+                    logger.warning(f"Skipping {qa_id}: Missing articles {missing_articles}")
+                    continue
+
+                # Count supporting document tokens
+                token_start = time.perf_counter()
+                supporting_tokens = sum(
+                    count_article_tokens(Article.objects.get(title=doc['title']))
+                    for doc in supporting_docs
+                )
+                timing_stats['token_counting'].append(time.perf_counter() - token_start)
+
+                # Get distractor documents using round-robin selection
+                distractor_docs = []
+                supporting_titles = {doc['title'] for doc in supporting_docs}
+                
+                # Use supporting fact titles as search queries
+                search_start = time.perf_counter()
+                search_results = [search_hybrid(fact[0], limit=20) for fact in supporting_facts if len(fact) > 0]
+                timing_stats['search_operations'].append(time.perf_counter() - search_start)
+                
+                # Round-robin through search results to collect distractors up to 128k limit
+                current_distractor_tokens = 0
+                max_context_tokens = 128000
+                search_result_indices = [0] * len(search_results)
+                
+                while supporting_tokens + current_distractor_tokens < max_context_tokens:
+                    found_article = False
                     
-                    # Check if result is _QAEntry dataclass (success case)
-                    if isinstance(result, _QAEntry):
-                        stats['processed'] += 1
-                        
-                        # Get all context size variants
-                        context_entries = result.get_all_context_sizes()
-                        
-                        # Add to appropriate context size buckets
-                        for context_size in context_sizes:
-                            if context_size in context_entries:
-                                # Convert QAEntry dataclass to dict for JSON serialization
-                                entry_dict = asdict(context_entries[context_size])
-                                results[context_size].append(entry_dict)
+                    for result_index in range(len(search_results)):
+                        if search_result_indices[result_index] < len(search_results[result_index]):
+                            article, score = search_results[result_index][search_result_indices[result_index]]
+                            search_result_indices[result_index] += 1
+                            
+                            # Skip if it's already a supporting doc
+                            if article.title in supporting_titles:
+                                continue
                                 
-                    # Handle error/skip cases (still dict format)
-                    elif isinstance(result, dict):
-                        if result['status'] == 'skipped_missing_articles':
-                            stats['skipped_missing_articles'] += 1
-                            logger.warning(f"Skipping {result['id']}: Missing articles {result['missing_articles']}")
+                            # Skip if already in distractors
+                            if any(doc['title'] == article.title for doc in distractor_docs):
+                                continue
                             
-                        elif result['status'] == 'skipped_context_overflow':
-                            stats['skipped_context_overflow'] += 1
-                            logger.warning(f"Skipping {result['id']}: Supporting docs exceed context limit ({result['supporting_tokens']} tokens)")
+                            # Check if adding this article would exceed the limit
+                            try:
+                                article_tokens = count_article_tokens(article)
+                            except Exception as e:
+                                logger.error(f"Error counting tokens for article {article.title}: {e}")
+                                continue
                             
-                        elif result['status'] == 'error':
-                            stats['errors'] += 1
-                            logger.error(f"Error processing entry {result['id']}: {result['error']}")
+                            if supporting_tokens + current_distractor_tokens + article_tokens > max_context_tokens:
+                                break
+                            
+                            # Add the distractor
+                            distractor_docs.append(format_article_for_qa(article))
+                            current_distractor_tokens += article_tokens
+                            found_article = True
+                            logger.debug(f"Added distractor: {article.title} (score: {score:.4f}, tokens: {article_tokens})")
+                            break
+                    
+                    # If no more articles available from any search result, break
+                    if not found_article:
+                        break
+
+                # Calculate context size mapping for different target sizes
+                context_sizes_map = {}
+                target_sizes = [8000, 32000, 128000]
+                
+                for target_size in target_sizes:
+                    # Calculate how many distractor docs fit within this target size
+                    distractor_tokens_used = 0
+                    num_distractor_docs = 0
+                    
+                    for doc in distractor_docs:
+                        try:
+                            doc_tokens = count_article_tokens(Article.objects.get(title=doc['title']))
+                        except Exception as e:
+                            logger.error(f"Error counting tokens for distractor doc {doc['title']}: {e}")
+                            continue
                         
-                except Exception as e:
-                    stats['errors'] += 1
-                    logger.error(f"Unexpected error processing entry: {e}")
+                        if supporting_tokens + distractor_tokens_used + doc_tokens <= target_size:
+                            distractor_tokens_used += doc_tokens
+                            num_distractor_docs += 1
+                        else:
+                            break
+                    
+                    # Store the actual context size and number of distractor docs
+                    actual_context_size = supporting_tokens + distractor_tokens_used
+                    context_sizes_map[target_size] = (actual_context_size, num_distractor_docs)
+
+                # Create _QAEntry dataclass
+                qa_entry = _QAEntry(
+                    id=qa_id,
+                    question=question,
+                    gold_answer=answer,
+                    supporting_docs=supporting_docs,
+                    distractor_docs=distractor_docs,
+                    context_sizes=context_sizes_map
+                )
+
+                # Add to results
+                stats['processed'] += 1
+                
+                # Get all context size variants
+                context_entries = qa_entry.get_all_context_sizes()
+                
+                # Add to appropriate context size buckets
+                for context_size in context_sizes:
+                    if context_size in context_entries:
+                        entry_dict = asdict(context_entries[context_size])
+                        results[context_size].append(entry_dict)
+
+            except Exception as e:
+                stats['errors'] += 1
+                logger.error(f"Error processing entry {entry_data.get('_id', 'unknown')}: {e}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    import traceback
+                    logger.debug(traceback.format_exc())
+            
+            timing_stats['entry_total'].append(time.perf_counter() - entry_start)
 
         # Log statistics
         self.stdout.write(f"\nProcessing Statistics:")
@@ -386,15 +357,31 @@ class Command(BaseCommand):
         self.stdout.write(f"  Skipped (context overflow): {stats['skipped_context_overflow']}")
         self.stdout.write(f"  Errors: {stats['errors']}")
 
-        return results
+        return results, timing_stats
 
+    def _print_timing_stats(self, timing_stats: Dict[str, List[float]]):
+        """Print timing statistics summary."""
+        self.stdout.write(f"\nTiming Statistics:")
+        
+        for operation, times in timing_stats.items():
+            if times:
+                total = sum(times)
+                avg = total / len(times)
+                min_time = min(times)
+                max_time = max(times)
+                
+                self.stdout.write(f"  {operation}:")
+                self.stdout.write(f"    Total: {total:.2f}s")
+                self.stdout.write(f"    Average: {avg*1000:.2f}ms")
+                self.stdout.write(f"    Min: {min_time*1000:.2f}ms")
+                self.stdout.write(f"    Max: {max_time*1000:.2f}ms")
 
     def generate_output_files(self, results: Dict[int, List[Dict]], output_dir: Path, context_sizes: List[int]):
         """Generate output JSON files for each context size."""
         for context_size in context_sizes:
             output_file = output_dir / f"qa_dataset_{context_size}.json"
             
-            self.stdout.write(f"Writing {len(results[context_size])} entries to {output_file}")
+            self.stdout.write(f"\nWriting {len(results[context_size])} entries to {output_file}")
             
             try:
                 with open(output_file, 'w', encoding='utf-8') as f:

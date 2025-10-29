@@ -510,29 +510,35 @@ For detailed documentation, see [docs-vibe/0106-search-benchmark.md](docs-vibe/0
 Generate question-answering dataset for LLM training from HotpotQA data:
 
 ```bash
-# Test on toy dataset first
+# Test with small dataset and profiling (recommended)
 python wiki_search/manage.py generate_qa_dataset \
-  --input data/raw/hotpot_dev_fullwiki_v1_toy.json \
+  --input data/raw/hotpot_dev_fullwiki_v1.json \
   --output-dir data/processed \
-  --context-sizes 8000 32000 128000 \
+  --limit 10 \
+  --profile \
   --verbose
 
-# Process full dataset (when available)
+# Production run (default 100 entries)
+python wiki_search/manage.py generate_qa_dataset \
+  --input data/raw/hotpot_dev_fullwiki_v1.json \
+  --output-dir data/processed
+
+# Custom context sizes
 python wiki_search/manage.py generate_qa_dataset \
   --input data/raw/hotpot_dev_fullwiki_v1.json \
   --output-dir data/processed \
   --context-sizes 8000 32000 128000 \
-  --workers 8 \
-  --limit 1000
+  --limit 500
 ```
 
 **Options:**
 - `--input PATH`: Path to HotpotQA JSON file (default: data/raw/hotpot_dev_fullwiki_v1.json)
 - `--output-dir PATH`: Directory for output files (default: data/processed)
 - `--context-sizes N1 N2 N3`: Context size limits in tokens (default: 8000 32000 128000)
-- `--limit N`: Limit number of entries to process (for testing)
-- `--workers N`: Number of worker processes (default: CPU count)
+- `--limit N`: Limit number of entries to process (default: 100)
+- `--profile`: Enable cProfile profiling and save to qa_dataset_generation.prof
 - `--verbose`: Enable verbose logging
+- `--debug`: Enable debug logging for troubleshooting
 
 **Output Files:**
 - `qa_dataset_8000.json` - entries with context_size ≤ 8k tokens
@@ -543,16 +549,19 @@ python wiki_search/manage.py generate_qa_dataset \
 1. **Supporting Documents**: Extract articles from database using exact title matching from `supporting_facts`
 2. **Distractor Documents**: Use hybrid search (TF-IDF + PageRank) with supporting fact titles as queries, excluding supporting docs
 3. **Context Filtering**: Skip entries where supporting docs alone exceed context limits
-4. **Token Counting**: Use GPT tokenizer (tiktoken cl100k_base) for LLM-compatible token counting
-5. **Output Generation**: Create separate files for each context size with appropriate filtering
 
-**Performance Characteristics:**
-- **Multiprocessing**: Uses all CPU cores by default for parallel processing
-- **Token Counting**: ~50,000 tokens/second using GPT tokenizer
-- **Search Performance**: Uses hybrid search (TF-IDF + PageRank) with inverted index for better quality distractor documents
-- **Memory Efficient**: Streams processing to handle large datasets
-- **Progress Tracking**: Real-time progress bars and comprehensive logging
-- **Speed**: ~5-6 seconds per entry with 8 workers (vs ~13-15 seconds sequential)
+**Performance Notes:**
+- Single-threaded implementation with comprehensive timing instrumentation
+- Use `--profile` to identify bottlenecks and analyze performance
+- Profile output saved to `qa_dataset_generation.prof` (analyze with `python -m pstats`)
+- See [docs-vibe/0114-qa-dataset-single-threaded.md](docs-vibe/0114-qa-dataset-single-threaded.md) for profiling results
+
+**Implementation Details:**
+- Token counting uses GPT tokenizer (tiktoken cl100k_base) for LLM-compatible counts
+- Timing statistics reported for article lookups, token counting, and search operations
+- Supports verbose and debug logging modes for troubleshooting
+- Real-time progress bars with tqdm for monitoring
+- Comprehensive error handling with skip statistics
 
 ## Web Application
 
@@ -697,15 +706,21 @@ For detailed information, see [docs-vibe/archives/0037-nltk-tfidf-refactor.md](d
 
 ### QA Dataset Performance
 
-**Generation Speed:**
-- **Sequential processing**: ~13-15 seconds per entry
-- **8 workers**: ~5-6 seconds per entry
+**Generation Speed (10 entry baseline):**
+- **Current (single-threaded)**: ~26 seconds per entry
+- **Total time**: 259 seconds for 10 entries
 - **Token counting**: ~50,000 tokens/second using GPT tokenizer
+
+**Profiling Results:**
+- **Article lookups**: 94.5% of total time (244.9s) - Primary bottleneck
+- **Search operations**: 1.6% of total time (4.0s)
+- **Token counting**: 0.5% of total time (1.4s)
+- See [docs-vibe/0114-qa-dataset-single-threaded.md](docs-vibe/0114-qa-dataset-single-threaded.md) for detailed analysis
 
 **Memory Usage:**
 - Scales linearly with dataset size
-- Streams processing to handle large datasets
-- Uses ProcessPoolExecutor for optimal CPU utilization
+- Single-threaded processing for simplicity and debuggability
+- Comprehensive profiling support for performance optimization
 
 ## Documentation
 
