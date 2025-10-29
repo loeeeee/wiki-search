@@ -26,6 +26,8 @@ Never use emoji in the code and documentation.
 
 Always define data structure with dataclass.
 
+When data type is too simple to be defined as dataclass, always create a NamedDict for dictionary.
+
 Always add tqdm progress bar to the process that would take a long time. (>10s)
 
 Always follow the existing code structure.
