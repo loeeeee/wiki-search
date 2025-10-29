@@ -319,34 +319,35 @@ python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
 
 **Performance Characteristics:**
 
-*Current Performance (optimized with initializer pattern, 6000 articles):*
-- 6000 articles: **433 articles/second** (13.86s total)
-- Pass 1: 3.07s (22.1%)
-- Pass 2: 10.78s (77.8%)
-  - Vocabulary: 0.60s
-  - Term mapping: 0.76s
-  - Inverted Index: 9.31s (pipelined CSV building + DB writes)
-- Configuration: 12 csv-workers, 12 db-workers, batch size 400
+*Current Performance (fully optimized, 10000 articles):*
+- 10000 articles: **451 articles/second** (22.2s total)
+- Pass 1: 4.5s (20%)
+- Pass 2: 17.3s (78%)
+  - Vocabulary: 1.1s (CSV: 0.66s, DB: 0.44s)
+  - Term mapping: 0.14s (optimized with values_list)
+  - Inverted Index: 16.0s (CSV: 4.6s, DB: 10.8s pipelined)
+- Configuration: 16 cpu-workers, 48 csv-workers, 48 db-workers, batch size 600
 
-*Performance Breakdown (6000 articles):*
-- **CSV Building**: Fully parallelized (all 12 workers active)
+*Performance Breakdown (10000 articles):*
+- **CSV Building**: List joining (50% faster than StringIO)
 - **Database Writes**: Overlapped with CSV building via pipeline
 - **Memory**: Process-local shared data (initializer pattern)
+- **Term Mapping**: Bulk query with values_list (86% faster)
 
 *Previous Baseline (before optimizations):*
-- 6000 articles: 204.13 articles/second (29.39s total)
-- **2.12x slower** than current optimized implementation
-- CSV building bottlenecked by 7.2s pickle serialization overhead
+- 10000 articles: 323 articles/second (30.9s total)
+- **39.6% improvement** with code-level optimizations
+- Original bottlenecks: StringIO overhead, ORM iteration, excessive workers
 
 **Optimization Notes:**
 - PostgreSQL COPY provides 4.2x speedup over Django ORM
 - Multiprocess tokenization achieves 2000-5000 articles/second in Pass 1
-- Initializer pattern eliminates pickle serialization bottleneck (7.2s to negligible)
+- Initializer pattern eliminates pickle serialization bottleneck
+- List joining for CSV building: 50% faster than StringIO
+- Bulk term-to-ID mapping: 86% faster than ORM iteration
 - Pipeline architecture overlaps CSV building with DB writes for better throughput
-- CSV building: 93% improvement (9.25s to 0.64s with initializer)
 - Process-local shared data enables true multi-core parallelism
-- CPU utilization: All workers fully active without serialization bottleneck
-- Overall throughput: 2.12x improvement over baseline (204 to 433 articles/sec)
+- Further speedup to 800+ articles/sec requires database tuning (see docs-vibe/0053)
 
 **Use Cases:**
 - Production builds of TF-IDF indexes

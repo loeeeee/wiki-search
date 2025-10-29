@@ -293,12 +293,9 @@ def create_vocabulary_raw_sql(
     
     logger.info(f"Vocabulary entries created via COPY")
     
-    # Build term-to-ID mapping by querying back
+    # Build term-to-ID mapping by querying back (optimized with values_list)
     logger.info("Building term-to-ID mapping...")
-    term_to_vocab_id = {}
-    vocab_objects = Vocabulary.objects.all()
-    for vocab in vocab_objects:
-        term_to_vocab_id[vocab.term] = vocab.id
+    term_to_vocab_id = dict(Vocabulary.objects.values_list('term', 'id'))
     
     logger.info(f"Mapped {len(term_to_vocab_id)} terms to vocabulary IDs")
     return term_to_vocab_id
@@ -395,15 +392,16 @@ def create_vocabulary_csv_batch(terms_list: List[str]) -> str:
     global_df = _vocabulary_worker_data['global_df']
     idf_dict = _vocabulary_worker_data['idf_dict']
     
-    csv_buffer = io.StringIO()
+    # Use list joining instead of StringIO for better performance
+    lines = []
     for term in terms_list:
         df = global_df[term]
         idf_value = idf_dict[term]
         # Escape term for CSV (handle quotes and newlines)
         escaped_term = term.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-        csv_buffer.write(f"{escaped_term}\t{df}\t{idf_value}\n")
+        lines.append(f"{escaped_term}\t{df}\t{idf_value}\n")
     
-    return csv_buffer.getvalue()
+    return ''.join(lines)
 
 
 def write_vocabulary_batch_sql(csv_data: str) -> int:
@@ -479,7 +477,8 @@ def create_inverted_index_csv_batch(article_batch: List[int]) -> str:
     term_to_vocab_id = _inverted_index_worker_data['term_to_vocab_id']
     idf_dict = _inverted_index_worker_data['idf_dict']
     
-    csv_buffer = io.StringIO()
+    # Use list joining instead of StringIO for better performance
+    lines = []
     
     for article_id in article_batch:
         tf_dict = article_tf_map[article_id]
@@ -487,9 +486,9 @@ def create_inverted_index_csv_batch(article_batch: List[int]) -> str:
         for term, tf in tf_dict.items():
             if term in term_to_vocab_id and term in idf_dict:
                 tfidf_score = tf * idf_dict[term]
-                csv_buffer.write(f"{term_to_vocab_id[term]}\t{article_id}\t{tfidf_score}\n")
+                lines.append(f"{term_to_vocab_id[term]}\t{article_id}\t{tfidf_score}\n")
     
-    return csv_buffer.getvalue()
+    return ''.join(lines)
 
 
 def write_inverted_index_batch_sql(csv_data: str) -> int:
@@ -645,13 +644,10 @@ def pass2_build_tfidf_concurrent(
     logger.info(f"Vocabulary write completed in {write_time:.2f}s")
     logger.info(f"Total vocabulary time: {vocab_total_time:.2f}s ({total_vocab_entries} entries)")
     
-    # Query back term-to-ID mapping
+    # Query back term-to-ID mapping (optimized with values_list)
     logger.info("Building term-to-ID mapping...")
     mapping_start = time.time()
-    term_to_vocab_id = {}
-    vocab_objects = Vocabulary.objects.all()
-    for vocab in vocab_objects:
-        term_to_vocab_id[vocab.term] = vocab.id
+    term_to_vocab_id = dict(Vocabulary.objects.values_list('term', 'id'))
     logger.info(f"Mapped {len(term_to_vocab_id)} terms in {time.time() - mapping_start:.2f}s")
     
     # === Inverted Index Building (Concurrent with Pipeline) ===
@@ -745,26 +741,26 @@ class Command(BaseCommand):
         parser.add_argument(
             '--batch-size-per-worker',
             type=int,
-            default=800,
-            help='Number of articles per worker batch in Pass 1 (default: 800)'
+            default=1000,
+            help='Number of articles per worker batch in Pass 1 (default: 1000)'
         )
         parser.add_argument(
             '--batch-size',
             type=int,
             default=800,
-            help='Articles per batch for Pass 2 inverted index (default: 800, optimized for 200+ articles/sec)'
+            help='Articles per batch for Pass 2 inverted index (default: 800, optimized for best throughput)'
         )
         parser.add_argument(
             '--csv-workers',
             type=int,
-            default=32,
-            help='Number of worker processes for CSV building in Pass 2 (default: 32)'
+            default=48,
+            help='Number of worker processes for CSV building in Pass 2 (default: 48)'
         )
         parser.add_argument(
             '--db-workers',
             type=int,
-            default=32,
-            help='Number of worker threads for database writes in Pass 2 (default: 32)'
+            default=48,
+            help='Number of worker threads for database writes in Pass 2 (default: 48)'
         )
 
     def handle(self, *args, **options):
@@ -776,8 +772,8 @@ class Command(BaseCommand):
         )
         logger = logging.getLogger(__name__)
         
-        # Determine CPU workers
-        cpu_workers = options['cpu_workers'] or os.cpu_count()
+        # Determine CPU workers (default to 16 for better performance, not all cores)
+        cpu_workers = options['cpu_workers'] or min(16, os.cpu_count() or 16)
         
         # Display configuration
         logger.info("=" * 60)
@@ -846,12 +842,12 @@ class Command(BaseCommand):
             logger.info(f"  - Pass 1 time: {pass1_time:.2f}s ({pass1_time/total_time*100:.1f}%)")
             logger.info(f"  - Pass 2 time: {pass2_time:.2f}s ({pass2_time/total_time*100:.1f}%)")
             logger.info(f"  - Articles per second: {articles_per_second:.2f}")
-            logger.info(f"  - Target: 200 articles/second")
+            logger.info(f"  - Target: 800 articles/second")
             
-            if articles_per_second >= 200:
+            if articles_per_second >= 800:
                 logger.info(f"  - TARGET ACHIEVED!")
             else:
-                logger.info(f"  - Target missed by {200 - articles_per_second:.2f} articles/second")
+                logger.info(f"  - Target missed by {800 - articles_per_second:.2f} articles/second")
             
             logger.info("=" * 60)
         
