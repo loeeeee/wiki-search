@@ -53,7 +53,7 @@ Get up and running in 5 minutes:
 - **Python 3.13+** with virtual environment at `.venv/`
 - **PostgreSQL** database server
 - **uv** package manager for Python dependencies
-- **AMD GPU with ROCm** (optional, for GPU acceleration)
+- **AMD GPU with ROCm** (historical; see docs-vibe/archives/)
 
 ### NixOS Environment
 
@@ -99,37 +99,12 @@ nix-shell
    python wiki_search/manage.py db_summary
    ```
 
-### GPU Acceleration Setup (Optional)
+### Documentation Quick Links
 
-For AMD GPU acceleration, install PyTorch with ROCm support:
-
-```bash
-# Install PyTorch with ROCm support
-pip install torch --index-url https://download.pytorch.org/whl/rocm5.7
-
-# Verify GPU availability
-python -c "import torch; print(torch.cuda.is_available())"
-
-# Install project with GPU dependencies
-uv sync --extra gpu
-```
-
-**GPU Requirements:**
-- AMD GPU with ROCm 5.0+ support (RX 6000 series or newer)
-- 8GB+ VRAM recommended for large datasets
-- Linux OS
-
-**Usage:**
-```bash
-# GPU-accelerated PageRank
-python wiki_search/manage.py build_pagerank --use-gpu --rebuild
-
-# CPU-based TF-IDF indexing with ProcessPool parallelism
-python wiki_search/manage.py build_tfidf_index --rebuild
-
-# Test with limited dataset
-python wiki_search/manage.py build_tfidf_index --limit 1000
-```
+- Overview: docs-vibe/0100-overview.md
+- Architecture: TF-IDF (docs-vibe/0101-tfidf-architecture.md), PageRank (docs-vibe/0102-pagerank-architecture.md), QA (docs-vibe/0103-qa-generation-architecture.md)
+- Benchmarks summary: docs-vibe/0104-benchmarks-summary.md
+- Historical/GPU docs: see docs-vibe/archives/
 
 ## Database Management Commands
 
@@ -365,82 +340,12 @@ python wiki_search/manage.py build_tfidf_simple --limit 5000 --rebuild --verbose
 - **InvertedIndex**: Term-article-score mappings for fast search
 
 For detailed performance analysis, see:
-- [docs-vibe/0052-csv-building-parallelization-fix.md](docs-vibe/0052-csv-building-parallelization-fix.md) - CSV building parallelization fix (433 articles/sec)
-- [docs-vibe/0051-concurrent-db-io-pass2.md](docs-vibe/0051-concurrent-db-io-pass2.md) - Concurrent Pass 2 implementation (200+ articles/sec)
-- [docs-vibe/0047-cpu-scalability-refactor.md](docs-vibe/0047-cpu-scalability-refactor.md) - Multiprocess tokenization details
+- [docs-vibe/archives/0052-csv-building-parallelization-fix.md](docs-vibe/archives/0052-csv-building-parallelization-fix.md) - CSV building parallelization fix (433 articles/sec)
+- [docs-vibe/archives/0051-concurrent-db-io-pass2.md](docs-vibe/archives/0051-concurrent-db-io-pass2.md) - Concurrent Pass 2 implementation (200+ articles/sec)
+- [docs-vibe/archives/0047-cpu-scalability-refactor.md](docs-vibe/archives/0047-cpu-scalability-refactor.md) - Multiprocess tokenization details
 
-### Build TF-IDF Index (Optimized Multi-Thread)
-
-Build TF-IDF index and inverted index for search functionality using optimized GPU acceleration with multiple threadpools:
-
-```bash
-# Build TF-IDF index with optimized GPU acceleration (default)
-python wiki_search/manage.py build_tfidf_index --limit 100000
-
-# Rebuild existing index
-python wiki_search/manage.py build_tfidf_index --rebuild
-
-# With custom GPU processes and reader workers
-python wiki_search/manage.py build_tfidf_index --gpu-threads 4 --reader-threads 32 --verbose
-
-# With separate writer pools and profiling
-python wiki_search/manage.py build_tfidf_index --separate-writers --profile --verbose
-
-# Custom workers and database writers
-python wiki_search/manage.py build_tfidf_index --workers 8 --db-workers 48 --verbose
-
-# Test with limited dataset
-python wiki_search/manage.py build_tfidf_index --limit 1000
-```
-
-**Options:**
-- `--rebuild`: Clear existing indexes before building
-- `--batch-size N`: Articles per database batch (default: 500)
-- `--limit N`: Limit number of articles (for testing)
-- `--workers N`: Number of CPU consumer processes (default: CPU cores)
-- `--db-workers N`: Number of database writer threads (default: 96)
-- `--verbose`: Enable verbose logging
-- `--profile`: Enable detailed profiling with cProfile
-- `--cpu-process-batch-size N`: Articles per CPU batch (default: 1_000)
-- `--cpu-threads N`: Number of parallel CPU consumer processes (default: CPU cores)
-- `--reader-workers N`: Number of database reader threads (default: 16)
-- `--separate-writers`: Enable separate writer pools for TF-IDF vs inverted index
-
-**Optimized Architecture:**
-- **Pass 1**: Producer-consumer model for document frequency calculation
-  - Producers: CPU thread count reading from database
-  - Consumers: CPU core count computing document frequency
-- **Pass 2**: CPU-based TF-IDF computation with ProcessPool parallelism
-  - **ProcessPool Architecture**: True parallelism with process isolation
-  - **CPU Processes**: Multiple processes (default: CPU cores) processing batches in parallel
-  - **Process Isolation**: Independent memory spaces per process
-  - **Reader Pool**: Dedicated threadpool (default: 16) for async database prefetching
-  - **Writer Pools**: Separate threadpools for TF-IDF and inverted index writes
-  - **Concurrent Pipeline**: Database prefetch happens alongside CPU processing
-
-**Performance Results:**
-- **CPU-only processing**: 11.9 articles/second (100 articles in 8.39s)
-- **ProcessPool parallelism**: True CPU parallelism without GIL limitations
-- **Universal compatibility**: Works on any system without GPU requirements
-- **Scalable architecture**: Performance scales with CPU core count
-- **CPU utilization**: ProcessPool parallelism without GIL limitations
-- **Database I/O**: Concurrent prefetch pipeline eliminates blocking reads
-- **Architecture**: ProcessPool provides true parallelism with process isolation
-
-**System Requirements:**
-- **CPU**: Multi-core processor (defaults to CPU core count)
-- **Memory**: Sufficient RAM for ProcessPool parallelism
-- **Database**: PostgreSQL for optimal performance
-- **No GPU required**: Universal compatibility across all systems
-
-**Key Features:**
-- **ProcessPool Architecture**: True CPU parallelism with process isolation
-- **CPU-Only Processing**: No GPU dependencies for universal compatibility
-- **Concurrent Pipeline**: Database prefetch happens alongside CPU processing
-- **Explicit Data Passing**: Batch data passed explicitly (no shared memory)
-- **Bulk Database Operations**: Single bulk UPDATE instead of N individual queries
-- **Robust Error Handling**: Proper cleanup and logging with timeout protection
-- **Auto-scaling**: Adjusts CPU process count based on dataset size
+### Additional Notes
+Legacy GPU setup and related commands have been archived. See `docs-vibe/archives/` for historical context.
 
 ### Build PageRank
 
@@ -651,7 +556,7 @@ python manage.py build_tfidf_index --rebuild
 | TF-IDF/Search | NLTK | ~20k/sec | High | High | Linguistic accuracy |
 | QA Generation | GPT | ~50k/sec | Medium | High | LLM compatibility |
 
-For detailed information, see [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/0037-nltk-tfidf-refactor.md).
+For detailed information, see [docs-vibe/archives/0037-nltk-tfidf-refactor.md](docs-vibe/archives/0037-nltk-tfidf-refactor.md).
 
 ## Performance Tuning
 
@@ -694,14 +599,20 @@ For detailed information, see [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/
 
 ## Documentation
 
-For detailed implementation information, see the documentation in `docs-vibe/`:
+High-level docs:
+- [docs-vibe/0100-overview.md](docs-vibe/0100-overview.md)
+- [docs-vibe/0101-tfidf-architecture.md](docs-vibe/0101-tfidf-architecture.md)
+- [docs-vibe/0102-pagerank-architecture.md](docs-vibe/0102-pagerank-architecture.md)
+- [docs-vibe/0103-qa-generation-architecture.md](docs-vibe/0103-qa-generation-architecture.md)
+- [docs-vibe/0104-benchmarks-summary.md](docs-vibe/0104-benchmarks-summary.md)
 
-- [docs-vibe/0040-pass2-threadpool-optimization.md](docs-vibe/0040-pass2-threadpool-optimization.md) - Pass 2 threadpool optimization details
-- [docs-vibe/0027-pagerank-optimization.md](docs-vibe/0027-pagerank-optimization.md) - PageRank optimization details
-- [docs-vibe/0029-multiprocessing-pagerank-feasibility.md](docs-vibe/0029-multiprocessing-pagerank-feasibility.md) - Multiprocessing PageRank analysis
-- [docs-vibe/0031-qa-dataset-generation.md](docs-vibe/0031-qa-dataset-generation.md) - QA dataset generation
-- [docs-vibe/0033-qa-dataset-hybrid-search.md](docs-vibe/0033-qa-dataset-hybrid-search.md) - QA dataset hybrid search
-- [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md) - Original tokenizer configuration
-- [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/0037-nltk-tfidf-refactor.md) - NLTK TF-IDF refactor
-- [docs-vibe/0022-tfidf-gpu-overhaul.md](docs-vibe/0022-tfidf-gpu-overhaul.md) - TF-IDF GPU overhaul
-- [docs-vibe/0039-tfidf-gpu-overhaul-complete.md](docs-vibe/0039-tfidf-gpu-overhaul-complete.md) - TF-IDF GPU overhaul completion
+Archived engineering logs and historical GPU docs:
+- [docs-vibe/archives/0040-pass2-threadpool-optimization.md](docs-vibe/archives/0040-pass2-threadpool-optimization.md)
+- [docs-vibe/archives/0027-pagerank-optimization.md](docs-vibe/archives/0027-pagerank-optimization.md)
+- [docs-vibe/archives/0029-multiprocessing-pagerank-feasibility.md](docs-vibe/archives/0029-multiprocessing-pagerank-feasibility.md)
+- [docs-vibe/archives/0031-qa-dataset-generation.md](docs-vibe/archives/0031-qa-dataset-generation.md)
+- [docs-vibe/archives/0033-qa-dataset-hybrid-search.md](docs-vibe/archives/0033-qa-dataset-hybrid-search.md)
+- [docs-vibe/archives/0023-tokenizer-helper.md](docs-vibe/archives/0023-tokenizer-helper.md)
+- [docs-vibe/archives/0037-nltk-tfidf-refactor.md](docs-vibe/archives/0037-nltk-tfidf-refactor.md)
+- [docs-vibe/archives/0022-tfidf-gpu-overhaul.md](docs-vibe/archives/0022-tfidf-gpu-overhaul.md)
+- [docs-vibe/archives/0039-tfidf-gpu-overhaul-complete.md](docs-vibe/archives/0039-tfidf-gpu-overhaul-complete.md)
