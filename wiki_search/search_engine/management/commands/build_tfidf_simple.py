@@ -753,8 +753,8 @@ class Command(BaseCommand):
         parser.add_argument(
             '--csv-workers',
             type=int,
-            default=24,
-            help='Number of worker processes for CSV building in Pass 2 (default: 24)'
+            default=None,
+            help='Number of worker processes for CSV building in Pass 2 (default: all available cores)'
         )
         parser.add_argument(
             '--db-workers',
@@ -775,6 +775,7 @@ class Command(BaseCommand):
         # Determine CPU workers (default to 16 for better performance, not all cores)
         cpu_workers = options['cpu_workers'] or max(1, os.cpu_count() // 2)
         db_workers = options['db_workers'] or max(1, os.cpu_count())
+        csv_workers = options['csv_workers'] or max(1, os.cpu_count() // 2)
         
         # Display configuration
         logger.info("=" * 60)
@@ -786,7 +787,7 @@ class Command(BaseCommand):
         logger.info(f"CPU Workers (Pass 1): {cpu_workers}")
         logger.info(f"Batch Size Per Worker (Pass 1): {options['batch_size_per_worker']}")
         logger.info(f"Pass 2 Batch Size: {options['batch_size']}")
-        logger.info(f"Pass 2 CSV Workers (processes): {options['csv_workers']}")
+        logger.info(f"Pass 2 CSV Workers (processes): {csv_workers}")
         logger.info(f"Pass 2 DB Workers (threads): {db_workers}")
         logger.info("=" * 60)
         
@@ -842,7 +843,7 @@ class Command(BaseCommand):
             pass2_build_tfidf_concurrent(
                 pass1_result,
                 options['batch_size'],
-                options['csv_workers'],
+                csv_workers,
                 db_workers,
                 logger
             )
