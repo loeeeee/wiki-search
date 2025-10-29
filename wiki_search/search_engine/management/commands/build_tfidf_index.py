@@ -71,6 +71,37 @@ from .tfidf_workers import (
 logger = logging.getLogger(__name__)
 
 
+def calculate_optimal_batch_size(total_items: int, num_workers: int, min_batch: int = 10, max_batch: int = 1000) -> int:
+    """
+    Calculate optimal batch size balancing parallelism and overhead.
+    
+    Args:
+        total_items: Total number of items to process
+        num_workers: Number of parallel workers
+        min_batch: Minimum batch size to prevent excessive overhead (default: 10)
+        max_batch: Maximum batch size to maintain responsiveness (default: 1000)
+        
+    Returns:
+        Optimal batch size ensuring each worker has meaningful work
+        
+    Algorithm:
+        - Naive size = total_items / num_workers
+        - Clamp to [min_batch, max_batch] range
+        - Ensures workers don't process too-small batches (overhead)
+        - Ensures batches don't get too large (responsiveness, memory)
+        
+    Examples:
+        - 1000 items, 20 workers: 50 batch size (1000/20)
+        - 100 items, 20 workers: 10 batch size (clamped to min_batch)
+        - 50000 items, 10 workers: 1000 batch size (clamped to max_batch)
+    """
+    if num_workers == 0 or total_items == 0:
+        return min_batch
+    
+    naive_size = total_items // num_workers
+    return max(min_batch, min(naive_size, max_batch))
+
+
 def save_profile_stats(profiler: cProfile.Profile, phase_name: str) -> str:
     """
     Save cProfile statistics to file and log top functions by cumulative time.
@@ -562,7 +593,29 @@ def producer_pass1(article_queue: Queue, batch_size: int, limit: int, num_consum
     logger.info(f"Producer Pass 1: sent {num_consumers} end signals")
 
 
-def consumer_pass1(article_queue: Queue, result_queue: Queue) -> None:
+def process_batch_pass2(batch_data: Tuple[List[Tuple[int, List[str], List[int]]], Dict[str, int], Dict[str, float]]) -> Tuple[List[Tuple[int, Dict[int, float], float, List[int]]], List[Tuple[int, int, float]]]:
+    """
+    Module-level function for ProcessPoolExecutor to process a batch of pretokenized articles.
+    
+    This function must be at module level (not nested) for multiprocessing to pickle it correctly.
+    
+    Args:
+        batch_data: Tuple containing:
+            - batch: List of pretokenized articles (article_id, tokens, token_counts)
+            - term_to_id: Vocabulary mapping from term to term_id
+            - term_to_idf: IDF mapping from term to IDF value
+            
+    Returns:
+        Tuple containing:
+            - tfidf_tuples: List of (article_id, tfidf_vector, l2_norm, token_counts)
+            - inverted_tuples: List of (term_id, article_id, tfidf_score)
+    """
+    batch, term_to_id, term_to_idf = batch_data
+    from .tfidf_workers import _build_tfidf_batch_cpu_from_tokens
+    return _build_tfidf_batch_cpu_from_tokens(batch, term_to_id, term_to_idf)
+
+
+def consumer_pass1(article_queue: Queue, result_queue: Queue, batch_size: int = 100) -> None:
     """
     Consumer process for Pass 1: tokenize articles and compute document frequency.
     
@@ -573,17 +626,17 @@ def consumer_pass1(article_queue: Queue, result_queue: Queue) -> None:
     Args:
         article_queue: Multiprocessing Queue containing (article_id, paragraphs) tuples
         result_queue: Multiprocessing Queue for sending document frequency counters
+        batch_size: Number of articles to process per batch (default: 100)
         
     Implementation:
-        - Processes articles in batches of 100 for efficiency
+        - Processes articles in dynamic batches for optimal efficiency
         - Tokenizes paragraphs using NLTK tokenizer from search_engine.tokenizer
         - Computes local document frequency counter for unique terms
         - Sends None signal when complete to indicate process finished
         - Let errors propagate to fail fast
     """
-    logger.info("Consumer Pass 1 starting")
+    logger.info(f"Consumer Pass 1 starting (batch_size={batch_size})")
     batch = []
-    batch_size = 100  # Process articles in small batches
     processed_count = 0
     
     while True:
@@ -854,8 +907,16 @@ class Command(BaseCommand):
         
         total_articles = qs.count()
         
-        # Limit workers for small datasets to avoid too many consumers
-        workers = min(workers, max(1, total_articles // 100))
+        # Phase 1 Optimization: Remove artificial worker cap, add intelligent minimum batch size
+        # Ensure each worker has meaningful work to avoid process overhead
+        MIN_ARTICLES_PER_WORKER = 50  # Minimum articles per worker to prevent excessive overhead
+        if total_articles < MIN_ARTICLES_PER_WORKER:
+            # Very small dataset: use single worker to avoid overhead
+            workers = 1
+        else:
+            # Calculate optimal workers ensuring each has at least MIN_ARTICLES_PER_WORKER
+            max_efficient_workers = total_articles // MIN_ARTICLES_PER_WORKER
+            workers = min(workers, max_efficient_workers)
         
         self.stdout.write(f"Processing {total_articles} articles with {workers} tokenizer processes, {db_workers} writer threads")
         self.stdout.write(f"CPU process batch size: {cpu_batch_size} articles")
@@ -869,6 +930,16 @@ class Command(BaseCommand):
         if enable_profiling:
             profiler_pass1 = cProfile.Profile()
             profiler_pass1.enable()
+        
+        # Phase 2 Optimization: Calculate optimal batch size for Pass 1 consumers
+        # Each consumer should process batches that balance efficiency vs overhead
+        pass1_batch_size = calculate_optimal_batch_size(
+            total_items=total_articles,
+            num_workers=workers,
+            min_batch=10,   # Minimum 10 articles per batch to prevent overhead
+            max_batch=500   # Maximum 500 articles per batch to maintain responsiveness
+        )
+        self.stdout.write(f"Pass 1 consumer batch size: {pass1_batch_size} articles")
         
         # Create unbounded queues for producer-consumer pattern
         # article_queue: (article_id, paragraphs) tuples from database
@@ -888,7 +959,7 @@ class Command(BaseCommand):
         for _ in range(workers):
             process = Process(
                 target=consumer_pass1,
-                args=(article_queue, result_queue)
+                args=(article_queue, result_queue, pass1_batch_size)
             )
             process.start()
             consumer_processes.append(process)
@@ -1011,16 +1082,21 @@ class Command(BaseCommand):
             profiler_pass2 = cProfile.Profile()
             profiler_pass2.enable()
         
-        # Create multiprocessing manager for shared queue
-        manager = Manager()
-        cpu_result_queue = manager.Queue()  # Results from CPU consumer processes
-        
         # Calculate batch slices for CPU processes
         total_pretokenized = len(pretokenized_all)
         self.stdout.write(f"Total pretokenized: {total_pretokenized}")
         
-        # Adjust number of CPU consumers if dataset is too small
-        actual_cpu_consumers = min(cpu_consumers, total_pretokenized)
+        # Phase 1 Optimization: Remove CPU consumer throttling, add intelligent batch sizing
+        # Ensure each process has meaningful work to avoid process creation overhead
+        MIN_ARTICLES_PER_PROCESS = 50  # Minimum articles per process to prevent excessive overhead
+        if total_pretokenized < MIN_ARTICLES_PER_PROCESS:
+            # Very small dataset: use single process
+            actual_cpu_consumers = 1
+        else:
+            # Calculate optimal process count ensuring each has at least MIN_ARTICLES_PER_PROCESS
+            max_efficient_processes = total_pretokenized // MIN_ARTICLES_PER_PROCESS
+            actual_cpu_consumers = min(cpu_consumers, max_efficient_processes)
+        
         articles_per_process = max(1, total_pretokenized // actual_cpu_consumers)
         
         logger.info(f"Pass 2: Using {actual_cpu_consumers} CPU processes for {total_pretokenized} articles")
@@ -1041,50 +1117,43 @@ class Command(BaseCommand):
         # Update the actual number of processes based on non-empty batches
         actual_cpu_consumers = len(batches)
         
-        # SIMPLIFIED ARCHITECTURE: Collect all results in memory, write once at end
-        # For 1000 articles: ~7MB TF-IDF + ~5MB inverted index = 12MB total (negligible)
-        # This eliminates threading overhead, deadlocks, and async complexity
+        # Phase 3 Optimization: Use ProcessPoolExecutor for better process management
+        # Benefits:
+        #   - Reuses worker processes instead of creating new ones for each batch
+        #   - Better error handling and resource cleanup
+        #   - Enables workers to process multiple batches efficiently
+        #   - Lower overhead for process creation/destruction
         tfidf_all: List[Tuple[int, Dict[int, float], float, List[int]]] = []
         inverted_all: List[Tuple[int, int, float]] = []
         
-        # Start CPU consumer processes
-        cpu_processes = []
+        # Use ProcessPoolExecutor for efficient process management
+        from concurrent.futures import ProcessPoolExecutor, as_completed
         
-        for i, batch in enumerate(batches):
-            process = Process(
-                target=cpu_consumer_pass2_process,
-                args=(batch, term_to_id, term_to_idf, cpu_result_queue)
-            )
-            process.start()
-            cpu_processes.append(process)
-        
-        # Collect results from CPU consumer processes (NO async writes during collection)
-        completed_cpu_processes = 0
+        # Prepare batch data for parallel processing
+        batch_data_list = [(batch, term_to_id, term_to_idf) for batch in batches]
         
         with tqdm(total=total_articles, desc="Pass 2 - TF-IDF") as pbar:
-            while completed_cpu_processes < actual_cpu_consumers:
-                try:
-                    result = cpu_result_queue.get(timeout=30)
-                except queue.Empty:
-                    logger.error(f"Timeout waiting for CPU result. Completed processes: {completed_cpu_processes}/{actual_cpu_consumers}")
-                    break
+            with ProcessPoolExecutor(max_workers=actual_cpu_consumers) as executor:
+                # Submit all batches to the pool using module-level function
+                futures = {executor.submit(process_batch_pass2, batch_data): i 
+                          for i, batch_data in enumerate(batch_data_list)}
                 
-                if result is None:
-                    completed_cpu_processes += 1
-                    logger.info(f"CPU process completed: {completed_cpu_processes}/{actual_cpu_consumers}")
-                    continue
-                
-                tfidf_tuples, inverted_tuples = result
-                
-                # Simply accumulate - no writes yet
-                tfidf_all.extend(tfidf_tuples)
-                inverted_all.extend(inverted_tuples)
-                
-                pbar.update(len(tfidf_tuples))
-        
-        # Cleanup processes
-        for process in cpu_processes:
-            process.join()
+                # Collect results as they complete
+                for future in as_completed(futures):
+                    batch_idx = futures[future]
+                    try:
+                        tfidf_tuples, inverted_tuples = future.result()
+                        
+                        # Accumulate results
+                        tfidf_all.extend(tfidf_tuples)
+                        inverted_all.extend(inverted_tuples)
+                        
+                        pbar.update(len(tfidf_tuples))
+                        logger.info(f"CPU process completed batch {batch_idx + 1}/{len(batches)} - {len(tfidf_tuples)} TF-IDF vectors")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing batch {batch_idx}: {e}")
+                        raise  # Fail fast on errors
         
         # NOW do bulk writes with MULTITHREADED I/O for parallelism
         self.stdout.write(f"Writing {len(tfidf_all)} TF-IDF vectors and {len(inverted_all)} inverted index entries...")
