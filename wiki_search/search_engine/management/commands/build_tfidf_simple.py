@@ -203,7 +203,7 @@ def pass1_build_tf_df_parallel(
     current_batch = []
     batches = []
     
-    for article_id, paragraphs in articles_qs.values_list('id', 'plain_text_paragraphs').iterator(chunk_size=10000):
+    for article_id, paragraphs in articles_qs.values_list('id', 'plain_text_paragraphs').iterator(chunk_size=50000):
         current_batch.append((article_id, paragraphs))
         
         if len(current_batch) >= batch_size_per_worker:
