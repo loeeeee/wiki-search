@@ -111,6 +111,7 @@ class Command(BaseCommand):
         
         # Start profiling
         profiler.enable()
+        processed_total: Optional[int] = None
         
         try:
             # Run the actual QA generation with profiling
@@ -164,15 +165,18 @@ class Command(BaseCommand):
 
         try:
             # Run the generation using the original command
+            # Pass only the arguments that generate_qa_dataset expects
             qa_command = GenerateQACommand()
-            qa_command.handle(
-                input=options['input'],
-                output_dir=options['output_dir'],
-                context_sizes=options['context_sizes'],
-                limit=options['limit'],
-                workers=options['workers'],
-                verbose=options['verbose'] or options.get('debug', False)
-            )
+            qa_options = {
+                'input': options['input'],
+                'output_dir': options['output_dir'],
+                'context_sizes': options['context_sizes'],
+                'limit': options.get('limit'),
+                'workers': options['workers'],
+                'verbose': options.get('verbose', False),
+                'debug': options.get('debug', False),
+            }
+            qa_command.handle(**qa_options)
         except Exception as e:
             logger.error(f"Error during QA generation: {e}")
             raise CommandError(f"QA generation failed: {e}")
