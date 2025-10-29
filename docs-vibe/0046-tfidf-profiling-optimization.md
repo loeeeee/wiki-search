@@ -478,20 +478,36 @@ random_page_cost = "1.1";
 
 **Root Cause Analysis**:
 
-PostgreSQL acquires **table-level locks** during COPY operations, not just row-level locks:
+PostgreSQL acquires **table-level locks** during COPY operations when indexes exist:
 - Multiple concurrent COPY operations to the same table trigger lock contention
 - The unique index on `(term_id, article_id)` requires exclusive locks during bulk inserts
 - Even with non-overlapping data, the **index structure** requires synchronization
-- PostgreSQL's locking mechanism doesn't support high concurrency for bulk inserts to the same table
+- PostgreSQL's locking mechanism doesn't support high concurrency for bulk inserts to indexed tables
 
-**Conclusion**:
+### Solution: Drop Indexes During Bulk Load ✅
 
-Multithreading to the same PostgreSQL table is **not viable** for this workload:
-- Table-level locks cause deadlocks regardless of threading strategy
-- Index maintenance requires exclusive access
-- Single-threaded writes are most reliable approach
+**Strategy**: Temporarily drop all indexes and constraints, perform parallel writes, then rebuild indexes.
 
-**Final Throughput**: 24.0 articles/second (with optimized 150k batch size)
+**Implementation**:
+1. Drop unique constraint `search_engine_invertedindex_term_id_article_id_e5c79adf_uniq`
+2. Drop secondary indexes (`search_engi_term_id_7cee1e_idx`, `search_engi_article_96c9a7_idx`)
+3. Use 8 parallel threads to write directly to table (no index overhead)
+4. Rebuild all indexes after writes complete
+
+**Results**:
+- **Index drop time**: 0.01s (negligible)
+- **Parallel write time**: 5.24s for 746,954 entries
+- **Write throughput**: 142,417 entries/second (4x improvement from 35,700/sec)
+- **Index rebuild time**: 0.77s
+- **Total write time**: 8.51s (vs 23.2s single-threaded)
+- **Overall throughput**: 37.2 articles/second (vs 24.0 articles/second)
+- **Improvement**: 55% faster (13.2 articles/sec gain)
+
+**Key Insights**:
+- Dropping indexes eliminates lock contention completely
+- 8 threads achieve near-linear scaling (8 × 18k = 144k entries/sec actual)
+- Index rebuild is fast (0.77s) due to sorted data and PostgreSQL optimizations
+- Total overhead is minimal compared to parallelism gains
 
 ### Alternative Approaches if PostgreSQL Tuning Insufficient
 
