@@ -1,4 +1,5 @@
 import cProfile
+import io
 import logging
 import math
 import pstats
@@ -9,7 +10,7 @@ from io import StringIO
 from typing import Dict, List
 
 from django.core.management.base import BaseCommand
-from django.db import transaction
+from django.db import connection, transaction
 from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, Vocabulary
@@ -139,6 +140,105 @@ def pass1_build_tf_df(
     )
 
 
+def create_vocabulary_raw_sql(
+    idf_dict: Dict[str, float],
+    df_dict: Dict[str, int],
+    logger: logging.Logger
+) -> Dict[str, int]:
+    """Create Vocabulary entries using PostgreSQL COPY for maximum speed.
+    
+    Args:
+        idf_dict: Term to IDF value mapping
+        df_dict: Term to document frequency mapping
+        logger: Logger for output
+        
+    Returns:
+        Dictionary mapping terms to vocabulary IDs
+    """
+    logger.info("Creating Vocabulary using raw SQL COPY...")
+    
+    # Prepare CSV data in memory
+    csv_buffer = io.StringIO()
+    for term, idf_value in idf_dict.items():
+        df = df_dict[term]
+        # Escape term for CSV (handle quotes and newlines)
+        escaped_term = term.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        csv_buffer.write(f"{escaped_term}\t{df}\t{idf_value}\n")
+    
+    csv_buffer.seek(0)
+    
+    # Use PostgreSQL COPY for bulk insert (psycopg3 API)
+    table_name = Vocabulary._meta.db_table
+    # Get the underlying psycopg connection
+    with connection.connection.cursor() as cursor:
+        # Use psycopg3 copy() method
+        with cursor.copy(f"COPY {table_name} (term, document_frequency, idf_value) FROM STDIN") as copy:
+            for line in csv_buffer:
+                copy.write(line)
+    
+    logger.info(f"Vocabulary entries created via COPY")
+    
+    # Build term-to-ID mapping by querying back
+    logger.info("Building term-to-ID mapping...")
+    term_to_vocab_id = {}
+    vocab_objects = Vocabulary.objects.all()
+    for vocab in vocab_objects:
+        term_to_vocab_id[vocab.term] = vocab.id
+    
+    logger.info(f"Mapped {len(term_to_vocab_id)} terms to vocabulary IDs")
+    return term_to_vocab_id
+
+
+def create_inverted_index_raw_sql(
+    article_tf_map: Dict[int, Dict[str, int]],
+    article_ids: List[int],
+    term_to_vocab_id: Dict[str, int],
+    idf_dict: Dict[str, float],
+    logger: logging.Logger
+) -> int:
+    """Create InvertedIndex entries using PostgreSQL COPY for maximum speed.
+    
+    Args:
+        article_tf_map: Article ID to term frequency mapping
+        article_ids: List of article IDs to process
+        term_to_vocab_id: Term to vocabulary ID mapping
+        idf_dict: Term to IDF value mapping
+        logger: Logger for output
+        
+    Returns:
+        Number of inverted index entries created
+    """
+    logger.info("Building inverted index using raw SQL COPY...")
+    
+    # Prepare CSV data in memory
+    csv_buffer = io.StringIO()
+    entry_count = 0
+    
+    for article_id in tqdm(article_ids, desc="Preparing Inverted Index", unit="article"):
+        tf_dict = article_tf_map[article_id]
+        
+        for term, tf in tf_dict.items():
+            if term in term_to_vocab_id and term in idf_dict:
+                tfidf_score = tf * idf_dict[term]
+                csv_buffer.write(f"{term_to_vocab_id[term]}\t{article_id}\t{tfidf_score}\n")
+                entry_count += 1
+    
+    csv_buffer.seek(0)
+    
+    # Use PostgreSQL COPY for bulk insert (psycopg3 API)
+    logger.info(f"Inserting {entry_count} entries via COPY...")
+    table_name = InvertedIndex._meta.db_table
+    # Get the underlying psycopg connection
+    with connection.connection.cursor() as cursor:
+        # Use psycopg3 copy() method
+        with cursor.copy(f"COPY {table_name} (term_id, article_id, tf_idf_score) FROM STDIN") as copy:
+            for line in csv_buffer:
+                copy.write(line)
+    
+    logger.info("Inverted index created via COPY")
+    return entry_count
+
+
 def pass2_build_tfidf(
     pass1_result: Pass1Result,
     batch_size: int,
@@ -148,13 +248,12 @@ def pass2_build_tfidf(
     
     Uses cached TF/DF data from Pass 1 to:
     - Calculate IDF values
-    - Create Vocabulary entries
-    - Build inverted index entries
-    - Save to database in batches
+    - Create Vocabulary entries using PostgreSQL COPY
+    - Build inverted index entries using PostgreSQL COPY
     
     Args:
         pass1_result: Results from Pass 1
-        batch_size: Batch size for bulk database operations
+        batch_size: Batch size for bulk database operations (unused, kept for compatibility)
         logger: Logger for output
     """
     logger.info("=== Pass 2: Building IDF and Inverted Index ===")
@@ -163,74 +262,28 @@ def pass2_build_tfidf(
     logger.info("Calculating IDF values...")
     idf_dict = compute_idf(pass1_result.global_df, pass1_result.total_docs)
     
-    # Create Vocabulary entries
-    logger.info(f"Creating {len(idf_dict)} Vocabulary entries...")
-    vocabulary_entries = []
-    term_to_vocab_id = {}
+    # Use raw SQL COPY for maximum performance
+    logger.info("Using PostgreSQL COPY for database writes")
     
-    with transaction.atomic():
-        for term, idf_value in tqdm(idf_dict.items(), desc="Creating Vocabulary", unit="term"):
-            vocab_entry = Vocabulary(
-                term=term,
-                document_frequency=pass1_result.global_df[term],
-                idf_value=idf_value
-            )
-            vocabulary_entries.append(vocab_entry)
-            
-            # Bulk create in batches
-            if len(vocabulary_entries) >= batch_size:
-                Vocabulary.objects.bulk_create(vocabulary_entries)
-                vocabulary_entries = []
-        
-        # Create remaining entries
-        if vocabulary_entries:
-            Vocabulary.objects.bulk_create(vocabulary_entries)
+    # Create Vocabulary via COPY
+    term_to_vocab_id = create_vocabulary_raw_sql(
+        idf_dict, 
+        pass1_result.global_df, 
+        logger
+    )
     
-    logger.info("Vocabulary saved to database")
+    # Create InvertedIndex via COPY
+    entry_count = create_inverted_index_raw_sql(
+        pass1_result.article_tf_map,
+        pass1_result.article_ids,
+        term_to_vocab_id,
+        idf_dict,
+        logger
+    )
     
-    # Build term_to_vocab_id mapping
-    logger.info("Building term-to-ID mapping...")
-    vocab_objects = Vocabulary.objects.all()
-    for vocab in vocab_objects:
-        term_to_vocab_id[vocab.term] = vocab.id
-    
-    logger.info(f"Mapped {len(term_to_vocab_id)} terms to vocabulary IDs")
-    
-    # Build inverted index
-    logger.info("Building inverted index...")
-    inverted_index_entries = []
-    
-    with transaction.atomic():
-        for article_id in tqdm(pass1_result.article_ids, desc="Building Inverted Index", unit="article"):
-            tf_dict = pass1_result.article_tf_map[article_id]
-            
-            # Compute TF-IDF vector
-            tfidf_vector = compute_tfidf_vector(tf_dict, idf_dict)
-            
-            # Create inverted index entries for this article
-            for term, tfidf_score in tfidf_vector.items():
-                if term in term_to_vocab_id:
-                    inverted_index_entries.append(
-                        InvertedIndex(
-                            term_id=term_to_vocab_id[term],
-                            article_id=article_id,
-                            tf_idf_score=tfidf_score
-                        )
-                    )
-            
-            # Bulk create in batches
-            if len(inverted_index_entries) >= batch_size:
-                InvertedIndex.objects.bulk_create(inverted_index_entries)
-                inverted_index_entries = []
-        
-        # Create remaining entries
-        if inverted_index_entries:
-            InvertedIndex.objects.bulk_create(inverted_index_entries)
-    
-    logger.info("Inverted index saved to database")
     logger.info(f"Pass 2 complete:")
     logger.info(f"  - Vocabulary entries: {len(idf_dict)}")
-    logger.info(f"  - Inverted index entries: {InvertedIndex.objects.count()}")
+    logger.info(f"  - Inverted index entries: {entry_count}")
 
 
 class Command(BaseCommand):
@@ -257,7 +310,7 @@ class Command(BaseCommand):
             '--batch-size',
             type=int,
             default=500,
-            help='Batch size for bulk database operations (default: 500)'
+            help='Batch size for bulk database operations (default: 500, unused but kept for compatibility)'
         )
         parser.add_argument(
             '--verbose',
@@ -276,10 +329,9 @@ class Command(BaseCommand):
         
         # Display configuration
         logger.info("=" * 60)
-        logger.info("Single-Thread TF-IDF Builder")
+        logger.info("Single-Thread TF-IDF Builder (PostgreSQL COPY)")
         logger.info("=" * 60)
         logger.info(f"Limit: {options['limit'] or 'None (all articles)'}")
-        logger.info(f"Batch size: {options['batch_size']}")
         logger.info(f"Profile: {options['profile']}")
         logger.info(f"Rebuild: {options['rebuild']}")
         logger.info("=" * 60)

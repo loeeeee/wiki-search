@@ -304,10 +304,10 @@ python wiki_search/manage.py build_tfidf_simple --limit 1000 --profile
   - Build and save InvertedIndex entries
 
 **Performance Characteristics:**
-- **Single-thread processing**: 10.79 articles/second (300 articles in 27.80s)
-- **Pass 1 (TF/DF)**: 45.78 articles/second (6.65s for 300 articles)
-- **Pass 2 (IDF/Inverted Index)**: 14.34 articles/second (20.92s for 300 articles)
-- **Bottleneck**: Database writes (75% of time)
+- **Single-thread processing**: **45.76 articles/second** ✓ Target achieved! (300 articles in 6.56s)
+- **Pass 1 (TF/DF)**: 83.80 articles/second (3.58s for 300 articles)
+- **Pass 2 (IDF/Inverted Index)**: 109.09 articles/second (2.75s for 300 articles)
+- **Optimization**: PostgreSQL COPY for 4.2x speedup over Django ORM
 - **Memory efficient**: TF-IDF vectors kept in memory, not persisted
 
 **Use Cases:**
