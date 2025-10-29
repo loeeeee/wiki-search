@@ -392,6 +392,53 @@ python wiki_search/manage.py build_pagerank --profile --verbose 2>&1 | grep "Mem
 - **Index Optimization**: Drop indexes before writes, rebuild after
 - **Auto-scaling**: Smart worker count selection based on dataset size
 
+### Benchmark Search Performance
+
+Benchmark search retrieval speed with profiling and example results:
+
+```bash
+# Run benchmark with default settings (1000 searches)
+python wiki_search/manage.py benchmark_search
+
+# Run with custom number of searches
+python wiki_search/manage.py benchmark_search --num-searches 500
+
+# Run with verbose logging
+python wiki_search/manage.py benchmark_search --verbose
+
+# Disable example result display
+python wiki_search/manage.py benchmark_search --no-show-examples
+
+# Custom profile output file
+python wiki_search/manage.py benchmark_search --profile-output search_benchmark_profile.txt
+```
+
+**Options:**
+- `--num-searches N`: Number of searches to execute (default: 1000)
+- `--profile-output PATH`: Output file for cProfile results (default: `search_benchmark_profile.txt`)
+- `--verbose`: Enable verbose logging
+- `--show-examples`: Display example search results (default: True)
+- `--no-show-examples`: Disable example result display
+
+**Output:**
+- Console: Progress bar, summary metrics, throughput comparison (target: 20 searches/sec), example results, top bottlenecks
+- Log file: `benchmark_search.log` (detailed execution log)
+- Profile file: `search_benchmark_profile.txt` (cProfile statistics with top 50 functions)
+
+**Performance Target:**
+- Target: **20 searches per second** (single-threaded)
+- Each search returns top 20 results using `search_hybrid()` (TF-IDF + PageRank)
+- Test queries are randomly sampled from article titles in the database
+
+**Use Cases:**
+- Measure baseline search performance
+- Identify bottlenecks in search retrieval
+- Profile database query patterns
+- Validate search index optimization
+- Compare performance across different database configurations
+
+For detailed documentation, see [docs-vibe/0106-search-benchmark.md](docs-vibe/0106-search-benchmark.md).
+
 ## QA Dataset Commands
 
 ### Generate QA Dataset
@@ -605,6 +652,7 @@ High-level docs:
 - [docs-vibe/0102-pagerank-architecture.md](docs-vibe/0102-pagerank-architecture.md)
 - [docs-vibe/0103-qa-generation-architecture.md](docs-vibe/0103-qa-generation-architecture.md)
 - [docs-vibe/0104-benchmarks-summary.md](docs-vibe/0104-benchmarks-summary.md)
+- [docs-vibe/0106-search-benchmark.md](docs-vibe/0106-search-benchmark.md)
 
 Archived engineering logs and historical GPU docs:
 - [docs-vibe/archives/0040-pass2-threadpool-optimization.md](docs-vibe/archives/0040-pass2-threadpool-optimization.md)
