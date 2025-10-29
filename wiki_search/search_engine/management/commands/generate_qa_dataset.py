@@ -16,7 +16,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from tqdm import tqdm
 
-from search_engine.models import Article, TFIDFIndex, InvertedIndex
+from search_engine.models import Article, InvertedIndex, Vocabulary
 from search_engine.search import search_hybrid
 from search_engine.qa_helpers import (
     count_article_tokens, 
@@ -281,17 +281,17 @@ class Command(BaseCommand):
         if not input_path.exists():
             raise CommandError(f"Input file not found: {input_path}")
 
-        # Validate TF-IDF index exists
-        tfidf_count = TFIDFIndex.objects.count()
+        # Validate search indexes exist
         inverted_count = InvertedIndex.objects.count()
+        vocab_count = Vocabulary.objects.count()
         
-        if tfidf_count == 0:
-            raise CommandError("TF-IDF index is empty. Please run 'python manage.py build_tfidf_index' first.")
+        if vocab_count == 0:
+            raise CommandError("Vocabulary is empty. Please run 'python manage.py build_tfidf_simple' first.")
         
         if inverted_count == 0:
-            raise CommandError("Inverted index is empty. Please run 'python manage.py build_tfidf_index' first.")
+            raise CommandError("Inverted index is empty. Please run 'python manage.py build_tfidf_simple' first.")
         
-        self.stdout.write(f"TF-IDF index validation: {tfidf_count} articles indexed, {inverted_count} inverted index entries")
+        self.stdout.write(f"Search index validation: {vocab_count} vocabulary terms, {inverted_count} inverted index entries")
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)

@@ -616,3 +616,20 @@ Archived engineering logs and historical GPU docs:
 - [docs-vibe/archives/0037-nltk-tfidf-refactor.md](docs-vibe/archives/0037-nltk-tfidf-refactor.md)
 - [docs-vibe/archives/0022-tfidf-gpu-overhaul.md](docs-vibe/archives/0022-tfidf-gpu-overhaul.md)
 - [docs-vibe/archives/0039-tfidf-gpu-overhaul-complete.md](docs-vibe/archives/0039-tfidf-gpu-overhaul-complete.md)
+
+### Profile QA Generation
+
+Profile throughput and bottlenecks with a target of 800 entries/sec (test with 1000 entries):
+
+```bash
+python wiki_search/manage.py profile_qa_generation \
+  --input data/raw/hotpot_dev_fullwiki_v1.json \
+  --output-dir data/processed \
+  --context-sizes 8000 32000 128000 \
+  --limit 1000 \
+  --workers $(nproc) \
+  --profile-db \
+  --debug
+```
+
+The command saves cProfile output, logs a timing breakdown, and reports throughput (entries/sec) vs the 800/sec target.

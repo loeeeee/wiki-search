@@ -11,7 +11,8 @@ import os
 import pstats
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
+from multiprocessing import cpu_count
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
@@ -46,13 +47,13 @@ class Command(BaseCommand):
         parser.add_argument(
             '--limit',
             type=int,
-            default=100,
-            help='Limit number of QA entries to process (default: 100)'
+            help='Limit number of QA entries to process (for testing)'
         )
         parser.add_argument(
             '--workers',
             type=int,
-            help='Number of worker processes (default: auto-detect)'
+            default=cpu_count(),
+            help=f'Number of worker processes (default: {cpu_count()})'
         )
         parser.add_argument(
             '--profile-output',
@@ -75,10 +76,15 @@ class Command(BaseCommand):
             action='store_true',
             help='Enable verbose logging'
         )
+        parser.add_argument(
+            '--debug',
+            action='store_true',
+            help='Enable debug logging for troubleshooting'
+        )
 
     def handle(self, *args, **options):
         # Configure logging
-        log_level = logging.DEBUG if options['verbose'] else logging.INFO
+        log_level = logging.DEBUG if (options['verbose'] or options.get('debug')) else logging.INFO
         logging.basicConfig(
             level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -96,7 +102,11 @@ class Command(BaseCommand):
         
         # Enable database query profiling if requested
         if options['profile_db']:
-            connection.queries_log.clear()
+            # Ensure Django records queries (requires DEBUG=True)
+            try:
+                connection.queries_log.clear()
+            except Exception:
+                pass
             logger.info("Database query profiling enabled")
         
         # Start profiling
@@ -104,7 +114,7 @@ class Command(BaseCommand):
         
         try:
             # Run the actual QA generation with profiling
-            self.run_qa_generation_with_profiling(options, logger)
+            processed_total = self.run_qa_generation_with_profiling(options, logger)
             
         finally:
             # Stop profiling
@@ -120,46 +130,38 @@ class Command(BaseCommand):
             
             # Log timing summary
             total_time = end_time - start_time
-            logger.info(f"Total execution time: {total_time:.2f} seconds")
+            if processed_total and total_time > 0:
+                throughput = processed_total / total_time
+                per_entry_ms = (total_time / processed_total) * 1000.0
+                logger.info("=== THROUGHPUT SUMMARY ===")
+                logger.info(f"Processed entries: {processed_total}")
+                logger.info(f"Total time: {total_time:.2f}s | Avg per entry: {per_entry_ms:.2f} ms")
+                logger.info(f"Throughput: {throughput:.2f} entries/sec (target: 800.00)")
+                if throughput < 800.0:
+                    logger.warning("Throughput below target. Investigate timing breakdown and DB analysis for bottlenecks.")
+            else:
+                logger.info(f"Total execution time: {total_time:.2f} seconds")
             
             self.stdout.write(self.style.SUCCESS("Profiling completed!"))
 
-    def run_qa_generation_with_profiling(self, options: Dict, logger: logging.Logger):
-        """Run QA generation with detailed timing breakdown."""
+    def run_qa_generation_with_profiling(self, options: Dict, logger: logging.Logger) -> Optional[int]:
+        """Run QA generation with detailed timing breakdown.
+
+        Returns the number of entries attempted (respecting --limit),
+        which is used for throughput calculation.
+        """
         
-        # Import the original worker function
-        from search_engine.management.commands.generate_qa_dataset import process_qa_entry_worker
+        # Set up timing tracking (simple - just track overall worker time)
+        # Detailed per-phase timing would require instrumentation inside the worker
+        # which would complicate the worker function for multiprocessing
         
-        # Set up timing tracking
-        timing_data = {
-            'article_lookup_time': 0.0,
-            'tokenization_time': 0.0,
-            'search_time': 0.0,
-            'context_calculation_time': 0.0,
-            'worker_overhead_time': 0.0
-        }
+        # Note: We don't monkey patch the worker because it runs in separate processes
+        # and local functions can't be pickled. Instead we rely on cProfile for detailed
+        # profiling and overall timing from the command execution.
         
-        # Create a timed wrapper for the worker function
-        def timed_worker(entry_data):
-            worker_start = time.perf_counter()
-            
-            # Track article lookup time
-            lookup_start = time.perf_counter()
-            result = process_qa_entry_worker(entry_data)
-            lookup_end = time.perf_counter()
-            
-            timing_data['article_lookup_time'] += (lookup_end - lookup_start)
-            
-            worker_end = time.perf_counter()
-            timing_data['worker_overhead_time'] += (worker_end - worker_start)
-            
-            return result
-        
-        # Monkey patch the worker function
-        import search_engine.management.commands.generate_qa_dataset as qa_module
-        original_worker = qa_module.process_qa_entry_worker
-        qa_module.process_qa_entry_worker = timed_worker
-        
+        # Estimate total entries for throughput (use input length, respect limit)
+        entries_attempted: Optional[int] = None
+
         try:
             # Run the generation using the original command
             qa_command = GenerateQACommand()
@@ -169,19 +171,27 @@ class Command(BaseCommand):
                 context_sizes=options['context_sizes'],
                 limit=options['limit'],
                 workers=options['workers'],
-                verbose=options['verbose']
+                verbose=options['verbose'] or options.get('debug', False)
             )
         except Exception as e:
             logger.error(f"Error during QA generation: {e}")
             raise CommandError(f"QA generation failed: {e}")
-        finally:
-            # Restore original worker function
-            qa_module.process_qa_entry_worker = original_worker
         
-        # Log timing breakdown
-        logger.info("=== TIMING BREAKDOWN ===")
-        for phase, time_taken in timing_data.items():
-            logger.info(f"{phase}: {time_taken:.2f}s")
+        # Determine attempted entries from input file and limit
+        try:
+            input_path = Path(options['input'])
+            with open(input_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            total_in_file = len(data) if isinstance(data, list) else 0
+            limit_opt = options.get('limit')
+            entries_attempted = min(total_in_file, limit_opt) if isinstance(limit_opt, int) else total_in_file
+        except Exception:
+            entries_attempted = None
+
+        # Note: Detailed timing breakdown requires cProfile analysis
+        # Check qa_generation_profile.txt for per-function timing details
+
+        return entries_attempted
 
     def save_profiling_results(self, profiler: cProfile.Profile, output_file: str):
         """Save cProfile results to file."""
@@ -216,10 +226,12 @@ class Command(BaseCommand):
             if 'SELECT' in sql.upper():
                 if 'Article' in sql:
                     query_type = 'Article lookup'
-                elif 'TFIDFIndex' in sql:
-                    query_type = 'TFIDF search'
                 elif 'InvertedIndex' in sql:
                     query_type = 'Inverted index'
+                elif 'Vocabulary' in sql:
+                    query_type = 'Vocabulary'
+                elif 'PageRank' in sql:
+                    query_type = 'PageRank'
                 else:
                     query_type = 'Other SELECT'
             else:

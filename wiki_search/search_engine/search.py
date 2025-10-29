@@ -226,53 +226,74 @@ def _cosine_similarity(q_vec: Dict[int, float], q_norm: float, d_vec: Dict[str, 
 
 
 def search_by_tfidf(query: str, limit: int = 10) -> List[Tuple[Article, float]]:
-    """Original TF-IDF search that scans all documents (slow for large datasets)."""
+    """TF-IDF search using InvertedIndex (all articles with any query term)."""
     tokens = tokenize(query)
     q_vec, q_norm = _build_query_vector(tokens)
-    if not q_vec:
+    if not q_vec or q_norm == 0.0:
         return []
-    # NOTE: For production-scale performance we should restrict to candidates via an inverted index.
-    # For initial correctness and unit tests, we scan existing TFIDFIndex rows.
+    
+    # Get candidate articles (those with any query term)
+    term_ids = list(q_vec.keys())
+    candidate_ids = list(
+        InvertedIndex.objects.filter(term_id__in=term_ids)
+        .values_list('article_id', flat=True)
+        .distinct()
+    )
+    
+    if not candidate_ids:
+        return []
+    
+    # Load ALL InvertedIndex entries for candidate articles to compute full document norms
+    all_entries = InvertedIndex.objects.filter(
+        article_id__in=candidate_ids
+    ).only('article_id', 'term_id', 'tf_idf_score')
+    
+    # Group by article: compute dot product and full document norm
+    article_dot: Dict[int, float] = {}  # article_id -> dot product with query
+    article_norm_sq: Dict[int, float] = {}  # article_id -> sum of squared tf_idf scores
+    
+    for entry in all_entries:
+        article_id = entry.article_id
+        term_id = entry.term_id
+        doc_weight = entry.tf_idf_score
+        
+        # Always accumulate document norm (full vector)
+        if article_id not in article_norm_sq:
+            article_norm_sq[article_id] = 0.0
+            article_dot[article_id] = 0.0
+        article_norm_sq[article_id] += doc_weight * doc_weight
+        
+        # Only accumulate dot product for query terms
+        query_weight = q_vec.get(term_id, 0.0)
+        if query_weight > 0.0:
+            article_dot[article_id] += query_weight * doc_weight
+    
+    # Compute cosine similarity
     results: List[Tuple[Article, float]] = []
-    for row in TFIDFIndex.objects.select_related("article").only("tfidf_vector", "l2_norm", "article__title"):
-        score = _cosine_similarity(q_vec, q_norm, row.tfidf_vector or {}, float(row.l2_norm))
-        if score > 0.0:
-            results.append((row.article, score))
+    article_ids = list(article_dot.keys())
+    
+    if article_ids:
+        # Load articles in batch
+        articles_dict = {a.id: a for a in Article.objects.filter(id__in=article_ids).only('id', 'title')}
+        
+        for article_id in article_ids:
+            dot_product = article_dot.get(article_id, 0.0)
+            norm_sq = article_norm_sq.get(article_id, 0.0)
+            if article_id in articles_dict and norm_sq > 0.0:
+                doc_norm = math.sqrt(norm_sq)
+                if doc_norm > 0.0:
+                    score = dot_product / (q_norm * doc_norm)
+                    if score > 0.0:
+                        results.append((articles_dict[article_id], score))
+    
     results.sort(key=lambda x: x[1], reverse=True)
     return results[:limit]
 
 
 def search_by_tfidf_optimized(query: str, limit: int = 10, use_inverted_index: bool = True) -> List[Tuple[Article, float]]:
-    """Fast TF-IDF search using inverted index for candidate filtering."""
-    tokens = tokenize(query)
-    q_vec, q_norm = _build_query_vector(tokens)
-    
-    if not q_vec or not use_inverted_index:
-        return search_by_tfidf(query, limit)  # fallback to original method
-    
-    # Get candidate articles via inverted index (FAST!)
-    # Only articles containing at least one query term
-    term_ids = list(q_vec.keys())
-    candidates = InvertedIndex.objects.filter(
-        term_id__in=term_ids
-    ).values('article_id').distinct()
-    
-    candidate_ids = [c['article_id'] for c in candidates]
-    
-    if not candidate_ids:
-        return []  # No articles contain any query terms
-    
-    # Score only candidates (not all articles!)
-    results: List[Tuple[Article, float]] = []
-    for row in TFIDFIndex.objects.filter(
-        article_id__in=candidate_ids
-    ).select_related("article").only("tfidf_vector", "l2_norm", "article__title"):
-        score = _cosine_similarity(q_vec, q_norm, row.tfidf_vector or {}, float(row.l2_norm))
-        if score > 0.0:
-            results.append((row.article, score))
-    
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results[:limit]
+    """Fast TF-IDF search using InvertedIndex (optimized - same as search_by_tfidf for now)."""
+    # Both functions now use the same InvertedIndex-based approach
+    return search_by_tfidf(query, limit)
 
 
 def search_hybrid(
