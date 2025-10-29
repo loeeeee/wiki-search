@@ -376,19 +376,25 @@ Legacy GPU setup and related commands have been archived. See `docs-vibe/archive
 Build PageRank scores for articles using the InternalLink graph:
 
 ```bash
-# Standard PageRank build (single-threaded baseline)
+# Optimized parallel build (recommended)
+python wiki_search/manage.py build_pagerank --rebuild --db-workers 64 --batch-size 300
+
+# Single-threaded baseline
 python wiki_search/manage.py build_pagerank --rebuild
 
 # With profiling and verbose output
-python wiki_search/manage.py build_pagerank --rebuild --profile --verbose
+python wiki_search/manage.py build_pagerank --rebuild --db-workers 64 --batch-size 300 --profile --verbose
 
 # Test with limited dataset
-python wiki_search/manage.py build_pagerank --limit 10000 --rebuild --profile --verbose
+python wiki_search/manage.py build_pagerank --limit 10000 --rebuild --db-workers 32 --batch-size 500
 ```
 
 **Options:**
 - `--rebuild`: Clear existing PageRank scores before building
 - `--limit N`: Limit number of links to process (for testing)
+- `--db-workers N`: Number of parallel database writer threads (default: 1, recommended: 64)
+- `--batch-size N`: Records per batch for parallel storage (default: 10000, recommended: 300)
+- `--db-read-workers N`: Number of parallel database readers for graph loading (default: 1, not recommended >1)
 - `--profile`: Enable detailed profiling with cProfile
 - `--verbose`: Enable verbose logging
 - `--damping FLOAT`: PageRank damping factor (default: 0.85)
@@ -397,41 +403,43 @@ python wiki_search/manage.py build_pagerank --limit 10000 --rebuild --profile --
 
 **Performance Characteristics:**
 
-*Single-Threaded CPU (Current Implementation):*
-- **1k articles**: 0.79s (1,013 articles/second)
-- **10k articles**: 2.68s (2,854 articles/second)
+*Optimized Parallel (64 workers, 300 batch size):*
+- **100k articles**: 1.21s (48,972 articles/second) - **9.0x faster**
+- **5.4M articles (full)**: 285.6s (17,801 articles/second) - **4.3x faster**
+- **Storage phase**: 12.0% of time (was 96.6%) - **30.9x speedup**
+- **Memory usage**: ~4 GB for full dataset
+
+*Single-Threaded Baseline:*
 - **100k articles**: 10.89s (5,391 articles/second)
-- **Memory usage**: ~10 MB delta for 100k articles (very efficient)
+- **5.4M articles (proj)**: 1,218s (4,502 articles/second)
+- **Storage phase**: 96.6% of time (bottleneck)
 
-*Phase Breakdown (100k articles):*
-- **Delete**: 0.03s (0.2%) - Fast TRUNCATE
-- **Compute**: 0.33s (3.0%) - PageRank algorithm
-- **Store**: 10.53s (96.6%) - Database COPY (bottleneck)
+*Phase Breakdown (5.4M articles, optimized):*
+- **Delete**: 0.66s (0.2%) - Fast TRUNCATE
+- **Compute**: 251s (88.0%) - PageRank algorithm (new bottleneck at scale)
+  - Database query (54M links): ~103s (36%)
+  - PageRank iterations: ~21s (7%)
+  - Matrix processing: ~127s (44%)
+- **Store**: 34s (12.0%) - Parallel batch COPY (optimized)
 
-*Scaling Projection:*
-- **Full dataset**: 5.4M articles
-- **Projected time**: 16.96 minutes (1,017 seconds)
-- **Target time**: 15 seconds
-- **Gap**: 67.83x speedup needed
+**Optimization Details:**
+- Parallel storage uses ThreadPoolExecutor with batch-level transactions
+- Each worker gets independent database connection via `connection.cursor()`
+- Optimal configuration: 64 workers, 300 records per batch
+- Storage bottleneck eliminated: 96.6% → 12.0% of time
+- Note: Parallel database reads (--db-read-workers >1) create contention and are slower
 
-**Bottleneck Analysis:**
-1. **Storage dominates**: 96.6% of time spent in database writes
-   - PostgreSQL COPY already optimized
-   - Transaction commit waiting for disk I/O
-   - I/O bound, not CPU bound
-2. **Computation is fast**: Only 3% of total time
-   - Sparse matrix operations are efficient
-   - Typically 7 iterations to converge
-   - No benefit from parallelization at this scale
+**Next Optimization Steps:**
+Current: 285.6s for 5.4M articles, Target: 15s, Remaining gap: 19x speedup needed
 
-**Optimization Path:**
-To reach 15-second target (67x speedup needed):
-1. **Database tuning** (2-5x): Disable fsync, increase buffers, tune checkpoints
-2. **Parallel storage** (4-8x): Multiple connections writing in parallel
-3. **Approximate PageRank** (10-20x): Monte Carlo sampling, early stopping
-4. **Graph partitioning** (50-100x): Partition-based parallel computation
+1. **✅ COMPLETE: Parallel storage** (4.3x achieved): ThreadPoolExecutor with 64 workers
+2. **Database query optimization** (2-3x): Add composite index on InternalLink, query tuning
+3. **Approximate PageRank** (5-10x): Monte Carlo sampling, early stopping
+4. **Incremental updates** (10-100x): Cache and update only changed portions
 
-For detailed analysis, see [docs-vibe/0111-pagerank-single-threaded-implementation.md](docs-vibe/0111-pagerank-single-threaded-implementation.md)
+For detailed optimization analysis:
+- Storage optimization: [docs-vibe/0113-pagerank-parallel-storage-optimization.md](docs-vibe/0113-pagerank-parallel-storage-optimization.md)
+- Single-threaded baseline: [docs-vibe/0111-pagerank-single-threaded-implementation.md](docs-vibe/0111-pagerank-single-threaded-implementation.md)
 
 ### Benchmark Search Performance
 

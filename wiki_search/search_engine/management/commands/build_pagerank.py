@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, List, Tuple
 
 from django.core.management.base import BaseCommand
 from django.db import connection, transaction
 from tqdm import tqdm
 
 from search_engine.models import PageRank
-from search_engine.pagerank import compute_pagerank
+from search_engine.pagerank import compute_pagerank, compute_pagerank_parallel
 from search_engine.utils.profiler import ProfileManager, get_memory_usage, phase_timer
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,24 @@ class Command(BaseCommand):
             default=1e-6,
             help="Convergence tolerance (default: 1e-6)"
         )
+        parser.add_argument(
+            "--db-workers",
+            type=int,
+            default=1,
+            help="Number of parallel database writer threads (default: 1, single-threaded)"
+        )
+        parser.add_argument(
+            "--batch-size",
+            type=int,
+            default=10000,
+            help="Records per batch for parallel storage (default: 10000)"
+        )
+        parser.add_argument(
+            "--db-read-workers",
+            type=int,
+            default=1,
+            help="Number of parallel database readers for graph loading (default: 1, single-threaded)"
+        )
     
     def handle(self, *args: Any, **options: Any) -> None:
         """Execute the command."""
@@ -97,6 +116,9 @@ class Command(BaseCommand):
         self.stdout.write(f"  Damping: {options['damping']}")
         self.stdout.write(f"  Max iterations: {options['max_iter']}")
         self.stdout.write(f"  Tolerance: {options['tolerance']}")
+        self.stdout.write(f"  DB workers (storage): {options['db_workers']}")
+        self.stdout.write(f"  Batch size: {options['batch_size']}")
+        self.stdout.write(f"  DB workers (read): {options['db_read_workers']}")
         self.stdout.write(f"  Initial memory: {get_memory_usage():.2f} MB\n")
         
         # Start profiling
@@ -117,13 +139,25 @@ class Command(BaseCommand):
             
             # Phase 2: Compute PageRank
             with phase_timer("Compute PageRank", options["verbose"]) as stats:
-                pagerank_scores, iterations, residual = compute_pagerank(
-                    damping=options["damping"],
-                    max_iter=options["max_iter"],
-                    tol=options["tolerance"],
-                    verbose=options["verbose"],
-                    limit=options["limit"]
-                )
+                if options["db_read_workers"] > 1:
+                    # Use parallel graph loading
+                    pagerank_scores, iterations, residual = compute_pagerank_parallel(
+                        damping=options["damping"],
+                        max_iter=options["max_iter"],
+                        tol=options["tolerance"],
+                        verbose=options["verbose"],
+                        limit=options["limit"],
+                        db_read_workers=options["db_read_workers"]
+                    )
+                else:
+                    # Use single-threaded graph loading
+                    pagerank_scores, iterations, residual = compute_pagerank(
+                        damping=options["damping"],
+                        max_iter=options["max_iter"],
+                        tol=options["tolerance"],
+                        verbose=options["verbose"],
+                        limit=options["limit"]
+                    )
                 
                 stats["articles_ranked"] = len(pagerank_scores)
                 stats["iterations"] = iterations
@@ -144,7 +178,17 @@ class Command(BaseCommand):
             
             # Phase 3: Store PageRank scores
             with phase_timer("Store PageRank scores", options["verbose"]) as stats:
-                stored_count = self._store_pagerank_copy(pagerank_scores)
+                if options["db_workers"] > 1:
+                    # Use parallel batch storage
+                    stored_count = self._store_pagerank_parallel(
+                        pagerank_scores,
+                        db_workers=options["db_workers"],
+                        batch_size=options["batch_size"]
+                    )
+                else:
+                    # Use single-threaded storage
+                    stored_count = self._store_pagerank_copy(pagerank_scores)
+                
                 stats["records_stored"] = stored_count
                 self.stdout.write(
                     self.style.SUCCESS(
@@ -259,4 +303,67 @@ class Command(BaseCommand):
         
         logger.info(f"Stored {len(records)} PageRank scores using COPY")
         return len(records)
+    
+    def _store_pagerank_parallel(
+        self, 
+        pagerank_scores: dict[int, float],
+        db_workers: int,
+        batch_size: int
+    ) -> int:
+        """Store PageRank scores using parallel batch COPY operations.
+        
+        Args:
+            pagerank_scores: Dict mapping article_id -> PageRank score
+            db_workers: Number of parallel database writer threads
+            batch_size: Number of records per batch
+            
+        Returns:
+            Number of records stored
+        """
+        if not pagerank_scores:
+            return 0
+        
+        # Prepare records
+        records = [(article_id, float(score)) for article_id, score in pagerank_scores.items()]
+        
+        # Split into batches
+        batches = [records[i:i+batch_size] for i in range(0, len(records), batch_size)]
+        
+        logger.info(f"Storing {len(records)} PageRank scores using {db_workers} workers, "
+                   f"{len(batches)} batches of size {batch_size}")
+        
+        def store_batch(batch: List[Tuple[int, float]]) -> int:
+            """Store a batch of PageRank scores using COPY.
+            
+            Each worker gets its own database connection via connection.cursor().
+            Uses batch-level transaction for parallelism.
+            """
+            with connection.cursor() as cursor:
+                with transaction.atomic():
+                    with cursor.copy(
+                        f"COPY {PageRank._meta.db_table} (article_id, score) FROM STDIN"
+                    ) as copy:
+                        for article_id, score in batch:
+                            copy.write_row((article_id, score))
+            return len(batch)
+        
+        # Parallel execution with progress tracking
+        total_stored = 0
+        with ThreadPoolExecutor(max_workers=db_workers) as executor:
+            # Submit all batches
+            futures = [executor.submit(store_batch, batch) for batch in batches]
+            
+            # Track progress as batches complete
+            with tqdm(total=len(batches), desc="Storing PageRank batches", unit="batch") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        count = future.result()
+                        total_stored += count
+                        pbar.update(1)
+                    except Exception as e:
+                        logger.error(f"Error storing batch: {e}")
+                        raise
+        
+        logger.info(f"Stored {total_stored} PageRank scores using parallel COPY")
+        return total_stored
 
