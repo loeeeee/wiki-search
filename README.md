@@ -291,6 +291,9 @@ python wiki_search/manage.py build_tfidf_simple --limit 1000 --profile --rebuild
 
 # Full rebuild with verbose logging
 python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
+
+# Fast rebuild for smoke test (5000 articles)
+python wiki_search/manage.py build_tfidf_simple --limit 5000 --rebuild --verbose
 ```
 
 **Options:**
@@ -303,6 +306,9 @@ python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
 - `--batch-size N`: Articles per batch for Pass 2 inverted index (default: 290, optimized for 200+ articles/sec)
 - `--csv-workers N`: Worker processes for CSV building in Pass 2 (default: 9)
 - `--db-workers N`: Worker threads for database writes in Pass 2 (default: 9)
+
+**Fast Rebuild Behavior:**
+- When `--rebuild` is specified, the command now uses PostgreSQL `TRUNCATE TABLE <tables> RESTART IDENTITY CASCADE` to clear existing TF-IDF data instantly, followed by `VACUUM ANALYZE` to refresh planner statistics. This mirrors the approach used by `clean_db` and significantly speeds up rebuilds.
 
 **Architecture:**
 - **Pass 1**: Build term frequency (TF) and document frequency (DF)

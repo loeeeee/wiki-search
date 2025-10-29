@@ -789,12 +789,24 @@ class Command(BaseCommand):
         logger.info(f"Pass 2 DB Workers (threads): {options['db_workers']}")
         logger.info("=" * 60)
         
-        # Clear existing data if rebuild
+        # Clear existing data if rebuild (fast path using TRUNCATE CASCADE)
         if options['rebuild']:
-            logger.info("Clearing existing Vocabulary and InvertedIndex...")
-            InvertedIndex.objects.all().delete()
-            Vocabulary.objects.all().delete()
-            logger.info("Cleared existing data")
+            logger.info("Clearing existing Vocabulary and InvertedIndex with TRUNCATE CASCADE...")
+            truncate_start = time.time()
+            table_names = [
+                InvertedIndex._meta.db_table,
+                Vocabulary._meta.db_table,
+            ]
+            table_list = ", ".join(table_names)
+            truncate_sql = f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE"
+            with connection.cursor() as cur:
+                cur.execute(truncate_sql)
+                # Refresh planner stats to keep subsequent writes/reads predictable
+                cur.execute("VACUUM ANALYZE")
+            logger.info(
+                "Cleared existing data via TRUNCATE in %.2fs",
+                time.time() - truncate_start,
+            )
         
         # Main processing function
         def build_index():
