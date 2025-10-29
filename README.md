@@ -384,9 +384,6 @@ python wiki_search/manage.py build_pagerank --rebuild --profile --verbose
 
 # Test with limited dataset
 python wiki_search/manage.py build_pagerank --limit 10000 --rebuild --profile --verbose
-
-# GPU acceleration (not recommended - see notes below)
-python wiki_search/manage.py build_pagerank --rebuild --use-gpu --verbose
 ```
 
 **Options:**
@@ -394,7 +391,6 @@ python wiki_search/manage.py build_pagerank --rebuild --use-gpu --verbose
 - `--limit N`: Limit number of links to process (for testing)
 - `--profile`: Enable detailed profiling with cProfile
 - `--verbose`: Enable verbose logging
-- `--use-gpu`: Use GPU acceleration (not recommended - see performance notes)
 - `--damping FLOAT`: PageRank damping factor (default: 0.85)
 - `--max-iter N`: Maximum number of iterations (default: 100)
 - `--tolerance FLOAT`: Convergence tolerance (default: 1e-6)
@@ -427,13 +423,6 @@ python wiki_search/manage.py build_pagerank --rebuild --use-gpu --verbose
    - Sparse matrix operations are efficient
    - Typically 7 iterations to converge
    - No benefit from parallelization at this scale
-
-**GPU Performance:**
-- **Small datasets**: GPU is 1.5x slower than CPU (transfer overhead)
-- **Medium datasets**: GPU is 1.2x slower than CPU  
-- **Large datasets (100k+)**: GPU fails with OOM (13.19 GB required)
-- **Issue**: GPU implementation converts sparse→dense matrix (18,857x memory inflation)
-- **Recommendation**: Use CPU - GPU provides no benefit for this workload
 
 **Optimization Path:**
 To reach 15-second target (67x speedup needed):

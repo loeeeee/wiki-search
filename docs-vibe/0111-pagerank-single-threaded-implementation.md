@@ -33,6 +33,11 @@ Implement a single-threaded PageRank computation system that:
 - Evaluate GPU acceleration benefits
 - Provide recommendations for reaching target
 
+**Actual Results**:
+- Achieved: 5,391 articles/second (100k dataset)
+- Projected time for full dataset: 16.96 minutes
+- Gap to target: 67.83x speedup needed
+
 ## Implementation Approach
 
 ### Phase 1: Delete Existing Scores
@@ -134,50 +139,50 @@ Status: Implementation complete, profiling and analysis complete
 
 ### Test Environment
 - CPU: AMD (via NixOS)
-- GPU: AMD Radeon RX 7900 XT (20GB VRAM)
 - Database: PostgreSQL
 - Python: 3.13
-- Libraries: NumPy, SciPy, PyTorch (with ROCm)
+- Libraries: NumPy, SciPy
 
-### Performance Results
+### Performance Results - CPU Only
 
-| Dataset | Links | Articles | CPU Time | CPU Throughput | GPU Time | GPU Throughput | Winner |
-|---------|-------|----------|----------|---------------|----------|----------------|--------|
-| Small   | 1,000 | 803 | 0.79s | 1,013 art/s | 1.18s | 638 art/s | CPU 1.5x |
-| Medium  | 10,000 | 7,648 | 2.68s | 2,854 art/s | 3.30s | 2,340 art/s | CPU 1.2x |
-| Large   | 100,000 | 58,742 | 10.89s | 5,391 art/s | OOM | N/A | CPU (GPU failed) |
+| Dataset | Links | Articles | Total Time | Delete | Compute | Store | Throughput |
+|---------|-------|----------|------------|--------|---------|-------|------------|
+| Small   | 1,000 | 803 | 0.79s | 0.21s (26.7%) | 0.03s (3.6%) | 0.54s (67.5%) | 1,013 art/s |
+| Medium  | 10,000 | 7,648 | 2.68s | 0.02s (0.9%) | 0.04s (1.6%) | 2.59s (96.8%) | 2,854 art/s |
+| Large   | 100,000 | 58,742 | 10.89s | 0.03s (0.2%) | 0.33s (3.0%) | 10.53s (96.6%) | 5,391 art/s |
 
-### Phase Breakdown (CPU, 100k links)
+### GPU Performance (Before Removal)
 
-| Phase | Time | Percentage | Notes |
-|-------|------|------------|-------|
-| Delete | 0.03s | 0.2% | Fast TRUNCATE |
-| Compute | 0.33s | 3.0% | PageRank algorithm |
-| Store | 10.53s | 96.6% | Database COPY |
-| **Total** | **10.89s** | **100%** | **5,391 art/s** |
+| Dataset | Links | Articles | Total Time | Delete | Compute | Store | Throughput | vs CPU |
+|---------|-------|----------|------------|--------|---------|-------|------------|--------|
+| Small   | 1,000 | 756 | 1.18s | 0.02s (1.7%) | 0.76s (64.3%) | 0.38s (32.2%) | 638 art/s | 0.63x (slower) |
+| Medium  | 10,000 | 7,725 | 3.30s | 0.03s (0.8%) | 0.63s (19.0%) | 2.63s (79.7%) | 2,340 art/s | 0.82x (slower) |
+| Large   | 100,000 | 59,506 | OOM | 0.03s | 0.81s | N/A | N/A | Failed |
 
-### Critical Findings
+### Key Findings
 
-1. **Storage is the Bottleneck**: 96.6% of time spent in database writes
-   - PostgreSQL COPY is already optimized
-   - Transaction commit takes 96% of store phase time
+1. **Storage is the Bottleneck (96.6% of time)**
+   - PostgreSQL COPY already optimized
+   - Transaction commit dominates (waiting for disk I/O)
    - I/O bound, not CPU bound
+   - Compute phase is only 3% of total time
 
-2. **Computation is Fast**: Only 3% of total time
-   - Sparse matrix operations are efficient
-   - 7 iterations to converge
-   - No benefit from parallelization at this scale
+2. **GPU is Not Beneficial**
+   - **Small datasets**: 1.5x slower (transfer overhead)
+   - **Medium datasets**: 1.2x slower
+   - **Large datasets**: OOM failure at 59k articles
+   - **Root cause**: Dense matrix conversion (18,857x memory inflation)
+   - **Decision**: GPU code removed from codebase
 
-3. **GPU Fails at Scale**:
-   - OOM error at 59k articles (13.19 GB required)
-   - GPU implementation converts sparse→dense (memory explosion)
-   - Transfer overhead dominates for small datasets
-   - GPU not viable for this workload
+3. **Throughput Scales Well**
+   - 2.8x improvement from 1k to 10k articles
+   - 1.9x improvement from 10k to 100k articles
+   - Efficiency increases with dataset size
 
-4. **Throughput Scales Well**: 
-   - 1k links: 1,013 art/s
-   - 10k links: 2,854 art/s (2.8x improvement)
-   - 100k links: 5,391 art/s (1.9x improvement)
+4. **Memory Efficiency**
+   - CPU: Only ~10 MB delta for 100k articles
+   - GPU: 142-170 MB (before OOM)
+   - Linear scaling with sparse operations
 
 ### Scaling Projection
 
@@ -188,41 +193,65 @@ Status: Implementation complete, profiling and analysis complete
 - Target time: 15 seconds
 - **Gap**: 67.83x speedup needed
 
-### Bottleneck Analysis
+### Detailed Bottleneck Analysis
 
-#### Storage Phase (96.6% of time)
-- PostgreSQL COPY: Already optimal for bulk insert
-- Transaction commit: Waiting for disk I/O
-- Database configuration: May need tuning (WAL, fsync, etc.)
-- Network latency: Database on same machine or remote?
+#### 1. Storage Phase (96.6% of time) - PRIMARY BOTTLENECK
+- **PostgreSQL COPY**: Already optimal for bulk insert
+- **Transaction commit**: Waiting for disk I/O (dominates phase time)
+- **Database configuration**: May need tuning (WAL, fsync, checkpoints)
+- **Network latency**: Database location matters
 
-#### Computation Phase (3.0% of time)
+**Profiling Data (100k articles):**
+```
+Total: 2.663 seconds (85,096 function calls)
+
+Top bottlenecks:
+- connection.wait: 2.581s (97%)
+- transaction.commit: 2.541s (95%)
+- PageRank computation: 0.042s (1.6%)
+- build_adjacency_matrix: 0.035s (1.3%)
+```
+
+**Storage Phase Breakdown:**
+- **write_row calls**: 0.019s (writing data)
+- **Transaction commit**: 2.541s (waiting for disk)
+- **Ratio**: 133:1 (commit vs write)
+- **Conclusion**: Database I/O is the limiting factor
+
+#### 2. Computation Phase (3.0% of time) - ALREADY OPTIMAL
 - Already very fast with single-threaded NumPy/SciPy
 - Sparse matrix operations: O(iterations × edges)
 - 7 iterations typical for convergence
+- No benefit from parallelization at this scale
 - Not the bottleneck
+
+#### 3. Delete Phase (0.2% of time) - NEGLIGIBLE
+- Fast TRUNCATE operation
+- Effectively zero overhead
+- Not worth optimizing
 
 #### Memory Usage
 - CPU: ~10 MB memory delta for 100k dataset
-- GPU: 142 MB (before OOM)
 - Linear scaling with dataset size
+- Very efficient sparse matrix operations
+- No memory pressure at any scale tested
 
-### GPU Analysis: Why It Failed
+### GPU Code Removed
 
-1. **Architecture Issue**: GPU implementation converts sparse→dense matrix
-   - 59,506 × 59,506 × 4 bytes = 13.19 GB
-   - Sparse has only 87,880 non-zeros = 0.7 MB
-   - 18,857x memory inflation!
+Based on testing, GPU acceleration was removed from the codebase:
 
-2. **Transfer Overhead**: 
-   - CPU→GPU transfer: ~0.5s for small datasets
-   - GPU→CPU transfer: ~0.05s
-   - Dominates computation time for small datasets
+**Why GPU Was Not Beneficial:**
+1. **Small datasets**: 1.5x slower than CPU (transfer overhead)
+2. **Medium datasets**: 1.2x slower than CPU
+3. **Large datasets (100k+)**: OOM failure at 59k articles (13.19 GB required)
 
-3. **No Benefit for Sparse Operations**:
-   - GPU shines at dense matrix operations
-   - Sparse matrix-vector multiply is memory-bound
-   - CPU cache-friendly for sparse operations
+**Root Cause:**
+- GPU implementation converted sparse→dense matrix (18,857x memory inflation)
+- Transfer overhead dominated for small datasets
+- Storage phase (96.6% of time) cannot be GPU-accelerated
+
+**Conclusion:**
+CPU-only implementation is faster, more memory efficient, and simpler to maintain.
 
 ### Recommendations
 
@@ -263,33 +292,109 @@ Status: Implementation complete, profiling and analysis complete
    - Merge results with boundary corrections
 
 7. **Specialized Hardware**:
-   - Graph processing accelerators (not GPU)
    - NVMe for faster storage
    - Memory-mapped files for zero-copy
-
-#### GPU Not Recommended
-- Current implementation: Dense matrix conversion (memory explosion)
-- Fix required: Keep sparse tensors throughout
-- Even with fix: Storage dominates (96.6% of time)
-- Computation speedup (2-3x) → Overall speedup (0.1x)
-- Not worth the complexity
+   - Focus on I/O performance, not compute
 
 ### Historical Comparison
 
-Previous optimizations (docs-vibe/archives/0027-pagerank-optimization.md):
-- Before: 76.17s for 10k articles (131 art/s)
-- After: 8.29s for 10k articles (1,206 art/s)
+**Previous Implementation** (docs-vibe/archives/0027-pagerank-optimization.md):
+- Before optimization: 76.17s for 10k articles (131 art/s)
+- After optimization: 8.29s for 10k articles (1,206 art/s)
 - Improvement: 9.2x speedup via dangling node optimization
 
-Current implementation:
+**Current Implementation**:
 - 10k articles: 2.68s (2,854 art/s)
-- vs Historical: 3.1x faster
-- Reason: Simpler storage, no metadata fields
+- vs Historical optimized: 3.1x faster
+- vs Historical baseline: 28.4x faster
+- Reason: Simpler storage (no metadata fields) + optimized algorithm
+
+## Files Generated
+
+### Profile Files
+- `data/profiles/pagerank_20251029_203444.prof` - 1k links CPU
+- `data/profiles/pagerank_20251029_203530.prof` - 1k links GPU (archived)
+- `data/profiles/pagerank_20251029_203617.prof` - 10k links CPU
+- `data/profiles/pagerank_20251029_203706.prof` - 10k links GPU (archived)
+- `data/profiles/pagerank_20251029_203805.prof` - 100k links CPU
+- `data/profiles/pagerank_20251029_203901.prof` - 100k links GPU (failed, archived)
+
+### Log Files
+- `build_pagerank_1000_test.log`
+- `build_pagerank_1000_gpu_test.log` (archived)
+- `build_pagerank_10k_cpu_test.log`
+- `build_pagerank_10k_gpu_test.log` (archived)
+- `build_pagerank_100k_cpu_test.log`
+- `build_pagerank_100k_gpu_test.log` (archived)
+
+### Implementation Files
+- `wiki_search/search_engine/utils/profiler.py` (new)
+- `wiki_search/search_engine/management/commands/build_pagerank.py` (new)
+- `wiki_search/search_engine/pagerank.py` (GPU code removed)
+- `pyproject.toml` (torch dependency removed)
+- `shell.nix` (torch packages removed)
+
+### Documentation Files
+- `docs-vibe/0111-pagerank-single-threaded-implementation.md` (this file)
+- `docs-vibe/0112-gpu-removal.md`
+- `README.md` (updated with PageRank section)
+
+## Immediate Actions
+
+**Completed:**
+1. ✅ Implement single-threaded PageRank with profiling
+2. ✅ Profile and measure at different scales (1k, 10k, 100k)
+3. ✅ Identify primary bottleneck (storage: 96.6% of time)
+4. ✅ Test GPU vs CPU performance (GPU not beneficial)
+5. ✅ Remove GPU code from codebase
+6. ✅ Document findings and recommendations
+
+**Not Recommended:**
+- ❌ GPU acceleration (slower + OOM at scale)
+- ❌ Parallel computation (only 3% of time)
+- ❌ Algorithm optimization (already efficient)
 
 ## Next Steps
 
-1. Database configuration tuning (easiest wins)
-2. Parallel storage writers (4-8x speedup)
-3. Document optimizations in new file
-4. Test full dataset performance with optimizations
+**Short-term (Immediate):**
+1. Database configuration tuning experiments
+2. Test UNLOGGED table for temporary bulk load
+3. Increase batch sizes and reduce transaction overhead
+
+**Medium-term (1-2 weeks):**
+4. Parallel storage writer implementation (4-8x potential)
+5. Test full dataset performance with optimizations
+6. Document database tuning recommendations
+
+**Long-term (Future):**
+7. Approximate PageRank exploration (Monte Carlo)
+8. Graph partitioning for parallel computation
+9. Incremental update system
+
+## Conclusion
+
+The single-threaded PageRank implementation is **working correctly and efficiently**. Comprehensive profiling identified the primary bottleneck:
+
+**Key Findings:**
+- **Storage dominates**: 96.6% of time spent in database writes
+- **Computation is optimal**: Only 3% of time, already very fast
+- **GPU provides no benefit**: Slower and fails at scale
+- **Throughput scales well**: 5,391 articles/second achieved
+
+**Current Status:**
+- **Achieved**: 5,391 articles/second (100k dataset)
+- **Projected**: 16.96 minutes for full 5.4M article dataset
+- **Target**: 15 seconds
+- **Gap**: 67.83x speedup needed
+
+**Path Forward:**
+
+To reach the 15-second target for 5.4M articles, focus on:
+1. **Database I/O optimization** (parallel writers, tuning) - 5-10x potential
+2. **Approximate algorithms** (Monte Carlo, early stopping) - 10-20x potential
+3. **Graph partitioning** (parallel computation on subgraphs) - 50-100x potential
+
+**Bottom Line:**
+
+Current throughput of 5,391 articles/second is **excellent for a single-threaded implementation**. The 67x gap to target requires **architectural changes** (parallel I/O, approximate algorithms), not algorithmic optimization. The computation phase is already optimal and cannot be improved further without changing the algorithm itself.
 
