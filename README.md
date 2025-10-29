@@ -1,5 +1,27 @@
 # Wiki Search
 
+## Hybrid Search (TF-IDF + PageRank)
+
+Single-threaded hybrid search combines inverted index TF-IDF relevance with PageRank authority and returns the top 20 results by default.
+
+Usage:
+
+```python
+from search_engine.search import search_hybrid
+
+results = search_hybrid("alan turing computability", limit=20)
+for article, score in results:
+    print(article.title, score)
+```
+
+Benchmark (target ≥ 20 searches/sec):
+
+```bash
+python manage.py benchmark_search --num-searches 1000 --profile-output search_benchmark_profile.txt
+```
+
+Tune parameters in `search_hybrid` (per-term postings cap and blend α) if profiling indicates bottlenecks.
+
 A Wikipedia dump processing pipeline with interactive search capabilities
 
 **SOFTWARE DEFINED DATA**
@@ -413,17 +435,32 @@ python wiki_search/manage.py benchmark_search --no-show-examples
 python wiki_search/manage.py benchmark_search --profile-output search_benchmark_profile.txt
 ```
 
+Quick smoke test inside nix-shell (deterministic by default):
+
+```bash
+cd /home/loe/Projects/wiki-search
+nix-shell --run "uv sync && python wiki_search/manage.py benchmark_search --num-searches 2 --no-show-examples"
+```
+
 **Options:**
 - `--num-searches N`: Number of searches to execute (default: 1000)
 - `--profile-output PATH`: Output file for cProfile results (default: `search_benchmark_profile.txt`)
 - `--verbose`: Enable verbose logging
 - `--show-examples`: Display example search results (default: True)
 - `--no-show-examples`: Disable example result display
+- `--seed SEED`: Deterministic seed (default: 42)
+- `--randomize`: Opt-out of deterministic mode (no fixed seed)
+- `--queries-file PATH`: Load queries from file (one per line)
+- `--save-queries PATH`: Save generated queries to file
+- `--export-results PATH`: Export per-query results CSV (query,rank,article_id,title,score)
 
 **Output:**
 - Console: Progress bar, summary metrics, throughput comparison (target: 20 searches/sec), example results, top bottlenecks
 - Log file: `benchmark_search.log` (detailed execution log)
 - Profile file: `search_benchmark_profile.txt` (cProfile statistics with top 50 functions)
+
+**Determinism:**
+- Deterministic by default. Two runs with the same seed and unchanged DB produce identical queries and exported CSVs.
 
 **Performance Target:**
 - Target: **20 searches per second** (single-threaded)
