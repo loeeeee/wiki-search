@@ -745,26 +745,26 @@ class Command(BaseCommand):
         parser.add_argument(
             '--batch-size-per-worker',
             type=int,
-            default=400,
-            help='Number of articles per worker batch in Pass 1 (default: 50)'
+            default=800,
+            help='Number of articles per worker batch in Pass 1 (default: 800)'
         )
         parser.add_argument(
             '--batch-size',
             type=int,
-            default=400,
-            help='Articles per batch for Pass 2 inverted index (default: 400, optimized for 200+ articles/sec)'
+            default=800,
+            help='Articles per batch for Pass 2 inverted index (default: 800, optimized for 200+ articles/sec)'
         )
         parser.add_argument(
             '--csv-workers',
             type=int,
-            default=12,
-            help='Number of worker processes for CSV building in Pass 2 (default: 12)'
+            default=32,
+            help='Number of worker processes for CSV building in Pass 2 (default: 32)'
         )
         parser.add_argument(
             '--db-workers',
             type=int,
-            default=12,
-            help='Number of worker threads for database writes in Pass 2 (default: 12)'
+            default=32,
+            help='Number of worker threads for database writes in Pass 2 (default: 32)'
         )
 
     def handle(self, *args, **options):
