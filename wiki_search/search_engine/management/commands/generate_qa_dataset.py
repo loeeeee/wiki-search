@@ -11,7 +11,7 @@ import time
 import cProfile
 import pstats
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 
@@ -20,11 +20,8 @@ from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, Vocabulary
 from search_engine.search import search_hybrid
-from search_engine.qa_helpers import (
-    count_article_tokens, 
-    format_article_for_qa, 
-    calculate_context_size
-)
+from search_engine.qa_helpers import format_article_for_qa
+from search_engine.tokenizer import tokenize_gpt
 
 logger = logging.getLogger(__name__)
 
@@ -158,12 +155,20 @@ class Command(BaseCommand):
 
         self.stdout.write(f"Processing {len(qa_data)} QA entries (single-threaded)...")
 
+        # Pre-process: collect titles, batch fetch articles, pre-compute token counts
+        start_preprocessing = time.perf_counter()
+        titles = self.collect_article_titles(qa_data)
+        article_cache = self.batch_fetch_articles(titles)
+        token_cache = self.precompute_token_counts(article_cache)
+        preprocessing_time = time.perf_counter() - start_preprocessing
+        self.stdout.write(f"Pre-processing completed in {preprocessing_time:.2f}s")
+
         # Process entries with optional profiling
         if enable_profiling:
             profiler = cProfile.Profile()
             profiler.enable()
             
-            results, timing_stats = self.process_qa_entries(qa_data, context_sizes)
+            results, timing_stats = self.process_qa_entries(qa_data, context_sizes, article_cache, token_cache)
             
             profiler.disable()
             
@@ -178,7 +183,7 @@ class Command(BaseCommand):
             stats.sort_stats('cumulative')
             stats.print_stats(30)
         else:
-            results, timing_stats = self.process_qa_entries(qa_data, context_sizes)
+            results, timing_stats = self.process_qa_entries(qa_data, context_sizes, article_cache, token_cache)
 
         # Print timing statistics
         self._print_timing_stats(timing_stats)
@@ -188,7 +193,85 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS("\nQA dataset generation completed!"))
 
-    def process_qa_entries(self, qa_data: List[Dict], context_sizes: List[int]) -> Tuple[Dict[int, List[Dict]], Dict]:
+    def collect_article_titles(self, qa_data: List[Dict]) -> Set[str]:
+        """Collect all unique article titles needed from QA data.
+        
+        Args:
+            qa_data: List of QA entry dictionaries
+            
+        Returns:
+            Set of unique article titles (original case preserved)
+        """
+        titles = set()
+        for entry in qa_data:
+            supporting_facts = entry.get('supporting_facts', [])
+            for fact in supporting_facts:
+                if len(fact) >= 1:
+                    titles.add(fact[0])
+        
+        self.stdout.write(f"Collected {len(titles)} unique article titles from QA data")
+        return titles
+
+    def batch_fetch_articles(self, titles: Set[str]) -> Dict[str, Article]:
+        """Batch fetch all articles and build case-insensitive lookup dict.
+        
+        Args:
+            titles: Set of article titles to fetch
+            
+        Returns:
+            Dictionary mapping lowercase title to Article object
+        """
+        self.stdout.write("Fetching articles in batch...")
+        
+        # Fetch all articles in single query
+        articles = Article.objects.filter(title__in=titles)
+        
+        # Build case-insensitive lookup dictionary
+        article_cache = {article.title.lower(): article for article in articles}
+        
+        # Log missing articles
+        fetched_titles = {article.title for article in articles}
+        missing_titles = titles - fetched_titles
+        
+        if missing_titles:
+            logger.warning(f"Missing {len(missing_titles)} articles from database: {list(missing_titles)[:10]}")
+        
+        self.stdout.write(f"Fetched {len(article_cache)} articles successfully")
+        return article_cache
+
+    def precompute_token_counts(self, article_cache: Dict[str, Article]) -> Dict[int, int]:
+        """Pre-compute token counts for all articles.
+        
+        Args:
+            article_cache: Dictionary of articles
+            
+        Returns:
+            Dictionary mapping article ID to total token count
+        """
+        self.stdout.write("Pre-computing token counts...")
+        token_cache = {}
+        
+        for article in tqdm(article_cache.values(), desc="Computing token counts"):
+            # Count tokens in title
+            title_tokens = len(tokenize_gpt(article.title))
+            
+            # Check if paragraph_token_counts is populated
+            if article.paragraph_token_counts and len(article.paragraph_token_counts) == len(article.plain_text_paragraphs):
+                # Use pre-computed paragraph token counts
+                paragraph_tokens = sum(article.paragraph_token_counts)
+            else:
+                # Compute paragraph tokens
+                paragraph_tokens = sum(
+                    len(tokenize_gpt(paragraph)) 
+                    for paragraph in article.plain_text_paragraphs
+                )
+            
+            token_cache[article.id] = title_tokens + paragraph_tokens
+        
+        self.stdout.write(f"Pre-computed token counts for {len(token_cache)} articles")
+        return token_cache
+
+    def process_qa_entries(self, qa_data: List[Dict], context_sizes: List[int], article_cache: Dict[str, Article], token_cache: Dict[int, int]) -> Tuple[Dict[int, List[Dict]], Dict]:
         """Process QA entries in single-threaded manner with timing instrumentation."""
         results = {size: [] for size in context_sizes}
         
@@ -213,33 +296,29 @@ class Command(BaseCommand):
                 answer = entry_data.get('answer', '')
                 supporting_facts = entry_data.get('supporting_facts', [])
 
-                # Get supporting documents
+                # Get supporting documents using article cache
                 supporting_docs = []
                 missing_articles = []
                 
-                lookup_start = time.perf_counter()
                 for fact in supporting_facts:
                     if len(fact) >= 1:
                         title = fact[0]
-                        try:
-                            article = Article.objects.get(title__iexact=title)
+                        article = article_cache.get(title.lower())
+                        if article:
                             supporting_docs.append(format_article_for_qa(article))
-                        except Article.DoesNotExist:
+                        else:
                             missing_articles.append(title)
-                timing_stats['article_lookup'].append(time.perf_counter() - lookup_start)
 
                 if missing_articles:
                     stats['skipped_missing_articles'] += 1
                     logger.warning(f"Skipping {qa_id}: Missing articles {missing_articles}")
                     continue
 
-                # Count supporting document tokens
-                token_start = time.perf_counter()
+                # Count supporting document tokens using token cache
                 supporting_tokens = sum(
-                    count_article_tokens(Article.objects.get(title=doc['title']))
+                    token_cache[article_cache[doc['title'].lower()].id]
                     for doc in supporting_docs
                 )
-                timing_stats['token_counting'].append(time.perf_counter() - token_start)
 
                 # Get distractor documents using round-robin selection
                 distractor_docs = []
@@ -272,11 +351,19 @@ class Command(BaseCommand):
                                 continue
                             
                             # Check if adding this article would exceed the limit
-                            try:
-                                article_tokens = count_article_tokens(article)
-                            except Exception as e:
-                                logger.error(f"Error counting tokens for article {article.title}: {e}")
-                                continue
+                            # If article not in token cache (from search results), compute on the fly
+                            if article.id in token_cache:
+                                article_tokens = token_cache[article.id]
+                            else:
+                                # Compute token count on the fly for articles from search results
+                                title_tokens = len(tokenize_gpt(article.title))
+                                if article.paragraph_token_counts and len(article.paragraph_token_counts) == len(article.plain_text_paragraphs):
+                                    paragraph_tokens = sum(article.paragraph_token_counts)
+                                else:
+                                    paragraph_tokens = sum(len(tokenize_gpt(p)) for p in article.plain_text_paragraphs)
+                                article_tokens = title_tokens + paragraph_tokens
+                                token_cache[article.id] = article_tokens  # Cache for future use
+                                article_cache[article.title.lower()] = article  # Also cache the article object
                             
                             if supporting_tokens + current_distractor_tokens + article_tokens > max_context_tokens:
                                 break
@@ -302,10 +389,16 @@ class Command(BaseCommand):
                     num_distractor_docs = 0
                     
                     for doc in distractor_docs:
-                        try:
-                            doc_tokens = count_article_tokens(Article.objects.get(title=doc['title']))
-                        except Exception as e:
-                            logger.error(f"Error counting tokens for distractor doc {doc['title']}: {e}")
+                        # Get article (should be in cache since we just added it to distractor_docs)
+                        article = article_cache.get(doc['title'].lower())
+                        if not article:
+                            logger.error(f"Article not found in cache for distractor doc {doc['title']}")
+                            continue
+                        
+                        # Get token count (should be in cache now)
+                        doc_tokens = token_cache.get(article.id)
+                        if doc_tokens is None:
+                            logger.error(f"Token count not found for distractor doc {doc['title']}")
                             continue
                         
                         if supporting_tokens + distractor_tokens_used + doc_tokens <= target_size:

@@ -200,6 +200,10 @@ def tokenize(text: str | None) -> List[str]:
     return _nltk_tokenizer_instance.tokenize(text)
 
 
+# Cache GPT tokenizer instance
+_gpt_tokenizer_instance: GPTTokenizer | None = None
+
+
 def tokenize_gpt(text: str | None) -> List[str]:
     """Tokenize for QA dataset generation (always uses GPT).
     
@@ -212,5 +216,7 @@ def tokenize_gpt(text: str | None) -> List[str]:
     Returns:
         List of token strings using GPT tokenization
     """
-    gpt_tokenizer = GPTTokenizer()
-    return gpt_tokenizer.tokenize(text)
+    global _gpt_tokenizer_instance
+    if _gpt_tokenizer_instance is None:
+        _gpt_tokenizer_instance = GPTTokenizer()
+    return _gpt_tokenizer_instance.tokenize(text)

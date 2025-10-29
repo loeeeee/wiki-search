@@ -523,6 +523,12 @@ python wiki_search/manage.py generate_qa_dataset \
   --input data/raw/hotpot_dev_fullwiki_v1.json \
   --output-dir data/processed
 
+# Full dataset (7,405 entries, ~17.5 minutes)
+python wiki_search/manage.py generate_qa_dataset \
+  --input data/raw/hotpot_dev_fullwiki_v1.json \
+  --output-dir data/processed \
+  --limit 0
+
 # Custom context sizes
 python wiki_search/manage.py generate_qa_dataset \
   --input data/raw/hotpot_dev_fullwiki_v1.json \
@@ -551,10 +557,13 @@ python wiki_search/manage.py generate_qa_dataset \
 3. **Context Filtering**: Skip entries where supporting docs alone exceed context limits
 
 **Performance Notes:**
-- Single-threaded implementation with comprehensive timing instrumentation
-- Use `--profile` to identify bottlenecks and analyze performance
+- **Optimized**: 192x speedup over baseline (135ms vs 25,900ms per entry)
+- **Pre-processing**: Batch fetches articles and pre-computes token counts for massive speedup
+- **Caching**: Article cache and token cache eliminate N+1 query problem (99.99% query reduction)
+- **Full dataset**: 7,405 entries in ~17.5 minutes (was projected to take 53+ hours)
+- Use `--profile` to identify remaining bottlenecks (now dominated by search operations)
 - Profile output saved to `qa_dataset_generation.prof` (analyze with `python -m pstats`)
-- See [docs-vibe/0114-qa-dataset-single-threaded.md](docs-vibe/0114-qa-dataset-single-threaded.md) for profiling results
+- See [docs-vibe/0115-qa-dataset-optimization.md](docs-vibe/0115-qa-dataset-optimization.md) for optimization details
 
 **Implementation Details:**
 - Token counting uses GPT tokenizer (tiktoken cl100k_base) for LLM-compatible counts
@@ -706,21 +715,44 @@ For detailed information, see [docs-vibe/archives/0037-nltk-tfidf-refactor.md](d
 
 ### QA Dataset Performance
 
-**Generation Speed (10 entry baseline):**
-- **Current (single-threaded)**: ~26 seconds per entry
-- **Total time**: 259 seconds for 10 entries
-- **Token counting**: ~50,000 tokens/second using GPT tokenizer
+**Generation Speed (optimized):**
 
-**Profiling Results:**
-- **Article lookups**: 94.5% of total time (244.9s) - Primary bottleneck
-- **Search operations**: 1.6% of total time (4.0s)
-- **Token counting**: 0.5% of total time (1.4s)
-- See [docs-vibe/0114-qa-dataset-single-threaded.md](docs-vibe/0114-qa-dataset-single-threaded.md) for detailed analysis
+| Entries | Total Time | Per Entry | Speedup |
+|---------|------------|-----------|---------|
+| 10      | 3.8s      | 380ms     | 68x     |
+| 100     | 31s       | 310ms     | 84x     |
+| 7,405   | 17.5min   | 135ms     | 192x    |
+
+**Before Optimization (baseline):**
+- **10 entries**: 259 seconds (25,900ms per entry)
+- **Primary bottleneck**: N+1 database queries (94.5% of time)
+- **Root cause**: Repeated article lookups with `Article.objects.get()`
+
+**After Optimization:**
+- **Eliminated N+1 problem**: Pre-fetching and caching of articles
+- **Token count caching**: Pre-computation eliminates redundant tokenization
+- **GPT tokenizer caching**: Single instance reused across all calls
+- **Current bottleneck**: Search operations (67.7% of time for full dataset)
+
+**Full Dataset Performance (7,405 entries):**
+- **Pre-processing**: 58.7s (batch fetch 13,783 articles, pre-compute tokens)
+- **Processing**: 16.6 minutes (search operations: 675.6s, entry processing: 322.0s)
+- **Average**: 134.85ms per entry
+- **Throughput**: 7.4 entries/second
+- **Database queries**: 1 bulk query vs 26,000+ individual queries (99.99% reduction)
+
+**Token Counting:**
+- **Speed**: ~50,000 tokens/second using cached GPT tokenizer (tiktoken cl100k_base)
+- **Optimization**: Cached tokenizer instance + pre-computed counts
 
 **Memory Usage:**
-- Scales linearly with dataset size
+- Scales with number of unique articles (~14k articles cached for full dataset)
 - Single-threaded processing for simplicity and debuggability
 - Comprehensive profiling support for performance optimization
+
+**Implementation Details:**
+- See [docs-vibe/0115-qa-dataset-optimization.md](docs-vibe/0115-qa-dataset-optimization.md) for optimization details
+- See [docs-vibe/0114-qa-dataset-single-threaded.md](docs-vibe/0114-qa-dataset-single-threaded.md) for baseline profiling
 
 ## Documentation
 
