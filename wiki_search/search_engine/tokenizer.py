@@ -178,6 +178,10 @@ def tokenize_configurable(text: str | None) -> List[str]:
     return _tokenizer_instance.tokenize(text)
 
 
+# Cache NLTK tokenizer instance
+_nltk_tokenizer_instance: NLTKTokenizer | None = None
+
+
 def tokenize(text: str | None) -> List[str]:
     """Tokenize for TF-IDF and search (always uses NLTK).
     
@@ -190,8 +194,10 @@ def tokenize(text: str | None) -> List[str]:
     Returns:
         List of token strings using NLTK tokenization
     """
-    nltk_tokenizer = NLTKTokenizer()
-    return nltk_tokenizer.tokenize(text)
+    global _nltk_tokenizer_instance
+    if _nltk_tokenizer_instance is None:
+        _nltk_tokenizer_instance = NLTKTokenizer()
+    return _nltk_tokenizer_instance.tokenize(text)
 
 
 def tokenize_gpt(text: str | None) -> List[str]:

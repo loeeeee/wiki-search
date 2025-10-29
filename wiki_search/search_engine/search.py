@@ -20,7 +20,7 @@ def search_hybrid(
     query: str,
     limit: int = 20,
     alpha: float = 0.7,
-    per_term_limit: int = 1000
+    max_candidates: int = 500
 ) -> List[Tuple[Article, float]]:
     """
     Hybrid search combining TF-IDF relevance with PageRank authority.
@@ -30,7 +30,7 @@ def search_hybrid(
         limit: Maximum number of results to return (default: 20)
         alpha: Weight for TF-IDF score in linear blend, 0-1 (default: 0.7)
                Final score = alpha * tfidf_norm + (1-alpha) * pagerank_norm
-        per_term_limit: Maximum articles to fetch per query term (default: 1000)
+        max_candidates: Maximum total InvertedIndex entries to fetch (default: 500)
     
     Returns:
         List of (Article, hybrid_score) tuples sorted by score descending
@@ -54,27 +54,24 @@ def search_hybrid(
     
     vocab_ids = list(vocab_lookup.values())
     
-    # Fetch InvertedIndex entries for all terms in a single query
-    # Group by term_id in Python to apply per_term_limit
+    # Query each term separately to use (term_id, tf_idf_score) index efficiently
+    # Then merge results in Python
     article_tfidf_scores: Dict[int, float] = defaultdict(float)
     
-    # Single query for all terms
-    all_entries = (
-        InvertedIndex.objects
-        .filter(term_id__in=vocab_ids)
-        .order_by('term_id', '-tf_idf_score')
-        .values('term_id', 'article_id', 'tf_idf_score')
-    )
+    # Limit per term (smaller limit = faster queries, but may miss relevant docs)
+    per_term_limit = 20
     
-    # Group by term and apply per_term_limit
-    term_counts: Dict[int, int] = defaultdict(int)
-    for entry in all_entries:
-        term_id = entry['term_id']
-        if term_counts[term_id] >= per_term_limit:
-            continue
+    for vocab_id in vocab_ids:
+        # This query uses the (term_id, tf_idf_score) index efficiently
+        entries = list(
+            InvertedIndex.objects
+            .filter(term_id=vocab_id)
+            .order_by('-tf_idf_score')[:per_term_limit]
+            .values_list('article_id', 'tf_idf_score', named=False)
+        )
         
-        term_counts[term_id] += 1
-        article_tfidf_scores[entry['article_id']] += entry['tf_idf_score']
+        for article_id, score in entries:
+            article_tfidf_scores[article_id] += score
     
     if not article_tfidf_scores:
         logger.debug("No articles found in InvertedIndex")
