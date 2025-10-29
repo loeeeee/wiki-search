@@ -376,45 +376,73 @@ Legacy GPU setup and related commands have been archived. See `docs-vibe/archive
 Build PageRank scores for articles using the InternalLink graph:
 
 ```bash
-# Standard PageRank build (parallel database operations)
-python wiki_search/manage.py build_pagerank
-
-# With custom parallel workers
-python wiki_search/manage.py build_pagerank --db-read-workers 4 --db-write-workers 4
+# Standard PageRank build (single-threaded baseline)
+python wiki_search/manage.py build_pagerank --rebuild
 
 # With profiling and verbose output
 python wiki_search/manage.py build_pagerank --rebuild --profile --verbose
 
-# Performance monitoring
-python wiki_search/manage.py build_pagerank --profile --verbose 2>&1 | grep "Memory usage"
+# Test with limited dataset
+python wiki_search/manage.py build_pagerank --limit 10000 --rebuild --profile --verbose
+
+# GPU acceleration (not recommended - see notes below)
+python wiki_search/manage.py build_pagerank --rebuild --use-gpu --verbose
 ```
 
 **Options:**
-- `--damping FLOAT`: PageRank damping factor (default: 0.85)
-- `--max-iterations N`: Maximum number of iterations (default: 100)
-- `--tolerance FLOAT`: Convergence tolerance (default: 1e-6)
 - `--rebuild`: Clear existing PageRank scores before building
-- `--verbose`: Enable verbose logging
-- `--threads N`: Number of threads for parallel database operations (default: 48)
-- `--db-read-workers N`: Number of parallel workers for reading links (default: 48)
-- `--db-write-workers N`: Number of parallel workers for writing scores (default: 48)
-- `--batch-size N`: Batch size for database operations (default: 1000)
 - `--limit N`: Limit number of links to process (for testing)
 - `--profile`: Enable detailed profiling with cProfile
+- `--verbose`: Enable verbose logging
+- `--use-gpu`: Use GPU acceleration (not recommended - see performance notes)
+- `--damping FLOAT`: PageRank damping factor (default: 0.85)
+- `--max-iter N`: Maximum number of iterations (default: 100)
+- `--tolerance FLOAT`: Convergence tolerance (default: 1e-6)
 
 **Performance Characteristics:**
-- **Small datasets (1k articles)**: 1.7-2x speedup over baseline
-- **Medium datasets (10k articles)**: 2-2.5x speedup over baseline
-- **Large datasets (100k+ articles)**: 2.5-3.5x speedup over baseline
-- **Memory usage**: Scales linearly with dataset size
-- **Database load**: Optimized with parallel operations
 
-**Optimization Features:**
-- **Parallel Graph Loading**: ID range-based batching with ThreadPoolExecutor (2-4x speedup)
-- **Parallel Storage**: Multi-threaded PostgreSQL COPY operations (2-3x speedup)
-- **Connection Management**: Each thread gets its own database connection
-- **Index Optimization**: Drop indexes before writes, rebuild after
-- **Auto-scaling**: Smart worker count selection based on dataset size
+*Single-Threaded CPU (Current Implementation):*
+- **1k articles**: 0.79s (1,013 articles/second)
+- **10k articles**: 2.68s (2,854 articles/second)
+- **100k articles**: 10.89s (5,391 articles/second)
+- **Memory usage**: ~10 MB delta for 100k articles (very efficient)
+
+*Phase Breakdown (100k articles):*
+- **Delete**: 0.03s (0.2%) - Fast TRUNCATE
+- **Compute**: 0.33s (3.0%) - PageRank algorithm
+- **Store**: 10.53s (96.6%) - Database COPY (bottleneck)
+
+*Scaling Projection:*
+- **Full dataset**: 5.4M articles
+- **Projected time**: 16.96 minutes (1,017 seconds)
+- **Target time**: 15 seconds
+- **Gap**: 67.83x speedup needed
+
+**Bottleneck Analysis:**
+1. **Storage dominates**: 96.6% of time spent in database writes
+   - PostgreSQL COPY already optimized
+   - Transaction commit waiting for disk I/O
+   - I/O bound, not CPU bound
+2. **Computation is fast**: Only 3% of total time
+   - Sparse matrix operations are efficient
+   - Typically 7 iterations to converge
+   - No benefit from parallelization at this scale
+
+**GPU Performance:**
+- **Small datasets**: GPU is 1.5x slower than CPU (transfer overhead)
+- **Medium datasets**: GPU is 1.2x slower than CPU  
+- **Large datasets (100k+)**: GPU fails with OOM (13.19 GB required)
+- **Issue**: GPU implementation converts sparse→dense matrix (18,857x memory inflation)
+- **Recommendation**: Use CPU - GPU provides no benefit for this workload
+
+**Optimization Path:**
+To reach 15-second target (67x speedup needed):
+1. **Database tuning** (2-5x): Disable fsync, increase buffers, tune checkpoints
+2. **Parallel storage** (4-8x): Multiple connections writing in parallel
+3. **Approximate PageRank** (10-20x): Monte Carlo sampling, early stopping
+4. **Graph partitioning** (50-100x): Partition-based parallel computation
+
+For detailed analysis, see [docs-vibe/0111-pagerank-single-threaded-implementation.md](docs-vibe/0111-pagerank-single-threaded-implementation.md)
 
 ### Benchmark Search Performance
 
