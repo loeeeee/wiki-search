@@ -4,7 +4,10 @@
 
 Single-threaded hybrid search combines inverted index TF-IDF relevance with PageRank authority and returns the top 20 results by default.
 
-**Performance**: 20.40 searches/second, 48.74ms average latency (1000-search benchmark)
+**Performance (with quality improvements)**: 4.90 searches/second, 203.67ms average latency (1000-search benchmark)
+**Note**: Search quality improvements have been implemented (coverage tracking, multi-term filtering, max-normalization, title boosting, deterministic tie-breaking) but performance target (20 searches/sec) is not met. See `docs-vibe/0116-search-quality-improvements.md` for details.
+
+**Performance (baseline)**: 20.40 searches/second, 48.74ms average latency (before quality improvements)
 
 Usage:
 

@@ -5,8 +5,10 @@ Search functions for hybrid TF-IDF + PageRank retrieval.
 from __future__ import annotations
 
 import logging
+import math
+import statistics
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 from django.db.models import Q
 
@@ -19,8 +21,10 @@ logger = logging.getLogger(__name__)
 def search_hybrid(
     query: str,
     limit: int = 20,
-    alpha: float = 0.7,
-    max_candidates: int = 500
+    alpha: float = 0.85,
+    max_candidates: int = 500,
+    coverage_bonus_weight: float = 0.1,
+    strict_and_filter: bool = False
 ) -> List[Tuple[Article, float]]:
     """
     Hybrid search combining TF-IDF relevance with PageRank authority.
@@ -31,6 +35,8 @@ def search_hybrid(
         alpha: Weight for TF-IDF score in linear blend, 0-1 (default: 0.7)
                Final score = alpha * tfidf_norm + (1-alpha) * pagerank_norm
         max_candidates: Maximum total InvertedIndex entries to fetch (default: 500)
+        coverage_bonus_weight: Weight for coverage bonus (default: 0.1)
+        strict_and_filter: Enable strict AND filtering for queries with ≤5 terms (default: False)
     
     Returns:
         List of (Article, hybrid_score) tuples sorted by score descending
@@ -57,9 +63,10 @@ def search_hybrid(
     # Query each term separately to use (term_id, tf_idf_score) index efficiently
     # Then merge results in Python
     article_tfidf_scores: Dict[int, float] = defaultdict(float)
+    article_term_coverage: Dict[int, int] = defaultdict(int)
     
-    # Limit per term (smaller limit = faster queries, but may miss relevant docs)
-    per_term_limit = 20
+    # Dynamic per-term limit based on max_candidates
+    per_term_limit = math.ceil(max_candidates / max(1, len(vocab_ids)))
     
     for vocab_id in vocab_ids:
         # This query uses the (term_id, tf_idf_score) index efficiently
@@ -72,13 +79,47 @@ def search_hybrid(
         
         for article_id, score in entries:
             article_tfidf_scores[article_id] += score
+            article_term_coverage[article_id] += 1
     
     if not article_tfidf_scores:
         logger.debug("No articles found in InvertedIndex")
         return []
     
-    # Get candidate article IDs
-    candidate_ids = list(article_tfidf_scores.keys())
+    # Apply multi-term coverage filtering
+    num_query_terms = len(query_terms)
+    if num_query_terms == 1:
+        min_term_match = 1
+    elif strict_and_filter and num_query_terms <= 5:
+        min_term_match = num_query_terms
+    elif num_query_terms >= 3:
+        min_term_match = 2
+    else:
+        # For 2-term queries, accept any single term match for better recall
+        min_term_match = 1
+    
+    # Filter candidates by coverage
+    filtered_article_ids = [
+        article_id for article_id in article_tfidf_scores.keys()
+        if article_term_coverage[article_id] >= min_term_match
+    ]
+    
+    if not filtered_article_ids:
+        logger.debug(f"No articles matched min_term_match={min_term_match}")
+        return []
+    
+    logger.debug(
+        f"Filtered {len(article_tfidf_scores)} candidates to {len(filtered_article_ids)} "
+        f"with min_term_match={min_term_match}"
+    )
+    
+    # Apply coverage bonus to TF-IDF scores
+    for article_id in filtered_article_ids:
+        coverage = article_term_coverage[article_id]
+        coverage_bonus = coverage_bonus_weight * (coverage - 1)
+        article_tfidf_scores[article_id] += coverage_bonus
+    
+    # Get candidate article IDs (only filtered ones)
+    candidate_ids = filtered_article_ids
     
     # Bulk fetch PageRank scores
     pagerank_lookup = {
@@ -86,63 +127,95 @@ def search_hybrid(
         for pr in PageRank.objects.filter(article_id__in=candidate_ids)
     }
     
-    # Normalize TF-IDF scores to [0, 1]
-    tfidf_scores = list(article_tfidf_scores.values())
-    tfidf_min = min(tfidf_scores)
-    tfidf_max = max(tfidf_scores)
-    tfidf_range = tfidf_max - tfidf_min
+    # Max-normalize TF-IDF scores to [0, 1]
+    tfidf_scores_for_candidates = [article_tfidf_scores[aid] for aid in candidate_ids]
+    tfidf_max = max(tfidf_scores_for_candidates) if tfidf_scores_for_candidates else 0.0
     
-    if tfidf_range > 0:
+    if tfidf_max > 0:
         tfidf_normalized = {
-            article_id: (score - tfidf_min) / tfidf_range
-            for article_id, score in article_tfidf_scores.items()
+            article_id: article_tfidf_scores[article_id] / tfidf_max
+            for article_id in candidate_ids
         }
     else:
-        # All TF-IDF scores are identical
-        tfidf_normalized = {article_id: 1.0 for article_id in article_tfidf_scores.keys()}
+        # All TF-IDF scores are zero or no candidates - keep raw scores
+        tfidf_normalized = {
+            article_id: article_tfidf_scores[article_id]
+            for article_id in candidate_ids
+        }
     
-    # Normalize PageRank scores to [0, 1]
+    # Max-normalize PageRank scores to [0, 1] and compute median for imputation
     if pagerank_lookup:
         pr_scores = list(pagerank_lookup.values())
-        pr_min = min(pr_scores)
         pr_max = max(pr_scores)
-        pr_range = pr_max - pr_min
+        median_pr = statistics.median(pr_scores)
         
-        if pr_range > 0:
+        if pr_max > 0:
             pr_normalized = {
-                article_id: (score - pr_min) / pr_range
+                article_id: score / pr_max
                 for article_id, score in pagerank_lookup.items()
             }
+            median_pr_normalized = median_pr / pr_max
         else:
-            # All PageRank scores are identical
-            pr_normalized = {article_id: 1.0 for article_id in pagerank_lookup.keys()}
+            # All PageRank scores are zero - keep raw scores
+            pr_normalized = pagerank_lookup.copy()
+            median_pr_normalized = median_pr
     else:
         pr_normalized = {}
+        median_pr_normalized = 0.0
     
     # Compute hybrid scores
     hybrid_scores = []
     for article_id in candidate_ids:
         tfidf_norm = tfidf_normalized[article_id]
-        pr_norm = pr_normalized.get(article_id, 0.0)  # Default to 0 if no PageRank
+        pr_norm = pr_normalized.get(article_id, median_pr_normalized)  # Use median for missing PageRank
         
         hybrid_score = alpha * tfidf_norm + (1.0 - alpha) * pr_norm
         hybrid_scores.append((article_id, hybrid_score))
     
-    # Sort by hybrid score descending and take top limit
-    hybrid_scores.sort(key=lambda x: x[1], reverse=True)
-    top_article_ids = [article_id for article_id, _ in hybrid_scores[:limit]]
+    # Sort by hybrid score descending, then tfidf, then pagerank, then article_id
+    hybrid_scores.sort(key=lambda x: (
+        -x[1],  # hybrid_score desc
+        -tfidf_normalized[x[0]],  # tfidf desc
+        -pr_normalized.get(x[0], median_pr_normalized),  # pagerank desc
+        x[0]  # article_id asc
+    ))
+    # Fetch slightly more articles than limit to handle missing ones
+    fetch_ids = [article_id for article_id, _ in hybrid_scores[:limit + 10]]
     
     # Bulk fetch articles
     articles = {
         article.id: article
-        for article in Article.objects.filter(id__in=top_article_ids)
+        for article in Article.objects.filter(id__in=fetch_ids)
     }
     
-    # Build results maintaining score order
+    # Build results maintaining score order, applying title boost
     results = []
-    for article_id, score in hybrid_scores[:limit]:
+    query_lower = query.lower()
+    boosted_scores = {}  # Track boosted scores for re-sorting
+    
+    for article_id, score in hybrid_scores:
         if article_id in articles:
-            results.append((articles[article_id], score))
+            article = articles[article_id]
+            # Apply title exact-match boost (1.5x multiplier) in Python
+            if article.title.lower() == query_lower:
+                score = score * 1.5
+                boosted_scores[article_id] = True
+                logger.debug(f"Applied title boost to: {article.title}")
+            results.append((article, score, article_id))
+            if len(results) >= limit:
+                break
+    
+    # Re-sort results if any boosts were applied
+    if boosted_scores:
+        results.sort(key=lambda x: (
+            -x[1],  # score desc
+            -tfidf_normalized[x[2]],  # tfidf desc
+            -pr_normalized.get(x[2], median_pr_normalized),  # pagerank desc
+            x[2]  # article_id asc
+        ))
+        results = [(article, score) for article, score, _ in results[:limit]]
+    else:
+        results = [(article, score) for article, score, _ in results[:limit]]
     
     logger.debug(f"Hybrid search returned {len(results)} results for query: {query}")
     return results

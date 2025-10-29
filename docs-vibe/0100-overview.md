@@ -13,6 +13,9 @@ The current emphasis is CPU-only performance, stability, and operational simplic
 - PageRank architecture: 0102-pagerank-architecture.md
 - QA generation architecture: 0103-qa-generation-architecture.md
 - Benchmarks summary: 0104-benchmarks-summary.md
+- Search benchmark: 0106-search-benchmark.md
+- Hybrid search implementation: 0108-hybrid-search-implementation.md
+- Search quality improvements: 0116-search-quality-improvements.md
 
 ### Operational Highlights
 - End-to-end rebuilds are fast and non-destructive to code; TRUNCATE-based rebuilds for TF-IDF reduce downtime.
