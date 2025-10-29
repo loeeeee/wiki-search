@@ -774,6 +774,7 @@ class Command(BaseCommand):
         
         # Determine CPU workers (default to 16 for better performance, not all cores)
         cpu_workers = options['cpu_workers'] or max(1, os.cpu_count() // 2)
+        db_workers = options['db_workers'] or max(1, os.cpu_count())
         
         # Display configuration
         logger.info("=" * 60)
@@ -786,7 +787,7 @@ class Command(BaseCommand):
         logger.info(f"Batch Size Per Worker (Pass 1): {options['batch_size_per_worker']}")
         logger.info(f"Pass 2 Batch Size: {options['batch_size']}")
         logger.info(f"Pass 2 CSV Workers (processes): {options['csv_workers']}")
-        logger.info(f"Pass 2 DB Workers (threads): {options['db_workers']}")
+        logger.info(f"Pass 2 DB Workers (threads): {db_workers}")
         logger.info("=" * 60)
         
         # Clear existing data if rebuild (fast path using TRUNCATE CASCADE)
@@ -842,7 +843,7 @@ class Command(BaseCommand):
                 pass1_result,
                 options['batch_size'],
                 options['csv_workers'],
-                options['db_workers'],
+                db_workers,
                 logger
             )
             pass2_time = time.time() - pass2_start
