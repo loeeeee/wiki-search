@@ -268,7 +268,61 @@ python wiki_search/manage.py resolve_links --rebuild --batch-size 5000 --db-work
 
 ## Search Index Commands
 
-### Build TF-IDF Index
+### Build TF-IDF Index (Simple Single-Thread)
+
+Build TF-IDF index using a simple single-process, single-threaded approach for clarity and debugging:
+
+```bash
+# Test with 300 articles
+python wiki_search/manage.py build_tfidf_simple --limit 300
+
+# Test with profiling enabled
+python wiki_search/manage.py build_tfidf_simple --limit 300 --profile --rebuild
+
+# Rebuild all indexes with verbose output
+python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
+
+# Test with 1000 articles
+python wiki_search/manage.py build_tfidf_simple --limit 1000 --profile
+```
+
+**Options:**
+- `--limit N`: Limit number of articles to process (default: all)
+- `--profile`: Enable cProfile profiling
+- `--rebuild`: Clear existing Vocabulary and InvertedIndex before building
+- `--batch-size N`: Batch size for bulk database operations (default: 500)
+- `--verbose`: Enable verbose logging
+
+**Architecture:**
+- **Pass 1**: Build term frequency (TF) and document frequency (DF)
+  - Tokenize articles using NLTK
+  - Cache TF maps in memory
+  - Build global DF dictionary
+- **Pass 2**: Build IDF values and inverted index
+  - Calculate IDF = log(N / df)
+  - Save Vocabulary table with term statistics
+  - Build and save InvertedIndex entries
+
+**Performance Characteristics:**
+- **Single-thread processing**: 10.79 articles/second (300 articles in 27.80s)
+- **Pass 1 (TF/DF)**: 45.78 articles/second (6.65s for 300 articles)
+- **Pass 2 (IDF/Inverted Index)**: 14.34 articles/second (20.92s for 300 articles)
+- **Bottleneck**: Database writes (75% of time)
+- **Memory efficient**: TF-IDF vectors kept in memory, not persisted
+
+**Use Cases:**
+- **Debugging**: Simple, single-threaded for easy debugging
+- **Small datasets**: Fast enough for small to medium datasets (< 10k articles)
+- **Baseline profiling**: Establish performance baseline before optimization
+- **Development**: Clean code structure for understanding TF-IDF algorithm
+
+**Database Tables:**
+- **Vocabulary**: Global term statistics (term, document_frequency, idf_value)
+- **InvertedIndex**: Term-article-score mappings for fast search
+
+For detailed performance analysis, see [docs-vibe/0048-single-thread-tfidf-builder.md](docs-vibe/0048-single-thread-tfidf-builder.md).
+
+### Build TF-IDF Index (Optimized Multi-Thread)
 
 Build TF-IDF index and inverted index for search functionality using optimized GPU acceleration with multiple threadpools:
 

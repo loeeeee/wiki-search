@@ -1,18 +1,12 @@
 from django.contrib import admin
 
-from .models import Article, Redirect, InternalLink
+from .models import Article, InternalLink
 
 
 @admin.register(Article)
 class ArticleAdmin(admin.ModelAdmin):
     list_display = ("page_id", "title", "is_disambiguation")
     search_fields = ("title",)
-
-
-@admin.register(Redirect)
-class RedirectAdmin(admin.ModelAdmin):
-    list_display = ("source_page_id", "source_title", "target")
-    search_fields = ("source_title",)
 
 
 @admin.register(InternalLink)

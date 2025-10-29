@@ -9,7 +9,7 @@ from django.core.management.base import BaseCommand
 from tqdm import tqdm
 from django.db import connection
 
-from search_engine.models import Article, InternalLink, Redirect, TFIDFIndex, Vocabulary, InvertedIndex, PageRank
+from search_engine.models import Article, InternalLink, Vocabulary, InvertedIndex, PageRank
 
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ class Command(BaseCommand):
         confirm = options["yes"]
         if not confirm:
             self.stdout.write(
-                "This will delete ALL Articles, Redirects, and InternalLinks. Type 'yes' to continue: ",
+                "This will delete ALL Articles and InternalLinks. Type 'yes' to continue: ",
                 ending="",
             )
             try:
@@ -51,15 +51,13 @@ class Command(BaseCommand):
             # Table names in dependency order (child tables first)
             tables = [
                 InternalLink._meta.db_table,
-                Redirect._meta.db_table,
-                TFIDFIndex._meta.db_table,
                 InvertedIndex._meta.db_table,
                 PageRank._meta.db_table,
                 Vocabulary._meta.db_table,
                 Article._meta.db_table,
             ]
 
-            total_articles = total_redirects = total_links = 0
+            total_articles = total_links = 0
 
             start_ts = time.perf_counter()
             with connection.cursor() as cur:
@@ -68,19 +66,17 @@ class Command(BaseCommand):
                     try:
                         cur.execute(f"SELECT COUNT(*) FROM {InternalLink._meta.db_table}")
                         total_links = int(cur.fetchone()[0])
-                        cur.execute(f"SELECT COUNT(*) FROM {Redirect._meta.db_table}")
-                        total_redirects = int(cur.fetchone()[0])
                         cur.execute(f"SELECT COUNT(*) FROM {Article._meta.db_table}")
                         total_articles = int(cur.fetchone()[0])
                     except Exception:  # noqa: BLE001
-                        total_articles = total_redirects = total_links = 0
+                        total_articles = total_links = 0
 
                 # Use PostgreSQL TRUNCATE CASCADE for maximum speed
                 logger.info("Executing TRUNCATE CASCADE")
                 table_list = ", ".join(tables)
                 truncate_sql = f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE"
                 
-                if use_progress and (total_links or total_redirects or total_articles):
+                if use_progress and (total_links or total_articles):
                     with tqdm(total=1, desc="Truncating all tables", unit="operation") as pbar:
                         cur.execute(truncate_sql)
                         pbar.update(1)
@@ -89,10 +85,10 @@ class Command(BaseCommand):
 
             elapsed = time.perf_counter() - start_ts
             logger.info("Data deletion completed in %.2fs", elapsed)
-            return total_articles, total_redirects, total_links
+            return total_articles, total_links
 
         # Fast truncate approach
-        articles_deleted, redirects_deleted, links_deleted = truncate_all_tables()
+        articles_deleted, links_deleted = truncate_all_tables()
 
         # Delete loading progress checkpoint file
         checkpoint_path = settings.BASE_DIR.parent / "data" / ".load_checkpoint.json"
@@ -115,7 +111,7 @@ class Command(BaseCommand):
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"Deleted Articles={articles_deleted}, Redirects={redirects_deleted}, InternalLinks={links_deleted} and optimized PostgreSQL database"
+                f"Deleted Articles={articles_deleted}, InternalLinks={links_deleted} and optimized PostgreSQL database"
             )
         )
 

@@ -23,7 +23,7 @@ except ImportError:
 
 from django.db.models import QuerySet
 
-from .models import Article, InvertedIndex, PageRank, TFIDFIndex, Vocabulary
+from .models import Article, InvertedIndex, PageRank, Vocabulary
 
 
 from .tokenizer import tokenize
