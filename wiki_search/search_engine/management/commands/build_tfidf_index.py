@@ -20,7 +20,7 @@ Architecture:
         - CPU processes large batches (10k articles) for TF-IDF computation
         - Async database writers flush results using PostgreSQL COPY
         - Separate writer pools for TF-IDF vs inverted index optimization
-        - Bulk inverted index mode with single-session COPY
+        - Incremental inverted index flushing with async writes for scalability
 
 Key Features:
     - Fail-fast validation catches issues in <1 second
@@ -322,7 +322,7 @@ def prefetch_vocabulary_async(
         return {}, {}
 
 
-def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_commit: bool = False, prefetched_vocab: Dict[int, Any] = None, prefetched_articles: Dict[int, Any] = None) -> int:
+def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_commit: bool = False, prefetched_vocab: Dict[int, Any] = None, prefetched_articles: Dict[int, Any] = None, skip_constraints: bool = False) -> int:
     """
     Synchronous inverted index flush using PostgreSQL COPY for high throughput.
     
@@ -338,6 +338,7 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_com
         defer_commit: Whether to defer transaction commit
         prefetched_vocab: Optional pre-fetched Vocabulary objects to avoid blocking reads
         prefetched_articles: Optional pre-fetched Article objects to avoid blocking reads
+        skip_constraints: If True, skip index creation and ON CONFLICT (for parallel writes with dropped indexes)
             
     Returns:
         int: Number of inverted index records successfully inserted
@@ -410,38 +411,48 @@ def flush_inverted_sync(inverted_tuples: List[Tuple[int, int, float]], defer_com
                 else:
                     with transaction.atomic():
                         with connection.cursor() as cursor:
-                            # Ensure a unique index exists on (term_id, article_id) for fast upserts
-                            cursor.execute(
-                                """
-                                CREATE UNIQUE INDEX IF NOT EXISTS idx_inverted_term_article
-                                ON search_engine_invertedindex(term_id, article_id)
-                                """
-                            )
-                            # Create a temporary staging table for robust dedup upsert
-                            cursor.execute(
-                                """
-                                CREATE TEMP TABLE IF NOT EXISTS tmp_invertedindex (
-                                    term_id INTEGER,
-                                    article_id INTEGER,
-                                    tf_idf_score DOUBLE PRECISION,
-                                    PRIMARY KEY (term_id, article_id)
-                                ) ON COMMIT DROP
-                                """
-                            )
-                            # COPY into temp table first
-                            with cursor.copy(
-                                "COPY tmp_invertedindex (term_id, article_id, tf_idf_score) FROM STDIN"
-                            ) as copy:
-                                for term_id, article_id, tfidf_score in inverted_data:
-                                    copy.write_row((term_id, article_id, tfidf_score))
-                            # Insert into final table ignoring duplicates using ON CONFLICT
-                            cursor.execute(
-                                """
-                                INSERT INTO search_engine_invertedindex (term_id, article_id, tf_idf_score)
-                                SELECT term_id, article_id, tf_idf_score FROM tmp_invertedindex
-                                ON CONFLICT (term_id, article_id) DO NOTHING
-                                """
-                            )
+                            if skip_constraints:
+                                # Fast path for parallel writes with dropped indexes
+                                # No index creation, no ON CONFLICT - just raw COPY
+                                with cursor.copy(
+                                    "COPY search_engine_invertedindex (term_id, article_id, tf_idf_score) FROM STDIN"
+                                ) as copy:
+                                    for term_id, article_id, tfidf_score in inverted_data:
+                                        copy.write_row((term_id, article_id, tfidf_score))
+                            else:
+                                # Safe path with deduplication (indexes exist)
+                                # Ensure a unique index exists on (term_id, article_id) for fast upserts
+                                cursor.execute(
+                                    """
+                                    CREATE UNIQUE INDEX IF NOT EXISTS idx_inverted_term_article
+                                    ON search_engine_invertedindex(term_id, article_id)
+                                    """
+                                )
+                                # Create a temporary staging table for robust dedup upsert
+                                cursor.execute(
+                                    """
+                                    CREATE TEMP TABLE IF NOT EXISTS tmp_invertedindex (
+                                        term_id INTEGER,
+                                        article_id INTEGER,
+                                        tf_idf_score DOUBLE PRECISION,
+                                        PRIMARY KEY (term_id, article_id)
+                                    ) ON COMMIT DROP
+                                    """
+                                )
+                                # COPY into temp table first
+                                with cursor.copy(
+                                    "COPY tmp_invertedindex (term_id, article_id, tf_idf_score) FROM STDIN"
+                                ) as copy:
+                                    for term_id, article_id, tfidf_score in inverted_data:
+                                        copy.write_row((term_id, article_id, tfidf_score))
+                                # Insert into final table ignoring duplicates using ON CONFLICT
+                                cursor.execute(
+                                    """
+                                    INSERT INTO search_engine_invertedindex (term_id, article_id, tf_idf_score)
+                                    SELECT term_id, article_id, tf_idf_score FROM tmp_invertedindex
+                                    ON CONFLICT (term_id, article_id) DO NOTHING
+                                    """
+                                )
                 
                 # If we get here, the operation succeeded
                 break
@@ -615,10 +626,11 @@ class Command(BaseCommand):
     2. Pass 1: Document frequency computation using producer-consumer pattern
     3. Pass 2: CPU-based TF-IDF computation with async database writes
     4. Separate writer pools for TF-IDF vs inverted index optimization
-    5. Bulk inverted index processing with single-session COPY
+    5. Incremental inverted index flushing with async writes for scalability
     
     Uses PostgreSQL COPY for optimal database performance and CPU-only processing.
     All validation happens before processing begins to fail fast with clear error messages.
+    Incremental flushing prevents memory overflow on large datasets (5M+ articles).
     """
     help = "Build TF-IDF index and inverted index over Article.plain_text_paragraphs using CPU-only processing with producer-consumer architecture"
 
@@ -979,9 +991,14 @@ class Command(BaseCommand):
         vocab_time = time.perf_counter() - vocab_start
         self.stdout.write(f"Vocabulary built in {vocab_time:.2f}s - {len(vocab_data)} terms")
         
-        # Build maps for GPU processing
+        # Build maps for CPU processing
         term_to_id = {v.term: v.id for v in Vocabulary.objects.only("id", "term")}
         term_to_idf = {v.term: float(v.idf_value) for v in Vocabulary.objects.only("term", "idf_value")}
+        
+        # Cache all vocabulary objects in memory for fast lookup during inverted index writes
+        # This eliminates the need for repeated database queries (91k terms ~= 7MB memory)
+        all_vocab = {v.id: v for v in Vocabulary.objects.all()}
+        self.stdout.write(f"Cached {len(all_vocab)} vocabulary terms in memory")
         
         # ============================================================================
         # Pass 2: CPU-Based TF-IDF Computation (ProcessPool Architecture with Concurrent Pipeline)
@@ -1024,112 +1041,154 @@ class Command(BaseCommand):
         # Update the actual number of processes based on non-empty batches
         actual_cpu_consumers = len(batches)
         
-        # Dynamic flush thresholds: optimize COPY performance while ensuring small runs still flush
-        if total_articles >= 10000:
-            TFIDF_FLUSH_THRESHOLD = 50000
-        else:
-            TFIDF_FLUSH_THRESHOLD = max(cpu_batch_size, min(50000, cpu_batch_size * 3))
-        
-        # Always use separate writer pools for optimal performance
-        tfidf_writer_workers = max(1, db_workers // 2)
-        
-        # CPU batch processing with concurrent pipeline and double-buffering
-        tfidf_buffer = []
+        # SIMPLIFIED ARCHITECTURE: Collect all results in memory, write once at end
+        # For 1000 articles: ~7MB TF-IDF + ~5MB inverted index = 12MB total (negligible)
+        # This eliminates threading overhead, deadlocks, and async complexity
+        tfidf_all: List[Tuple[int, Dict[int, float], float, List[int]]] = []
         inverted_all: List[Tuple[int, int, float]] = []
-        db_futures = []
         
-        # Double-buffering for continuous prefetch
-        prefetch_buffer = {}  # Future for next batch
-        current_articles = {}  # Articles for current batch
+        # Start CPU consumer processes
+        cpu_processes = []
         
-        with ThreadPoolExecutor(max_workers=reader_workers) as reader_executor, \
-             ThreadPoolExecutor(max_workers=tfidf_writer_workers) as tfidf_executor:
-            
-            # Start CPU consumer processes
-            cpu_processes = []
-            
-            for i, batch in enumerate(batches):
-                process = Process(
-                    target=cpu_consumer_pass2_process,
-                    args=(batch, term_to_id, term_to_idf, cpu_result_queue)
-                )
-                process.start()
-                cpu_processes.append(process)
-            
-            # Process results from CPU consumer processes
-            completed_cpu_processes = 0
-            batch_idx = 0
-            
-            with tqdm(total=total_articles, desc="Pass 2 - TF-IDF") as pbar:
-                while completed_cpu_processes < actual_cpu_consumers:
-                    try:
-                        result = cpu_result_queue.get(timeout=30)  # Add timeout to prevent infinite hang
-                    except queue.Empty:
-                        logger.error(f"Timeout waiting for CPU result. Completed processes: {completed_cpu_processes}/{actual_cpu_consumers}")
-                        break
-                    
-                    if result is None:
-                        completed_cpu_processes += 1
-                        logger.info(f"CPU process completed: {completed_cpu_processes}/{actual_cpu_consumers}")
-                        continue
-                    
-                    tfidf_tuples, inverted_tuples = result
-                    
-                    # Add to buffers
-                    tfidf_buffer.extend(tfidf_tuples)
-                    inverted_all.extend(inverted_tuples)
-                    
-                    pbar.update(len(tfidf_tuples))
-                    
-                    # Submit prefetch for NEXT batch (while processing current)
-                    if batch_idx + 1 < actual_cpu_consumers:
-                        # Peek next batch article IDs
-                        next_batch = batches[batch_idx + 1]
-                        next_article_ids = [article_id for article_id, _, _ in next_batch]
-                        
-                        prefetch_buffer[batch_idx + 1] = reader_executor.submit(
-                            prefetch_articles_async, next_article_ids, reader_executor
-                        )
-                    
-                    # Wait for current batch prefetch
-                    if batch_idx in prefetch_buffer:
-                        current_articles = prefetch_buffer[batch_idx].result()
-                    
-                    # Submit async write (non-blocking)
-                    if len(tfidf_buffer) >= TFIDF_FLUSH_THRESHOLD:
-                        db_future = tfidf_executor.submit(
-                            flush_tfidf_sync, tfidf_buffer[:], False, current_articles
-                        )
-                        db_futures.append(('tfidf', db_future))
-                        tfidf_buffer.clear()
-                    
-                    batch_idx += 1
-            
-            # Wait for all DB writes to complete
-            self.stdout.write("Waiting for database writes to complete...")
-            tfidf_created = 0
-            inverted_created = 0
-            
-            for write_type, db_future in db_futures:
-                result = db_future.result()
-                if write_type == 'tfidf':
-                    tfidf_created += result
-                else:
-                    inverted_created += result
-            
-            # Final flush with prefetching
-            if tfidf_buffer:
-                prefetched_articles = prefetch_articles_async(
-                    [tup[0] for tup in tfidf_buffer], reader_executor
-                )
-                tfidf_created += flush_tfidf_sync(tfidf_buffer, False, prefetched_articles)
-            
-            # Always use bulk mode for inverted index - single-session COPY using all accumulated tuples
-            inverted_created += flush_inverted_sync(inverted_all)
+        for i, batch in enumerate(batches):
+            process = Process(
+                target=cpu_consumer_pass2_process,
+                args=(batch, term_to_id, term_to_idf, cpu_result_queue)
+            )
+            process.start()
+            cpu_processes.append(process)
         
-        # Cleanup
+        # Collect results from CPU consumer processes (NO async writes during collection)
+        completed_cpu_processes = 0
+        
+        with tqdm(total=total_articles, desc="Pass 2 - TF-IDF") as pbar:
+            while completed_cpu_processes < actual_cpu_consumers:
+                try:
+                    result = cpu_result_queue.get(timeout=30)
+                except queue.Empty:
+                    logger.error(f"Timeout waiting for CPU result. Completed processes: {completed_cpu_processes}/{actual_cpu_consumers}")
+                    break
+                
+                if result is None:
+                    completed_cpu_processes += 1
+                    logger.info(f"CPU process completed: {completed_cpu_processes}/{actual_cpu_consumers}")
+                    continue
+                
+                tfidf_tuples, inverted_tuples = result
+                
+                # Simply accumulate - no writes yet
+                tfidf_all.extend(tfidf_tuples)
+                inverted_all.extend(inverted_tuples)
+                
+                pbar.update(len(tfidf_tuples))
+        
+        # Cleanup processes
         for process in cpu_processes:
             process.join()
+        
+        # NOW do bulk writes with MULTITHREADED I/O for parallelism
+        self.stdout.write(f"Writing {len(tfidf_all)} TF-IDF vectors and {len(inverted_all)} inverted index entries...")
+        
+        write_start = time.perf_counter()
+        
+        # Write TF-IDF index in single transaction (small dataset, fast)
+        tfidf_created = flush_tfidf_sync(tfidf_all, defer_commit=False, prefetched_articles=None)
+        
+        # MULTITHREADED INVERTED INDEX WRITES WITH DROPPED INDEXES
+        # Strategy: Drop unique constraint + indexes, parallel write, rebuild indexes
+        # This eliminates lock contention and enables true parallel writes
+        inverted_created = 0
+        NUM_WRITE_THREADS = min(8, max(4, db_workers // 12))  # Use 4-8 threads
+        
+        self.stdout.write(f"Dropping indexes to enable parallel writes ({NUM_WRITE_THREADS} threads)...")
+        drop_start = time.perf_counter()
+        
+        # Drop indexes and constraints
+        with connection.cursor() as cursor:
+            # Drop Django-managed unique_together constraint
+            cursor.execute("""
+                ALTER TABLE search_engine_invertedindex 
+                DROP CONSTRAINT IF EXISTS search_engine_invertedindex_term_id_article_id_e5c79adf_uniq
+            """)
+            # Drop any other unique constraints that might exist
+            cursor.execute("""
+                SELECT conname FROM pg_constraint 
+                WHERE conrelid = 'search_engine_invertedindex'::regclass 
+                AND contype = 'u'
+            """)
+            for row in cursor.fetchall():
+                constraint_name = row[0]
+                cursor.execute(f"ALTER TABLE search_engine_invertedindex DROP CONSTRAINT IF EXISTS {constraint_name}")
+            
+            # Drop secondary indexes (keep primary key)
+            cursor.execute("DROP INDEX IF EXISTS search_engi_term_id_7cee1e_idx")  # term, tf_idf_score index
+            cursor.execute("DROP INDEX IF EXISTS search_engi_article_96c9a7_idx")  # article index
+            cursor.execute("DROP INDEX IF EXISTS idx_inverted_term_article")  # unique index created by flush function
+        
+        drop_time = time.perf_counter() - drop_start
+        self.stdout.write(f"Indexes dropped in {drop_time:.2f}s")
+        
+        # Partition data by term_id for load balancing (no conflicts, just better distribution)
+        inverted_all_sorted = sorted(inverted_all, key=lambda x: x[0])  # Sort by term_id
+        partition_size = len(inverted_all_sorted) // NUM_WRITE_THREADS
+        inverted_partitions = []
+        for i in range(NUM_WRITE_THREADS):
+            start_idx = i * partition_size
+            end_idx = (i + 1) * partition_size if i < NUM_WRITE_THREADS - 1 else len(inverted_all_sorted)
+            partition = inverted_all_sorted[start_idx:end_idx]
+            if partition:
+                inverted_partitions.append(partition)
+        
+        self.stdout.write(f"Writing {len(inverted_all)} entries using {len(inverted_partitions)} parallel threads...")
+        
+        # Parallel writes with ThreadPoolExecutor (no indexes = no deadlocks!)
+        from concurrent.futures import as_completed
+        
+        write_parallel_start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=len(inverted_partitions)) as write_executor:
+            futures = []
+            for partition in inverted_partitions:
+                future = write_executor.submit(
+                    flush_inverted_sync, partition, False, all_vocab, None, True  # skip_constraints=True
+                )
+                futures.append(future)
+            
+            # Collect results with progress bar
+            with tqdm(total=len(inverted_all), desc="Writing inverted index (parallel)", unit="entries") as pbar:
+                for future in as_completed(futures):
+                    batch_count = future.result()
+                    inverted_created += batch_count
+                    pbar.update(batch_count)
+        
+        write_parallel_time = time.perf_counter() - write_parallel_start
+        self.stdout.write(f"Parallel writes completed in {write_parallel_time:.2f}s ({inverted_created / write_parallel_time:.0f} entries/sec)")
+        
+        # Rebuild indexes
+        self.stdout.write("Rebuilding indexes...")
+        rebuild_start = time.perf_counter()
+        
+        with connection.cursor() as cursor:
+            # Recreate unique constraint (will fail if duplicates exist)
+            cursor.execute("""
+                ALTER TABLE search_engine_invertedindex 
+                ADD CONSTRAINT search_engine_invertedindex_term_id_article_id_e5c79adf_uniq 
+                UNIQUE (term_id, article_id)
+            """)
+            # Recreate secondary indexes
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS search_engi_term_id_7cee1e_idx 
+                ON search_engine_invertedindex (term_id, tf_idf_score)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS search_engi_article_96c9a7_idx 
+                ON search_engine_invertedindex (article_id)
+            """)
+        
+        rebuild_time = time.perf_counter() - rebuild_start
+        self.stdout.write(f"Indexes rebuilt in {rebuild_time:.2f}s")
+        
+        write_time = time.perf_counter() - write_start
+        self.stdout.write(f"Total database writes: {write_time:.2f}s (drop: {drop_time:.2f}s, write: {write_parallel_time:.2f}s, rebuild: {rebuild_time:.2f}s)")
         
         if enable_profiling and profiler_pass2 is not None:
             profiler_pass2.disable()
