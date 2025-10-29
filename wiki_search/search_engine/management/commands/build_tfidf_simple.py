@@ -759,8 +759,8 @@ class Command(BaseCommand):
         parser.add_argument(
             '--db-workers',
             type=int,
-            default=48,
-            help='Number of worker threads for database writes in Pass 2 (default: 48)'
+            default=None,
+            help='Number of worker threads for database writes in Pass 2 (default: all available cores)'
         )
 
     def handle(self, *args, **options):
@@ -773,7 +773,7 @@ class Command(BaseCommand):
         logger = logging.getLogger(__name__)
         
         # Determine CPU workers (default to 16 for better performance, not all cores)
-        cpu_workers = options['cpu_workers'] or min(32, os.cpu_count() or 16)
+        cpu_workers = options['cpu_workers'] or max(1, os.cpu_count() // 2)
         
         # Display configuration
         logger.info("=" * 60)
