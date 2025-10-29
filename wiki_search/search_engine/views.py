@@ -9,7 +9,7 @@ from django.http import Http404
 from django.db import connection, models
 
 from .models import Article, Vocabulary, InvertedIndex, PageRank, InternalLink
-from .search import search_hybrid
+from .search import search_hybrid, search_by_title_exact
 from .tokenizer import tokenize
 
 
@@ -27,12 +27,10 @@ def search_view(request):
         try:
             search_results = search_hybrid(query, limit=20)
             if not search_results:  # If hybrid search returns no results, try title search
-                from .search import search_by_title_exact
                 articles = search_by_title_exact(query, limit=20)
                 search_results = [(art, 1.0) for art in articles]
         except Exception as e:
             # Fallback to simple title search if TF-IDF not available
-            from .search import search_by_title_exact
             articles = search_by_title_exact(query, limit=20)
             search_results = [(art, 1.0) for art in articles]
         
@@ -56,15 +54,7 @@ def search_view(request):
 
 def article_detail_view(request, page_id):
     """Display full article content with clickable internal links."""
-    try:
-        article = get_object_or_404(Article, page_id=page_id)
-    except Http404:
-        # Try to find via redirect
-        try:
-            redirect = Redirect.objects.get(source_page_id=page_id)
-            article = redirect.target
-        except Redirect.DoesNotExist:
-            raise Http404("Article not found")
+    article = get_object_or_404(Article, page_id=page_id)
     
     # Process article content to convert internal links
     processed_paragraphs = _process_article_links(article.plain_text_paragraphs)
@@ -129,7 +119,7 @@ def _process_article_links(paragraphs: List[str]) -> List[str]:
 
 
 def _resolve_article_title(title: str) -> Optional[Article]:
-    """Resolve a Wikipedia title to an Article object, handling redirects."""
+    """Resolve a Wikipedia title to an Article object."""
     # First try direct lookup
     try:
         return Article.objects.get(title=title)
@@ -142,20 +132,6 @@ def _resolve_article_title(title: str) -> Optional[Article]:
     except Article.DoesNotExist:
         pass
     
-    # Try to find via redirect
-    try:
-        redirect = Redirect.objects.get(source_title=title)
-        return redirect.target
-    except Redirect.DoesNotExist:
-        pass
-    
-    # Try case-insensitive redirect lookup
-    try:
-        redirect = Redirect.objects.get(source_title__iexact=title)
-        return redirect.target
-    except Redirect.DoesNotExist:
-        pass
-    
     return None
 
 
@@ -164,13 +140,11 @@ def status_view(request):
     try:
         # Basic counts
         article_count = Article.objects.count()
-        redirect_count = Redirect.objects.count()
         link_count = InternalLink.objects.count()
         unresolved_links = InternalLink.objects.filter(to_article__isnull=True).count()
         
         # Search index statistics
         vocabulary_count = Vocabulary.objects.count()
-        tfidf_count = TFIDFIndex.objects.count()
         inverted_index_count = InvertedIndex.objects.count()
         pagerank_count = PageRank.objects.count()
         
@@ -227,21 +201,6 @@ def status_view(request):
             except Exception:
                 pagerank_stats = {}
         
-        # TF-IDF statistics - simplified
-        tfidf_stats = {}
-        if tfidf_count > 0:
-            try:
-                stats = TFIDFIndex.objects.aggregate(
-                    avg_norm=models.Avg('l2_norm'),
-                    max_norm=models.Max('l2_norm')
-                )
-                tfidf_stats = {
-                    'avg_l2_norm': stats['avg_norm'],
-                    'max_l2_norm': stats['max_norm']
-                }
-            except Exception:
-                tfidf_stats = {}
-        
         # Vocabulary statistics - simplified
         vocab_stats = {}
         if vocabulary_count > 0:
@@ -261,11 +220,9 @@ def status_view(request):
         
         context = {
             'article_count': article_count,
-            'redirect_count': redirect_count,
             'link_count': link_count,
             'unresolved_links': unresolved_links,
             'vocabulary_count': vocabulary_count,
-            'tfidf_count': tfidf_count,
             'inverted_index_count': inverted_index_count,
             'pagerank_count': pagerank_count,
             'avg_paragraphs': avg_paragraphs,
@@ -274,7 +231,6 @@ def status_view(request):
             'db_backend': db_backend,
             'db_version': db_version,
             'pagerank_stats': pagerank_stats,
-            'tfidf_stats': tfidf_stats,
             'vocab_stats': vocab_stats,
             'sample_size': len(paragraph_counts)
         }
@@ -284,11 +240,9 @@ def status_view(request):
         context = {
             'error': str(e),
             'article_count': 0,
-            'redirect_count': 0,
             'link_count': 0,
             'unresolved_links': 0,
             'vocabulary_count': 0,
-            'tfidf_count': 0,
             'inverted_index_count': 0,
             'pagerank_count': 0,
             'avg_paragraphs': 0.0,
@@ -297,7 +251,6 @@ def status_view(request):
             'db_backend': 'Unknown',
             'db_version': 'Unknown',
             'pagerank_stats': {},
-            'tfidf_stats': {},
             'vocab_stats': {}
         }
     

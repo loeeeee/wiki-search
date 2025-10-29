@@ -164,10 +164,6 @@
             <span class="stat-value number">{{ article_count|floatformat:0 }}</span>
         </div>
         <div class="stat-item">
-            <span class="stat-label">Redirects</span>
-            <span class="stat-value number">{{ redirect_count|floatformat:0 }}</span>
-        </div>
-        <div class="stat-item">
             <span class="stat-label">Internal Links</span>
             <span class="stat-value number">{{ link_count|floatformat:0 }}</span>
         </div>
@@ -183,10 +179,6 @@
         <div class="stat-item">
             <span class="stat-label">Vocabulary Terms</span>
             <span class="stat-value number">{{ vocabulary_count|floatformat:0 }}</span>
-        </div>
-        <div class="stat-item">
-            <span class="stat-label">TF-IDF Vectors</span>
-            <span class="stat-value number">{{ tfidf_count|floatformat:0 }}</span>
         </div>
         <div class="stat-item">
             <span class="stat-label">Inverted Index Entries</span>
@@ -241,21 +233,6 @@
             <span class="stat-value">{{ pagerank_stats.last_computed|date:"M d, Y H:i" }}</span>
         </div>
         {% endif %}
-    </div>
-    {% endif %}
-
-    <!-- TF-IDF Statistics -->
-    {% if tfidf_stats %}
-    <div class="stat-card">
-        <h3>TF-IDF Statistics</h3>
-        <div class="stat-item">
-            <span class="stat-label">Avg L2 Norm</span>
-            <span class="stat-value number">{{ tfidf_stats.avg_l2_norm|floatformat:4 }}</span>
-        </div>
-        <div class="stat-item">
-            <span class="stat-label">Max L2 Norm</span>
-            <span class="stat-value number">{{ tfidf_stats.max_l2_norm|floatformat:4 }}</span>
-        </div>
     </div>
     {% endif %}
 

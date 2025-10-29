@@ -576,8 +576,8 @@ The project includes a Django web application for searching and viewing Wikipedi
 Access comprehensive database statistics and system information at `http://localhost:8000/status/`:
 
 **Basic Statistics:**
-- Article count, redirects, internal links, unresolved links
-- Search index statistics (TF-IDF, Vocabulary, InvertedIndex, PageRank)
+- Article count, internal links, unresolved links
+- Search index statistics (Vocabulary, InvertedIndex, PageRank)
 
 **Content Analysis:**
 - Average paragraphs per article
@@ -586,7 +586,6 @@ Access comprehensive database statistics and system information at `http://local
 
 **Search Index Details:**
 - PageRank score statistics (min/max/average)
-- TF-IDF vector statistics (L2 norms)
 - Vocabulary statistics (document frequency, IDF values)
 
 **System Information:**
