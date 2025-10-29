@@ -747,8 +747,8 @@ class Command(BaseCommand):
         parser.add_argument(
             '--batch-size',
             type=int,
-            default=800,
-            help='Articles per batch for Pass 2 inverted index (default: 800, optimized for best throughput)'
+            default=4000,
+            help='Articles per batch for Pass 2 inverted index (default: 4000, optimized for best throughput)'
         )
         parser.add_argument(
             '--csv-workers',
