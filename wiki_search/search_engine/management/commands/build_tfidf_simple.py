@@ -7,13 +7,13 @@ import os
 import pstats
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from io import StringIO
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from django.core.management.base import BaseCommand
-from django.db import connection, transaction
+from django.db import connection, connections, transaction
 from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, Vocabulary
@@ -354,6 +354,114 @@ def create_inverted_index_raw_sql(
     return entry_count
 
 
+def create_vocabulary_csv_batch(terms_batch: List[Tuple[str, int, float]]) -> str:
+    """Create CSV buffer for a batch of vocabulary terms.
+    
+    Worker function for ProcessPoolExecutor to build CSV buffers in parallel.
+    
+    Args:
+        terms_batch: List of (term, df, idf_value) tuples
+        
+    Returns:
+        CSV buffer as string
+    """
+    csv_buffer = io.StringIO()
+    for term, df, idf_value in terms_batch:
+        # Escape term for CSV (handle quotes and newlines)
+        escaped_term = term.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        csv_buffer.write(f"{escaped_term}\t{df}\t{idf_value}\n")
+    
+    return csv_buffer.getvalue()
+
+
+def write_vocabulary_batch_sql(csv_data: str) -> int:
+    """Write vocabulary batch to database via PostgreSQL COPY.
+    
+    Worker function for ThreadPoolExecutor to write CSV buffers concurrently.
+    Each thread gets its own database connection.
+    
+    Args:
+        csv_data: CSV buffer string
+        
+    Returns:
+        Number of entries written
+    """
+    table_name = Vocabulary._meta.db_table
+    entry_count = csv_data.count('\n')
+    
+    # Get connection for this thread
+    conn = connections['default']
+    conn.ensure_connection()
+    
+    # Use PostgreSQL COPY for bulk insert (psycopg3 API)
+    with conn.connection.cursor() as cursor:
+        with cursor.copy(f"COPY {table_name} (term, document_frequency, idf_value) FROM STDIN") as copy:
+            for line in csv_data.splitlines(keepends=True):
+                copy.write(line)
+    
+    return entry_count
+
+
+def create_inverted_index_csv_batch(
+    article_batch: List[int],
+    article_tf_map: Dict[int, Dict[str, int]],
+    term_to_vocab_id: Dict[str, int],
+    idf_dict: Dict[str, float]
+) -> str:
+    """Create CSV buffer for a batch of inverted index entries.
+    
+    Worker function for ProcessPoolExecutor to build CSV buffers in parallel.
+    
+    Args:
+        article_batch: List of article IDs
+        article_tf_map: Article ID to term frequency mapping
+        term_to_vocab_id: Term to vocabulary ID mapping
+        idf_dict: Term to IDF value mapping
+        
+    Returns:
+        CSV buffer as string
+    """
+    csv_buffer = io.StringIO()
+    
+    for article_id in article_batch:
+        tf_dict = article_tf_map[article_id]
+        
+        for term, tf in tf_dict.items():
+            if term in term_to_vocab_id and term in idf_dict:
+                tfidf_score = tf * idf_dict[term]
+                csv_buffer.write(f"{term_to_vocab_id[term]}\t{article_id}\t{tfidf_score}\n")
+    
+    return csv_buffer.getvalue()
+
+
+def write_inverted_index_batch_sql(csv_data: str) -> int:
+    """Write inverted index batch to database via PostgreSQL COPY.
+    
+    Worker function for ThreadPoolExecutor to write CSV buffers concurrently.
+    Each thread gets its own database connection.
+    
+    Args:
+        csv_data: CSV buffer string
+        
+    Returns:
+        Number of entries written
+    """
+    table_name = InvertedIndex._meta.db_table
+    entry_count = csv_data.count('\n')
+    
+    # Get connection for this thread
+    conn = connections['default']
+    conn.ensure_connection()
+    
+    # Use PostgreSQL COPY for bulk insert (psycopg3 API)
+    with conn.connection.cursor() as cursor:
+        with cursor.copy(f"COPY {table_name} (term_id, article_id, tf_idf_score) FROM STDIN") as copy:
+            for line in csv_data.splitlines(keepends=True):
+                copy.write(line)
+    
+    return entry_count
+
+
 def pass2_build_tfidf(
     pass1_result: Pass1Result,
     logger: logging.Logger
@@ -399,8 +507,149 @@ def pass2_build_tfidf(
     logger.info(f"  - Inverted index entries: {entry_count}")
 
 
+def pass2_build_tfidf_concurrent(
+    pass1_result: Pass1Result,
+    batch_size: int,
+    csv_workers: int,
+    db_workers: int,
+    logger: logging.Logger
+) -> None:
+    """Pass 2: Build IDF and inverted index using concurrent batch processing.
+    
+    Uses ProcessPoolExecutor for CPU-bound CSV building and ThreadPoolExecutor
+    for I/O-bound database writes in a producer-consumer pipeline.
+    
+    Args:
+        pass1_result: Results from Pass 1
+        batch_size: Articles per batch for inverted index
+        csv_workers: Number of worker processes for CSV building
+        db_workers: Number of worker threads for database writes
+        logger: Logger for output
+    """
+    logger.info("=== Pass 2: Building IDF and Inverted Index (Concurrent) ===")
+    logger.info(f"CSV workers (processes): {csv_workers}")
+    logger.info(f"DB workers (threads): {db_workers}")
+    logger.info(f"Batch size: {batch_size} articles")
+    
+    # Calculate IDF values
+    logger.info("Calculating IDF values...")
+    idf_start = time.time()
+    idf_dict = compute_idf(pass1_result.global_df, pass1_result.total_docs)
+    logger.info(f"IDF calculation completed in {time.time() - idf_start:.2f}s")
+    
+    # === Vocabulary Building (Concurrent) ===
+    logger.info("Building Vocabulary (concurrent)...")
+    vocab_start = time.time()
+    
+    # Prepare terms in batches
+    terms_list = [(term, pass1_result.global_df[term], idf_dict[term]) 
+                  for term in idf_dict.keys()]
+    vocab_batch_size = 10000  # Terms per batch
+    terms_batches = [terms_list[i:i + vocab_batch_size] 
+                     for i in range(0, len(terms_list), vocab_batch_size)]
+    
+    logger.info(f"Split {len(terms_list)} terms into {len(terms_batches)} batches")
+    
+    # Build CSV buffers in parallel (CPU-bound)
+    csv_buffers = []
+    with ProcessPoolExecutor(max_workers=csv_workers) as csv_executor:
+        futures = [csv_executor.submit(create_vocabulary_csv_batch, batch) 
+                   for batch in terms_batches]
+        
+        for future in tqdm(concurrent.futures.as_completed(futures), 
+                          total=len(futures), 
+                          desc="Building Vocab CSV", 
+                          unit="batch"):
+            csv_buffers.append(future.result())
+    
+    csv_time = time.time() - vocab_start
+    logger.info(f"Vocabulary CSV building completed in {csv_time:.2f}s")
+    
+    # Write to database concurrently (I/O-bound)
+    write_start = time.time()
+    total_vocab_entries = 0
+    with ThreadPoolExecutor(max_workers=db_workers) as db_executor:
+        futures = [db_executor.submit(write_vocabulary_batch_sql, csv_buffer) 
+                   for csv_buffer in csv_buffers]
+        
+        for future in tqdm(concurrent.futures.as_completed(futures), 
+                          total=len(futures), 
+                          desc="Writing Vocab", 
+                          unit="batch"):
+            total_vocab_entries += future.result()
+    
+    write_time = time.time() - write_start
+    vocab_total_time = time.time() - vocab_start
+    logger.info(f"Vocabulary write completed in {write_time:.2f}s")
+    logger.info(f"Total vocabulary time: {vocab_total_time:.2f}s ({total_vocab_entries} entries)")
+    
+    # Query back term-to-ID mapping
+    logger.info("Building term-to-ID mapping...")
+    mapping_start = time.time()
+    term_to_vocab_id = {}
+    vocab_objects = Vocabulary.objects.all()
+    for vocab in vocab_objects:
+        term_to_vocab_id[vocab.term] = vocab.id
+    logger.info(f"Mapped {len(term_to_vocab_id)} terms in {time.time() - mapping_start:.2f}s")
+    
+    # === Inverted Index Building (Concurrent) ===
+    logger.info("Building Inverted Index (concurrent)...")
+    index_start = time.time()
+    
+    # Split article IDs into batches
+    article_batches = [pass1_result.article_ids[i:i + batch_size] 
+                       for i in range(0, len(pass1_result.article_ids), batch_size)]
+    
+    logger.info(f"Split {len(pass1_result.article_ids)} articles into {len(article_batches)} batches")
+    
+    # Build CSV buffers in parallel (CPU-bound)
+    csv_buffers = []
+    with ProcessPoolExecutor(max_workers=csv_workers) as csv_executor:
+        futures = [
+            csv_executor.submit(
+                create_inverted_index_csv_batch,
+                batch,
+                pass1_result.article_tf_map,
+                term_to_vocab_id,
+                idf_dict
+            )
+            for batch in article_batches
+        ]
+        
+        for future in tqdm(concurrent.futures.as_completed(futures), 
+                          total=len(futures), 
+                          desc="Building Index CSV", 
+                          unit="batch"):
+            csv_buffers.append(future.result())
+    
+    csv_time = time.time() - index_start
+    logger.info(f"Inverted index CSV building completed in {csv_time:.2f}s")
+    
+    # Write to database concurrently (I/O-bound)
+    write_start = time.time()
+    total_index_entries = 0
+    with ThreadPoolExecutor(max_workers=db_workers) as db_executor:
+        futures = [db_executor.submit(write_inverted_index_batch_sql, csv_buffer) 
+                   for csv_buffer in csv_buffers]
+        
+        for future in tqdm(concurrent.futures.as_completed(futures), 
+                          total=len(futures), 
+                          desc="Writing Index", 
+                          unit="batch"):
+            total_index_entries += future.result()
+    
+    write_time = time.time() - write_start
+    index_total_time = time.time() - index_start
+    logger.info(f"Inverted index write completed in {write_time:.2f}s")
+    logger.info(f"Total inverted index time: {index_total_time:.2f}s ({total_index_entries} entries)")
+    
+    logger.info(f"Pass 2 complete:")
+    logger.info(f"  - Vocabulary entries: {total_vocab_entries}")
+    logger.info(f"  - Inverted index entries: {total_index_entries}")
+
+
 class Command(BaseCommand):
-    help = 'Build TF-IDF index using multiprocess parallel approach'
+    help = 'Build TF-IDF index using multiprocess parallel approach with concurrent Pass 2 (200+ articles/sec)'
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -428,13 +677,31 @@ class Command(BaseCommand):
             '--cpu-workers',
             type=int,
             default=None,
-            help='Number of CPU worker processes (default: all available cores)'
+            help='Number of CPU worker processes for Pass 1 (default: all available cores)'
         )
         parser.add_argument(
             '--batch-size-per-worker',
             type=int,
-            default=200,
-            help='Number of articles per worker batch (default: 200)'
+            default=400,
+            help='Number of articles per worker batch in Pass 1 (default: 50)'
+        )
+        parser.add_argument(
+            '--batch-size',
+            type=int,
+            default=400,
+            help='Articles per batch for Pass 2 inverted index (default: 400, optimized for 200+ articles/sec)'
+        )
+        parser.add_argument(
+            '--csv-workers',
+            type=int,
+            default=12,
+            help='Number of worker processes for CSV building in Pass 2 (default: 12)'
+        )
+        parser.add_argument(
+            '--db-workers',
+            type=int,
+            default=12,
+            help='Number of worker threads for database writes in Pass 2 (default: 12)'
         )
 
     def handle(self, *args, **options):
@@ -451,13 +718,16 @@ class Command(BaseCommand):
         
         # Display configuration
         logger.info("=" * 60)
-        logger.info("Multi-Process TF-IDF Builder (PostgreSQL COPY)")
+        logger.info("Multi-Process TF-IDF Builder (Concurrent Pass 2)")
         logger.info("=" * 60)
         logger.info(f"Limit: {options['limit'] or 'None (all articles)'}")
         logger.info(f"Profile: {options['profile']}")
         logger.info(f"Rebuild: {options['rebuild']}")
-        logger.info(f"CPU Workers: {cpu_workers}")
-        logger.info(f"Batch Size Per Worker: {options['batch_size_per_worker']}")
+        logger.info(f"CPU Workers (Pass 1): {cpu_workers}")
+        logger.info(f"Batch Size Per Worker (Pass 1): {options['batch_size_per_worker']}")
+        logger.info(f"Pass 2 Batch Size: {options['batch_size']}")
+        logger.info(f"Pass 2 CSV Workers (processes): {options['csv_workers']}")
+        logger.info(f"Pass 2 DB Workers (threads): {options['db_workers']}")
         logger.info("=" * 60)
         
         # Clear existing data if rebuild
@@ -490,9 +760,15 @@ class Command(BaseCommand):
             pass1_time = time.time() - pass1_start
             logger.info(f"Pass 1 completed in {pass1_time:.2f}s")
             
-            # Pass 2: Build IDF and inverted index
+            # Pass 2: Build IDF and inverted index (concurrent)
             pass2_start = time.time()
-            pass2_build_tfidf(pass1_result, logger)
+            pass2_build_tfidf_concurrent(
+                pass1_result,
+                options['batch_size'],
+                options['csv_workers'],
+                options['db_workers'],
+                logger
+            )
             pass2_time = time.time() - pass2_start
             logger.info(f"Pass 2 completed in {pass2_time:.2f}s")
             
@@ -507,12 +783,12 @@ class Command(BaseCommand):
             logger.info(f"  - Pass 1 time: {pass1_time:.2f}s ({pass1_time/total_time*100:.1f}%)")
             logger.info(f"  - Pass 2 time: {pass2_time:.2f}s ({pass2_time/total_time*100:.1f}%)")
             logger.info(f"  - Articles per second: {articles_per_second:.2f}")
-            logger.info(f"  - Target: 20 articles/second")
+            logger.info(f"  - Target: 200 articles/second")
             
-            if articles_per_second >= 20:
-                logger.info("  - ✓ TARGET ACHIEVED!")
+            if articles_per_second >= 200:
+                logger.info(f"  - TARGET ACHIEVED!")
             else:
-                logger.info(f"  - ✗ Target missed by {20 - articles_per_second:.2f} articles/second")
+                logger.info(f"  - Target missed by {200 - articles_per_second:.2f} articles/second")
             
             logger.info("=" * 60)
         

@@ -273,10 +273,17 @@ python wiki_search/manage.py resolve_links --rebuild --batch-size 5000 --db-work
 Build TF-IDF index using multiprocess parallel approach with PostgreSQL COPY optimization:
 
 ```bash
-# Build with default settings (uses all CPU cores)
+# Build with default concurrent Pass 2 (200+ articles/sec)
 python wiki_search/manage.py build_tfidf_simple --limit 10000 --rebuild
 
-# Custom workers and batch size for optimal performance
+# Optimal default configuration (9 csv-workers, 9 db-workers, batch size 290)
+python wiki_search/manage.py build_tfidf_simple --rebuild
+
+# Custom workers and batch size for different systems
+python wiki_search/manage.py build_tfidf_simple --rebuild \
+    --db-workers 12 --csv-workers 12 --batch-size 250
+
+# Custom Pass 1 configuration
 python wiki_search/manage.py build_tfidf_simple --rebuild --cpu-workers 16 --batch-size-per-worker 200
 
 # Test with profiling
@@ -291,8 +298,11 @@ python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
 - `--profile`: Enable cProfile profiling
 - `--rebuild`: Clear existing Vocabulary and InvertedIndex before building
 - `--verbose`: Enable verbose logging
-- `--cpu-workers N`: Number of CPU worker processes (default: all available cores)
-- `--batch-size-per-worker N`: Articles per worker batch (default: 200)
+- `--cpu-workers N`: Number of CPU worker processes for Pass 1 (default: all available cores)
+- `--batch-size-per-worker N`: Articles per worker batch in Pass 1 (default: 50)
+- `--batch-size N`: Articles per batch for Pass 2 inverted index (default: 290, optimized for 200+ articles/sec)
+- `--csv-workers N`: Worker processes for CSV building in Pass 2 (default: 9)
+- `--db-workers N`: Worker threads for database writes in Pass 2 (default: 9)
 
 **Architecture:**
 - **Pass 1**: Build term frequency (TF) and document frequency (DF)
@@ -300,28 +310,35 @@ python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
   - Database reads use `.iterator()` for memory efficiency
   - Configurable workers and batch size for optimal performance
   - Cache TF maps in memory, aggregate global DF dictionary
-- **Pass 2**: Build IDF values and inverted index
+- **Pass 2**: Build IDF values and inverted index (concurrent by default)
   - Calculate IDF = log(N / df)
-  - Save Vocabulary table with term statistics using PostgreSQL COPY
-  - Build and save InvertedIndex entries using PostgreSQL COPY
+  - Producer-consumer pipeline with:
+    - ProcessPoolExecutor for CSV buffer building (CPU-bound, bypasses GIL)
+    - ThreadPoolExecutor for database COPY operations (I/O-bound)
+    - Parallel batch processing for 2.2x speedup over sequential approach
 
 **Performance Characteristics:**
 
-*Test: 1000 articles, 16 workers, batch 200:*
-- **Overall throughput**: 144.11 articles/second
-- **Pass 1 (TF/DF)**: 1.39s (20% of time, 8.1x faster than single-thread)
-- **Pass 2 (IDF/Inverted Index)**: 5.55s (80% of time)
+*Current Performance (concurrent mode, default):*
+- 3000 articles: **~200 articles/second** (14-15s total)
+- Pass 1: ~1.6s (11%), Pass 2: ~13s (89%)
+- Configuration: 9 csv-workers, 9 db-workers, batch size 290
 
-*Test: 10000 articles, 16 workers, batch 200:*
-- **Overall throughput**: 136.67 articles/second
-- **Pass 1 (TF/DF)**: 4.84s (6.6% of time, 2490 articles/second!)
-- **Pass 2 (IDF/Inverted Index)**: 67.86s (92.7% of time, database I/O bottleneck)
+*Performance Breakdown (3000 articles):*
+- **Vocabulary**: 0.5s (CSV: 0.2s, DB write: 0.3s)
+- **Inverted Index**: 12s (CSV: 4s, DB write: 8s)
+- **Term mapping**: 0.6s
+
+*Previous Sequential Baseline (for comparison):*
+- 3000 articles: 93.78 articles/second (31.99s total)
+- **2.18x slower** than current concurrent implementation
 
 **Optimization Notes:**
 - PostgreSQL COPY provides 4.2x speedup over Django ORM
 - Multiprocess tokenization achieves 2000-5000 articles/second in Pass 1
-- Pass 2 database writes are the bottleneck (80-95% of execution time)
-- Optimal configuration: 16 workers with batch size 200
+- Concurrent Pass 2 reduces database write time by 2.15x
+- CSV building parallelization provides 2.5x speedup
+- Optimal configuration: 9 csv-workers, 9 db-workers (sweet spot for 96-thread DB)
 - CPU utilization: Full parallelism without GIL limitations
 
 **Use Cases:**
@@ -333,7 +350,9 @@ python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
 - **Vocabulary**: Global term statistics (term, document_frequency, idf_value)
 - **InvertedIndex**: Term-article-score mappings for fast search
 
-For detailed performance analysis, see [docs-vibe/0051-multiprocess-tokenization.md](docs-vibe/0051-multiprocess-tokenization.md).
+For detailed performance analysis, see:
+- [docs-vibe/0051-concurrent-db-io-pass2.md](docs-vibe/0051-concurrent-db-io-pass2.md) - Concurrent Pass 2 implementation (200+ articles/sec)
+- [docs-vibe/0047-cpu-scalability-refactor.md](docs-vibe/0047-cpu-scalability-refactor.md) - Multiprocess tokenization details
 
 ### Build TF-IDF Index (Optimized Multi-Thread)
 
