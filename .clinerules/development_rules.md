@@ -52,6 +52,8 @@ Always check and remove dead code in the script.
 
 Always use a modular design with helper functions.
 
+Always print a concise report after script execution.
+
 ## Documentation
 
 Always document concise implementation details and basic usage in docs-vibe/ with a sequential file name.
