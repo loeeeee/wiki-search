@@ -8,7 +8,7 @@ from django.shortcuts import render, get_object_or_404
 from django.http import Http404
 from django.db import connection, models
 
-from .models import Article, Redirect, Vocabulary, TFIDFIndex, InvertedIndex, PageRank, InternalLink
+from .models import Article, Vocabulary, InvertedIndex, PageRank, InternalLink
 from .search import search_hybrid
 from .tokenizer import tokenize
 

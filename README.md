@@ -53,6 +53,7 @@ Get up and running in 5 minutes:
 - **Python 3.13+** with virtual environment at `.venv/`
 - **PostgreSQL** database server
 - **uv** package manager for Python dependencies
+- **AMD GPU with ROCm** (optional, for GPU acceleration)
 
 ### NixOS Environment
 
@@ -97,6 +98,38 @@ nix-shell
    ```bash
    python wiki_search/manage.py db_summary
    ```
+
+### GPU Acceleration Setup (Optional)
+
+For AMD GPU acceleration, install PyTorch with ROCm support:
+
+```bash
+# Install PyTorch with ROCm support
+pip install torch --index-url https://download.pytorch.org/whl/rocm5.7
+
+# Verify GPU availability
+python -c "import torch; print(torch.cuda.is_available())"
+
+# Install project with GPU dependencies
+uv sync --extra gpu
+```
+
+**GPU Requirements:**
+- AMD GPU with ROCm 5.0+ support (RX 6000 series or newer)
+- 8GB+ VRAM recommended for large datasets
+- Linux OS
+
+**Usage:**
+```bash
+# GPU-accelerated PageRank
+python wiki_search/manage.py build_pagerank --use-gpu --rebuild
+
+# CPU-based TF-IDF indexing with ProcessPool parallelism
+python wiki_search/manage.py build_tfidf_index --rebuild
+
+# Test with limited dataset
+python wiki_search/manage.py build_tfidf_index --limit 1000
+```
 
 ## Database Management Commands
 
@@ -235,41 +268,179 @@ python wiki_search/manage.py resolve_links --rebuild --batch-size 5000 --db-work
 
 ## Search Index Commands
 
-### Build TF-IDF Index
+### Build TF-IDF Index (Multiprocess)
 
-Build TF-IDF index and inverted index for search functionality:
+Build TF-IDF index using multiprocess parallel approach with PostgreSQL COPY optimization:
 
 ```bash
-# Build TF-IDF index with token counts (optimized for performance)
+# Build with default concurrent Pass 2 (200+ articles/sec)
+python wiki_search/manage.py build_tfidf_simple --limit 10000 --rebuild
+
+# Optimal default configuration (9 csv-workers, 9 db-workers, batch size 290)
+python wiki_search/manage.py build_tfidf_simple --rebuild
+
+# Custom workers and batch size for different systems
+python wiki_search/manage.py build_tfidf_simple --rebuild \
+    --db-workers 12 --csv-workers 12 --batch-size 250
+
+# Custom Pass 1 configuration
+python wiki_search/manage.py build_tfidf_simple --rebuild --cpu-workers 16 --batch-size-per-worker 200
+
+# Test with profiling
+python wiki_search/manage.py build_tfidf_simple --limit 1000 --profile --rebuild
+
+# Full rebuild with verbose logging
+python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
+
+# Fast rebuild for smoke test (5000 articles)
+python wiki_search/manage.py build_tfidf_simple --limit 5000 --rebuild --verbose
+```
+
+**Options:**
+- `--limit N`: Limit number of articles to process (default: all)
+- `--profile`: Enable cProfile profiling
+- `--rebuild`: Clear existing Vocabulary and InvertedIndex before building
+- `--verbose`: Enable verbose logging
+- `--cpu-workers N`: Number of CPU worker processes for Pass 1 (default: all available cores)
+- `--batch-size-per-worker N`: Articles per worker batch in Pass 1 (default: 50)
+- `--batch-size N`: Articles per batch for Pass 2 inverted index (default: 290, optimized for 200+ articles/sec)
+- `--csv-workers N`: Worker processes for CSV building in Pass 2 (default: 9)
+- `--db-workers N`: Worker threads for database writes in Pass 2 (default: 9)
+
+**Fast Rebuild Behavior:**
+- When `--rebuild` is specified, the command now uses PostgreSQL `TRUNCATE TABLE <tables> RESTART IDENTITY CASCADE` to clear existing TF-IDF data instantly, followed by `VACUUM ANALYZE` to refresh planner statistics. This mirrors the approach used by `clean_db` and significantly speeds up rebuilds.
+
+**Architecture:**
+- **Pass 1**: Build term frequency (TF) and document frequency (DF)
+  - Multiprocess tokenization using NLTK with ProcessPoolExecutor
+  - Database reads use `.iterator()` for memory efficiency
+  - Configurable workers and batch size for optimal performance
+  - Cache TF maps in memory, aggregate global DF dictionary
+- **Pass 2**: Build IDF values and inverted index (concurrent by default)
+  - Calculate IDF = log(N / df)
+  - Producer-consumer pipeline with:
+    - ProcessPoolExecutor for CSV buffer building (CPU-bound, bypasses GIL)
+    - ThreadPoolExecutor for database COPY operations (I/O-bound)
+    - Parallel batch processing for 2.2x speedup over sequential approach
+
+**Performance Characteristics:**
+
+*Current Performance (fully optimized, 10000 articles):*
+- 10000 articles: **451 articles/second** (22.2s total)
+- Pass 1: 4.5s (20%)
+- Pass 2: 17.3s (78%)
+  - Vocabulary: 1.1s (CSV: 0.66s, DB: 0.44s)
+  - Term mapping: 0.14s (optimized with values_list)
+  - Inverted Index: 16.0s (CSV: 4.6s, DB: 10.8s pipelined)
+- Configuration: 16 cpu-workers, 48 csv-workers, 48 db-workers, batch size 600
+
+*Performance Breakdown (10000 articles):*
+- **CSV Building**: List joining (50% faster than StringIO)
+- **Database Writes**: Overlapped with CSV building via pipeline
+- **Memory**: Process-local shared data (initializer pattern)
+- **Term Mapping**: Bulk query with values_list (86% faster)
+
+*Previous Baseline (before optimizations):*
+- 10000 articles: 323 articles/second (30.9s total)
+- **39.6% improvement** with code-level optimizations
+- Original bottlenecks: StringIO overhead, ORM iteration, excessive workers
+
+**Optimization Notes:**
+- PostgreSQL COPY provides 4.2x speedup over Django ORM
+- Multiprocess tokenization achieves 2000-5000 articles/second in Pass 1
+- Initializer pattern eliminates pickle serialization bottleneck
+- List joining for CSV building: 50% faster than StringIO
+- Bulk term-to-ID mapping: 86% faster than ORM iteration
+- Pipeline architecture overlaps CSV building with DB writes for better throughput
+- Process-local shared data enables true multi-core parallelism
+- Further speedup to 800+ articles/sec requires database tuning (see docs-vibe/0053)
+
+**Use Cases:**
+- Production builds of TF-IDF indexes
+- Processing large datasets (> 1k articles)
+- Development and debugging with clean code structure
+
+**Database Tables:**
+- **Vocabulary**: Global term statistics (term, document_frequency, idf_value)
+- **InvertedIndex**: Term-article-score mappings for fast search
+
+For detailed performance analysis, see:
+- [docs-vibe/0052-csv-building-parallelization-fix.md](docs-vibe/0052-csv-building-parallelization-fix.md) - CSV building parallelization fix (433 articles/sec)
+- [docs-vibe/0051-concurrent-db-io-pass2.md](docs-vibe/0051-concurrent-db-io-pass2.md) - Concurrent Pass 2 implementation (200+ articles/sec)
+- [docs-vibe/0047-cpu-scalability-refactor.md](docs-vibe/0047-cpu-scalability-refactor.md) - Multiprocess tokenization details
+
+### Build TF-IDF Index (Optimized Multi-Thread)
+
+Build TF-IDF index and inverted index for search functionality using optimized GPU acceleration with multiple threadpools:
+
+```bash
+# Build TF-IDF index with optimized GPU acceleration (default)
 python wiki_search/manage.py build_tfidf_index --limit 100000
 
 # Rebuild existing index
 python wiki_search/manage.py build_tfidf_index --rebuild
 
-# With custom workers and profiling
-python wiki_search/manage.py build_tfidf_index --workers 8 --db-workers 48 --profile --verbose
+# With custom GPU processes and reader workers
+python wiki_search/manage.py build_tfidf_index --gpu-threads 4 --reader-threads 32 --verbose
+
+# With separate writer pools and profiling
+python wiki_search/manage.py build_tfidf_index --separate-writers --profile --verbose
+
+# Custom workers and database writers
+python wiki_search/manage.py build_tfidf_index --workers 8 --db-workers 48 --verbose
+
+# Test with limited dataset
+python wiki_search/manage.py build_tfidf_index --limit 1000
 ```
 
 **Options:**
-- `--rebuild`: Clear existing index before building
-- `--batch-size N`: Articles per worker batch (default: 1000)
+- `--rebuild`: Clear existing indexes before building
+- `--batch-size N`: Articles per database batch (default: 500)
 - `--limit N`: Limit number of articles (for testing)
-- `--workers N`: Number of worker processes (default: CPU/2)
+- `--workers N`: Number of CPU consumer processes (default: CPU cores)
 - `--db-workers N`: Number of database writer threads (default: 96)
 - `--verbose`: Enable verbose logging
 - `--profile`: Enable detailed profiling with cProfile
+- `--cpu-process-batch-size N`: Articles per CPU batch (default: 1_000)
+- `--cpu-threads N`: Number of parallel CPU consumer processes (default: CPU cores)
+- `--reader-workers N`: Number of database reader threads (default: 16)
+- `--separate-writers`: Enable separate writer pools for TF-IDF vs inverted index
 
-**Performance Characteristics:**
-- **Small datasets (100-1k articles)**: 10-25 articles/second
-- **Medium datasets (1k-10k articles)**: 20-40 articles/second
-- **Large datasets (10k+ articles)**: 30-60 articles/second
-- **Auto-scaling**: Worker count automatically optimized based on dataset size
+**Optimized Architecture:**
+- **Pass 1**: Producer-consumer model for document frequency calculation
+  - Producers: CPU thread count reading from database
+  - Consumers: CPU core count computing document frequency
+- **Pass 2**: CPU-based TF-IDF computation with ProcessPool parallelism
+  - **ProcessPool Architecture**: True parallelism with process isolation
+  - **CPU Processes**: Multiple processes (default: CPU cores) processing batches in parallel
+  - **Process Isolation**: Independent memory spaces per process
+  - **Reader Pool**: Dedicated threadpool (default: 16) for async database prefetching
+  - **Writer Pools**: Separate threadpools for TF-IDF and inverted index writes
+  - **Concurrent Pipeline**: Database prefetch happens alongside CPU processing
 
-**Token Counting Integration:**
-- Automatically computes token counts for each paragraph
-- Token counts stored in `paragraph_token_counts` field
-- Uses NLTK tokenizer for TF-IDF indexing and search functionality
-- No additional processing time - computed during existing tokenization pass
+**Performance Results:**
+- **CPU-only processing**: 11.9 articles/second (100 articles in 8.39s)
+- **ProcessPool parallelism**: True CPU parallelism without GIL limitations
+- **Universal compatibility**: Works on any system without GPU requirements
+- **Scalable architecture**: Performance scales with CPU core count
+- **CPU utilization**: ProcessPool parallelism without GIL limitations
+- **Database I/O**: Concurrent prefetch pipeline eliminates blocking reads
+- **Architecture**: ProcessPool provides true parallelism with process isolation
+
+**System Requirements:**
+- **CPU**: Multi-core processor (defaults to CPU core count)
+- **Memory**: Sufficient RAM for ProcessPool parallelism
+- **Database**: PostgreSQL for optimal performance
+- **No GPU required**: Universal compatibility across all systems
+
+**Key Features:**
+- **ProcessPool Architecture**: True CPU parallelism with process isolation
+- **CPU-Only Processing**: No GPU dependencies for universal compatibility
+- **Concurrent Pipeline**: Database prefetch happens alongside CPU processing
+- **Explicit Data Passing**: Batch data passed explicitly (no shared memory)
+- **Bulk Database Operations**: Single bulk UPDATE instead of N individual queries
+- **Robust Error Handling**: Proper cleanup and logging with timeout protection
+- **Auto-scaling**: Adjusts CPU process count based on dataset size
 
 ### Build PageRank
 
@@ -499,9 +670,10 @@ For detailed information, see [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/
 ### Search Index Performance
 
 **TF-IDF Build Performance:**
-- **Small datasets (100-1k articles)**: 10-25 articles/second
-- **Medium datasets (1k-10k articles)**: 20-40 articles/second
-- **Large datasets (10k+ articles)**: 30-60 articles/second
+- **GPU Acceleration**: 5-10x speedup over CPU implementation
+- **Producer-Consumer Architecture**: Eliminates database bottlenecks
+- **Batch Processing**: Processes 10k articles simultaneously on GPU
+- **Async Database Writes**: Non-blocking database operations
 
 **PageRank Build Performance:**
 - **Small datasets (1k articles)**: 1.7-2x speedup over baseline
@@ -524,9 +696,12 @@ For detailed information, see [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/
 
 For detailed implementation information, see the documentation in `docs-vibe/`:
 
+- [docs-vibe/0040-pass2-threadpool-optimization.md](docs-vibe/0040-pass2-threadpool-optimization.md) - Pass 2 threadpool optimization details
 - [docs-vibe/0027-pagerank-optimization.md](docs-vibe/0027-pagerank-optimization.md) - PageRank optimization details
 - [docs-vibe/0029-multiprocessing-pagerank-feasibility.md](docs-vibe/0029-multiprocessing-pagerank-feasibility.md) - Multiprocessing PageRank analysis
 - [docs-vibe/0031-qa-dataset-generation.md](docs-vibe/0031-qa-dataset-generation.md) - QA dataset generation
 - [docs-vibe/0033-qa-dataset-hybrid-search.md](docs-vibe/0033-qa-dataset-hybrid-search.md) - QA dataset hybrid search
 - [docs-vibe/0023-tokenizer-helper.md](docs-vibe/0023-tokenizer-helper.md) - Original tokenizer configuration
 - [docs-vibe/0037-nltk-tfidf-refactor.md](docs-vibe/0037-nltk-tfidf-refactor.md) - NLTK TF-IDF refactor
+- [docs-vibe/0022-tfidf-gpu-overhaul.md](docs-vibe/0022-tfidf-gpu-overhaul.md) - TF-IDF GPU overhaul
+- [docs-vibe/0039-tfidf-gpu-overhaul-complete.md](docs-vibe/0039-tfidf-gpu-overhaul-complete.md) - TF-IDF GPU overhaul completion

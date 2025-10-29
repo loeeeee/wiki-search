@@ -6,15 +6,14 @@ from typing import List
 
 from django.core.management.base import BaseCommand
 
-from search_engine.models import Article, InternalLink, Redirect
+from search_engine.models import Article, InternalLink
 
 
 class Command(BaseCommand):
-    help = "Print a summary of current SQLite database contents"
+    help = "Print a summary of current database contents"
 
     def handle(self, *args, **options):
         article_count = Article.objects.count()
-        redirect_count = Redirect.objects.count()
         link_count = InternalLink.objects.count()
         unresolved_links = InternalLink.objects.filter(to_article__isnull=True).count()
 
@@ -36,7 +35,6 @@ class Command(BaseCommand):
 
         self.stdout.write("Database summary")
         self.stdout.write(f"- Articles: {article_count}")
-        self.stdout.write(f"- Redirects: {redirect_count}")
         self.stdout.write(f"- InternalLinks: {link_count}")
         self.stdout.write(f"- Unresolved links (to_article is NULL): {unresolved_links}")
         self.stdout.write(f"- Avg paragraphs per sampled article ({len(samples)} samples): {avg_paragraphs:.2f}")
