@@ -7,7 +7,6 @@ import pstats
 import io
 import psutil
 import os
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -142,13 +141,11 @@ class Command(BaseCommand):
             logger.info("Rebuilt all PageRank indexes")
 
     def _store_pagerank_copy(self, pagerank_scores: Dict[int, float], 
-                           iteration_count: int,
                            batch_size: int = 50000) -> int:
         """Store PageRank scores using PostgreSQL COPY with batch streaming.
         
         Args:
             pagerank_scores: Dictionary mapping article_id to PageRank score
-            iteration_count: Number of iterations used for computation
             batch_size: Number of records to process per batch
             
         Returns:
@@ -171,10 +168,10 @@ class Command(BaseCommand):
             with transaction.atomic():
                 with connection.cursor() as cursor:
                     with cursor.copy(
-                        "COPY search_engine_pagerank (article_id, score, iteration_count, last_computed) FROM STDIN"
+                        "COPY search_engine_pagerank (article_id, score) FROM STDIN"
                     ) as copy:
                         for article_id, score in batch:
-                            copy.write_row((article_id, float(score), iteration_count, datetime.now()))
+                            copy.write_row((article_id, float(score)))
             
             created += len(batch)
             
@@ -184,14 +181,12 @@ class Command(BaseCommand):
         return created
 
     def _store_pagerank_parallel(self, pagerank_scores: Dict[int, float],
-                                iteration_count: int,
                                 batch_size: int = 50000,
                                 db_workers: int = 4) -> int:
         """Store PageRank scores using parallel database writes.
         
         Args:
             pagerank_scores: Dictionary mapping article_id to PageRank score
-            iteration_count: Number of iterations used for computation
             batch_size: Number of records to process per batch
             db_workers: Number of parallel database workers
             
@@ -223,10 +218,10 @@ class Command(BaseCommand):
                 with transaction.atomic():
                     with connection.cursor() as cursor:
                         with cursor.copy(
-                            "COPY search_engine_pagerank (article_id, score, iteration_count, last_computed) FROM STDIN"
+                            "COPY search_engine_pagerank (article_id, score) FROM STDIN"
                         ) as copy:
                             for article_id, score in batch:
-                                copy.write_row((article_id, float(score), iteration_count, datetime.now()))
+                                copy.write_row((article_id, float(score)))
                 written += len(batch)
             return written
         
@@ -371,7 +366,6 @@ class Command(BaseCommand):
         self.stdout.write(f"Storing {len(pagerank_scores)} PageRank scores using parallel PostgreSQL COPY...")
         created_count = self._store_pagerank_parallel(
             pagerank_scores=pagerank_scores,
-            iteration_count=iterations,
             batch_size=batch_size,
             db_workers=db_write_workers
         )

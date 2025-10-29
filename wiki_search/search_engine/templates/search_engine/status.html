@@ -227,12 +227,6 @@
             <span class="stat-label">Avg Score</span>
             <span class="stat-value number">{{ pagerank_stats.avg_score|floatformat:6 }}</span>
         </div>
-        {% if pagerank_stats.last_computed %}
-        <div class="stat-item">
-            <span class="stat-label">Last Computed</span>
-            <span class="stat-value">{{ pagerank_stats.last_computed|date:"M d, Y H:i" }}</span>
-        </div>
-        {% endif %}
     </div>
     {% endif %}
 

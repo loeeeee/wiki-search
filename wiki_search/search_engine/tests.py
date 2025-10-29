@@ -93,9 +93,9 @@ class HybridSearchTests(TestCase):
         InvertedIndex.objects.create(term=vocab_language, article=a3, tf_idf_score=0.6)
 
         # Create PageRank scores
-        PageRank.objects.create(article=a1, score=0.3, iteration_count=10)
-        PageRank.objects.create(article=a2, score=0.1, iteration_count=10)
-        PageRank.objects.create(article=a3, score=0.2, iteration_count=10)
+        PageRank.objects.create(article=a1, score=0.3)
+        PageRank.objects.create(article=a2, score=0.1)
+        PageRank.objects.create(article=a3, score=0.2)
 
     def test_single_term_query(self):
         """Test hybrid search with single term query."""

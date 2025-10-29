@@ -195,8 +195,7 @@ def status_view(request):
                 pagerank_stats = {
                     'max_score': stats['max_score'],
                     'min_score': stats['min_score'],
-                    'avg_score': stats['avg_score'],
-                    'last_computed': PageRank.objects.order_by('-last_computed').first().last_computed if PageRank.objects.exists() else None
+                    'avg_score': stats['avg_score']
                 }
             except Exception:
                 pagerank_stats = {}

@@ -58,8 +58,6 @@ class PageRank(models.Model):
     """Store precomputed PageRank scores for articles."""
     article = models.OneToOneField('Article', on_delete=models.CASCADE, related_name='pagerank')
     score = models.FloatField(default=0.0, db_index=True)
-    iteration_count = models.PositiveIntegerField(default=0)  # Convergence tracking
-    last_computed = models.DateTimeField(auto_now=True)
 
     class Meta:
         indexes = [
