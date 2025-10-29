@@ -753,8 +753,8 @@ class Command(BaseCommand):
         parser.add_argument(
             '--csv-workers',
             type=int,
-            default=48,
-            help='Number of worker processes for CSV building in Pass 2 (default: 48)'
+            default=24,
+            help='Number of worker processes for CSV building in Pass 2 (default: 24)'
         )
         parser.add_argument(
             '--db-workers',
@@ -773,7 +773,7 @@ class Command(BaseCommand):
         logger = logging.getLogger(__name__)
         
         # Determine CPU workers (default to 16 for better performance, not all cores)
-        cpu_workers = options['cpu_workers'] or min(16, os.cpu_count() or 16)
+        cpu_workers = options['cpu_workers'] or min(32, os.cpu_count() or 16)
         
         # Display configuration
         logger.info("=" * 60)
@@ -800,9 +800,14 @@ class Command(BaseCommand):
             table_list = ", ".join(table_names)
             truncate_sql = f"TRUNCATE TABLE {table_list} RESTART IDENTITY CASCADE"
             with connection.cursor() as cur:
-                cur.execute(truncate_sql)
-                # Refresh planner stats to keep subsequent writes/reads predictable
-                cur.execute("VACUUM ANALYZE")
+                # Progress: TRUNCATE
+                with tqdm(total=1, desc="Truncating TF-IDF tables", unit="operation") as pbar:
+                    cur.execute(truncate_sql)
+                    pbar.update(1)
+                # Progress: VACUUM ANALYZE
+                with tqdm(total=1, desc="Vacuuming and analyzing database", unit="operation") as pbar:
+                    cur.execute("VACUUM ANALYZE")
+                    pbar.update(1)
             logger.info(
                 "Cleared existing data via TRUNCATE in %.2fs",
                 time.time() - truncate_start,
