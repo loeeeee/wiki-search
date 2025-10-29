@@ -354,19 +354,51 @@ def create_inverted_index_raw_sql(
     return entry_count
 
 
-def create_vocabulary_csv_batch(terms_batch: List[Tuple[str, int, float]]) -> str:
+# Process-local storage for vocabulary worker data
+_vocabulary_worker_data = None
+
+
+def init_vocabulary_worker(
+    global_df: Dict[str, int],
+    idf_dict: Dict[str, float]
+) -> None:
+    """Initialize worker process with shared data for vocabulary CSV building.
+    
+    This function is called once per worker process to load the dictionaries
+    into process-local storage, avoiding repeated serialization.
+    
+    Args:
+        global_df: Term to document frequency mapping
+        idf_dict: Term to IDF value mapping
+    """
+    global _vocabulary_worker_data
+    _vocabulary_worker_data = {
+        'global_df': global_df,
+        'idf_dict': idf_dict
+    }
+
+
+def create_vocabulary_csv_batch(terms_list: List[str]) -> str:
     """Create CSV buffer for a batch of vocabulary terms.
     
     Worker function for ProcessPoolExecutor to build CSV buffers in parallel.
+    Uses process-local data initialized by init_vocabulary_worker().
     
     Args:
-        terms_batch: List of (term, df, idf_value) tuples
+        terms_list: List of terms
         
     Returns:
         CSV buffer as string
     """
+    # Access process-local data
+    global _vocabulary_worker_data
+    global_df = _vocabulary_worker_data['global_df']
+    idf_dict = _vocabulary_worker_data['idf_dict']
+    
     csv_buffer = io.StringIO()
-    for term, df, idf_value in terms_batch:
+    for term in terms_list:
+        df = global_df[term]
+        idf_value = idf_dict[term]
         # Escape term for CSV (handle quotes and newlines)
         escaped_term = term.replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
         csv_buffer.write(f"{escaped_term}\t{df}\t{idf_value}\n")
@@ -402,25 +434,51 @@ def write_vocabulary_batch_sql(csv_data: str) -> int:
     return entry_count
 
 
-def create_inverted_index_csv_batch(
-    article_batch: List[int],
+# Process-local storage for inverted index worker data
+_inverted_index_worker_data = None
+
+
+def init_inverted_index_worker(
     article_tf_map: Dict[int, Dict[str, int]],
     term_to_vocab_id: Dict[str, int],
     idf_dict: Dict[str, float]
-) -> str:
-    """Create CSV buffer for a batch of inverted index entries.
+) -> None:
+    """Initialize worker process with shared data for inverted index CSV building.
     
-    Worker function for ProcessPoolExecutor to build CSV buffers in parallel.
+    This function is called once per worker process to load the large
+    dictionaries into process-local storage, avoiding repeated serialization.
     
     Args:
-        article_batch: List of article IDs
         article_tf_map: Article ID to term frequency mapping
         term_to_vocab_id: Term to vocabulary ID mapping
         idf_dict: Term to IDF value mapping
+    """
+    global _inverted_index_worker_data
+    _inverted_index_worker_data = {
+        'article_tf_map': article_tf_map,
+        'term_to_vocab_id': term_to_vocab_id,
+        'idf_dict': idf_dict
+    }
+
+
+def create_inverted_index_csv_batch(article_batch: List[int]) -> str:
+    """Create CSV buffer for a batch of inverted index entries.
+    
+    Worker function for ProcessPoolExecutor to build CSV buffers in parallel.
+    Uses process-local data initialized by init_inverted_index_worker().
+    
+    Args:
+        article_batch: List of article IDs
         
     Returns:
         CSV buffer as string
     """
+    # Access process-local data
+    global _inverted_index_worker_data
+    article_tf_map = _inverted_index_worker_data['article_tf_map']
+    term_to_vocab_id = _inverted_index_worker_data['term_to_vocab_id']
+    idf_dict = _inverted_index_worker_data['idf_dict']
+    
     csv_buffer = io.StringIO()
     
     for article_id in article_batch:
@@ -541,9 +599,8 @@ def pass2_build_tfidf_concurrent(
     logger.info("Building Vocabulary (concurrent)...")
     vocab_start = time.time()
     
-    # Prepare terms in batches
-    terms_list = [(term, pass1_result.global_df[term], idf_dict[term]) 
-                  for term in idf_dict.keys()]
+    # Prepare terms in batches (only send term strings, not df/idf data)
+    terms_list = list(idf_dict.keys())
     vocab_batch_size = 10000  # Terms per batch
     terms_batches = [terms_list[i:i + vocab_batch_size] 
                      for i in range(0, len(terms_list), vocab_batch_size)]
@@ -551,8 +608,13 @@ def pass2_build_tfidf_concurrent(
     logger.info(f"Split {len(terms_list)} terms into {len(terms_batches)} batches")
     
     # Build CSV buffers in parallel (CPU-bound)
+    # Use initializer to load shared data once per worker process
     csv_buffers = []
-    with ProcessPoolExecutor(max_workers=csv_workers) as csv_executor:
+    with ProcessPoolExecutor(
+        max_workers=csv_workers,
+        initializer=init_vocabulary_worker,
+        initargs=(pass1_result.global_df, idf_dict)
+    ) as csv_executor:
         futures = [csv_executor.submit(create_vocabulary_csv_batch, batch) 
                    for batch in terms_batches]
         
@@ -592,8 +654,8 @@ def pass2_build_tfidf_concurrent(
         term_to_vocab_id[vocab.term] = vocab.id
     logger.info(f"Mapped {len(term_to_vocab_id)} terms in {time.time() - mapping_start:.2f}s")
     
-    # === Inverted Index Building (Concurrent) ===
-    logger.info("Building Inverted Index (concurrent)...")
+    # === Inverted Index Building (Concurrent with Pipeline) ===
+    logger.info("Building Inverted Index (concurrent with pipeline)...")
     index_start = time.time()
     
     # Split article IDs into batches
@@ -602,45 +664,46 @@ def pass2_build_tfidf_concurrent(
     
     logger.info(f"Split {len(pass1_result.article_ids)} articles into {len(article_batches)} batches")
     
-    # Build CSV buffers in parallel (CPU-bound)
-    csv_buffers = []
-    with ProcessPoolExecutor(max_workers=csv_workers) as csv_executor:
-        futures = [
-            csv_executor.submit(
-                create_inverted_index_csv_batch,
-                batch,
-                pass1_result.article_tf_map,
-                term_to_vocab_id,
-                idf_dict
-            )
+    # Pipeline CSV building and DB writes for better parallelism
+    # Start DB writes as soon as CSV buffers are ready
+    total_index_entries = 0
+    csv_build_time = 0
+    db_write_time = 0
+    
+    with ProcessPoolExecutor(
+        max_workers=csv_workers,
+        initializer=init_inverted_index_worker,
+        initargs=(pass1_result.article_tf_map, term_to_vocab_id, idf_dict)
+    ) as csv_executor, ThreadPoolExecutor(max_workers=db_workers) as db_executor:
+        
+        # Submit all CSV building tasks
+        csv_futures = [
+            csv_executor.submit(create_inverted_index_csv_batch, batch)
             for batch in article_batches
         ]
         
-        for future in tqdm(concurrent.futures.as_completed(futures), 
-                          total=len(futures), 
-                          desc="Building Index CSV", 
-                          unit="batch"):
-            csv_buffers.append(future.result())
-    
-    csv_time = time.time() - index_start
-    logger.info(f"Inverted index CSV building completed in {csv_time:.2f}s")
-    
-    # Write to database concurrently (I/O-bound)
-    write_start = time.time()
-    total_index_entries = 0
-    with ThreadPoolExecutor(max_workers=db_workers) as db_executor:
-        futures = [db_executor.submit(write_inverted_index_batch_sql, csv_buffer) 
-                   for csv_buffer in csv_buffers]
+        # As CSV buffers complete, immediately submit them for DB writes
+        db_futures = []
+        csv_start = time.time()
+        with tqdm(total=len(article_batches), desc="Building & Writing Index", unit="batch") as pbar:
+            for csv_future in concurrent.futures.as_completed(csv_futures):
+                csv_buffer = csv_future.result()
+                # Immediately submit to DB writer
+                db_future = db_executor.submit(write_inverted_index_batch_sql, csv_buffer)
+                db_futures.append(db_future)
+                pbar.update(1)
         
-        for future in tqdm(concurrent.futures.as_completed(futures), 
-                          total=len(futures), 
-                          desc="Writing Index", 
-                          unit="batch"):
-            total_index_entries += future.result()
+        csv_build_time = time.time() - csv_start
+        
+        # Wait for all DB writes to complete
+        db_start = time.time()
+        for db_future in concurrent.futures.as_completed(db_futures):
+            total_index_entries += db_future.result()
+        db_write_time = time.time() - db_start
     
-    write_time = time.time() - write_start
     index_total_time = time.time() - index_start
-    logger.info(f"Inverted index write completed in {write_time:.2f}s")
+    logger.info(f"Inverted index CSV building completed in {csv_build_time:.2f}s")
+    logger.info(f"Inverted index DB writes completed in {db_write_time:.2f}s")
     logger.info(f"Total inverted index time: {index_total_time:.2f}s ({total_index_entries} entries)")
     
     logger.info(f"Pass 2 complete:")

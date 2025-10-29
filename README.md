@@ -319,27 +319,34 @@ python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
 
 **Performance Characteristics:**
 
-*Current Performance (concurrent mode, default):*
-- 3000 articles: **~200 articles/second** (14-15s total)
-- Pass 1: ~1.6s (11%), Pass 2: ~13s (89%)
-- Configuration: 9 csv-workers, 9 db-workers, batch size 290
+*Current Performance (optimized with initializer pattern, 6000 articles):*
+- 6000 articles: **433 articles/second** (13.86s total)
+- Pass 1: 3.07s (22.1%)
+- Pass 2: 10.78s (77.8%)
+  - Vocabulary: 0.60s
+  - Term mapping: 0.76s
+  - Inverted Index: 9.31s (pipelined CSV building + DB writes)
+- Configuration: 12 csv-workers, 12 db-workers, batch size 400
 
-*Performance Breakdown (3000 articles):*
-- **Vocabulary**: 0.5s (CSV: 0.2s, DB write: 0.3s)
-- **Inverted Index**: 12s (CSV: 4s, DB write: 8s)
-- **Term mapping**: 0.6s
+*Performance Breakdown (6000 articles):*
+- **CSV Building**: Fully parallelized (all 12 workers active)
+- **Database Writes**: Overlapped with CSV building via pipeline
+- **Memory**: Process-local shared data (initializer pattern)
 
-*Previous Sequential Baseline (for comparison):*
-- 3000 articles: 93.78 articles/second (31.99s total)
-- **2.18x slower** than current concurrent implementation
+*Previous Baseline (before optimizations):*
+- 6000 articles: 204.13 articles/second (29.39s total)
+- **2.12x slower** than current optimized implementation
+- CSV building bottlenecked by 7.2s pickle serialization overhead
 
 **Optimization Notes:**
 - PostgreSQL COPY provides 4.2x speedup over Django ORM
 - Multiprocess tokenization achieves 2000-5000 articles/second in Pass 1
-- Concurrent Pass 2 reduces database write time by 2.15x
-- CSV building parallelization provides 2.5x speedup
-- Optimal configuration: 9 csv-workers, 9 db-workers (sweet spot for 96-thread DB)
-- CPU utilization: Full parallelism without GIL limitations
+- Initializer pattern eliminates pickle serialization bottleneck (7.2s to negligible)
+- Pipeline architecture overlaps CSV building with DB writes for better throughput
+- CSV building: 93% improvement (9.25s to 0.64s with initializer)
+- Process-local shared data enables true multi-core parallelism
+- CPU utilization: All workers fully active without serialization bottleneck
+- Overall throughput: 2.12x improvement over baseline (204 to 433 articles/sec)
 
 **Use Cases:**
 - Production builds of TF-IDF indexes
@@ -351,6 +358,7 @@ python wiki_search/manage.py build_tfidf_simple --rebuild --verbose
 - **InvertedIndex**: Term-article-score mappings for fast search
 
 For detailed performance analysis, see:
+- [docs-vibe/0052-csv-building-parallelization-fix.md](docs-vibe/0052-csv-building-parallelization-fix.md) - CSV building parallelization fix (433 articles/sec)
 - [docs-vibe/0051-concurrent-db-io-pass2.md](docs-vibe/0051-concurrent-db-io-pass2.md) - Concurrent Pass 2 implementation (200+ articles/sec)
 - [docs-vibe/0047-cpu-scalability-refactor.md](docs-vibe/0047-cpu-scalability-refactor.md) - Multiprocess tokenization details
 
