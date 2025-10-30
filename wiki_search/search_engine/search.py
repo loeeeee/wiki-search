@@ -25,10 +25,10 @@ def search_hybrid(
     limit: int = 20,
     alpha: float = 0.85,
     max_candidates: int = 500,
-    coverage_bonus_weight: float = 0.1,
+    coverage_bonus_weight: float = 0.0,
     strict_and_filter: bool = False,
     min_term_match_policy: str = "balanced",
-    enable_partial_title_boost: bool = False
+    enable_partial_title_boost: bool = True
 ) -> List[Tuple[Article, float]]:
     """
     Hybrid search combining TF-IDF relevance with PageRank authority.
@@ -36,11 +36,13 @@ def search_hybrid(
     Args:
         query: Search query string
         limit: Maximum number of results to return (default: 20)
-        alpha: Weight for TF-IDF score in linear blend, 0-1 (default: 0.7)
+        alpha: Weight for TF-IDF score in linear blend, 0-1 (default: 0.85)
                Final score = alpha * tfidf_norm + (1-alpha) * pagerank_norm
         max_candidates: Maximum total InvertedIndex entries to fetch (default: 500)
-        coverage_bonus_weight: Weight for coverage bonus (default: 0.1)
+        coverage_bonus_weight: Weight for coverage bonus (default: 0.0)
         strict_and_filter: Enable strict AND filtering for queries with ≤5 terms (default: False)
+        min_term_match_policy: balanced|strict|len2_strict (default: balanced)
+        enable_partial_title_boost: Enable prefix/contains title boosts (default: True)
     
     Returns:
         List of (Article, hybrid_score) tuples sorted by score descending
