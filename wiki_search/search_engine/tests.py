@@ -143,3 +143,43 @@ class HybridSearchTests(TestCase):
         """Test query with only stopwords (should tokenize to empty)."""
         results = search_hybrid("the and or", limit=5)
         self.assertEqual(len(results), 0)
+
+
+class QADatasetDedupTests(TestCase):
+    def setUp(self):
+        # Create a single article that will appear twice in supporting_facts
+        Article.objects.create(
+            page_id=10,
+            title="Alpha",
+            plain_text_paragraphs=["Alpha content."]
+        )
+
+    def test_supporting_docs_deduplicated(self):
+        from .management.commands.generate_qa_dataset import Command
+
+        # Construct minimal Hotpot-style entry with duplicate titles
+        qa_data = [{
+            "_id": "q1",
+            "question": "What is Alpha?",
+            "answer": "Alpha",
+            "supporting_facts": [["Alpha", 0], ["Alpha", 1]]
+        }]
+
+        cmd = Command()
+        titles = cmd.collect_article_titles(qa_data)
+        article_cache = cmd.batch_fetch_articles(titles)
+        token_cache = cmd.precompute_token_counts(article_cache)
+
+        results, _timing = cmd.process_qa_entries(
+            qa_data=qa_data,
+            context_sizes=[32000],
+            article_cache=article_cache,
+            token_cache=token_cache,
+        )
+
+        self.assertIn(32000, results)
+        self.assertEqual(len(results[32000]), 1)
+        entry = results[32000][0]
+        titles = [d["title"] for d in entry["supporting_docs"]]
+        self.assertEqual(len(titles), 1)
+        self.assertEqual(titles[0], "Alpha")
