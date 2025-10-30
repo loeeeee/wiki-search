@@ -8,3 +8,5 @@
 Create a common profile helper.
 
 Always store profiling results in data/profiling/
+
+Every task should have a performance goal.
