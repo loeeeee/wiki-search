@@ -575,6 +575,16 @@ python wiki_search/manage.py generate_qa_dataset \
 - Real-time progress bars with tqdm for monitoring
 - Comprehensive error handling with skip statistics
 
+#### Profiling and Benchmarking (default metrics)
+
+The command prints detailed timing metrics by default, including stage breakdown, throughput (entries/sec), and ETA when `--limit` is used. For quick baselines on representative subsets and an extrapolated full-run estimate:
+
+```bash
+python scripts/benchmark_generate_qa.py --input data/raw/hotpot_dev_fullwiki_v1.json --limits 300 1000
+```
+
+See `docs-vibe/0119-qa-dataset-profiling-baseline.md` for details.
+
 ## Web Application
 
 The project includes a Django web application for searching and viewing Wikipedia articles.

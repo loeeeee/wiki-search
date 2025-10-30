@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Set
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from functools import lru_cache
 
 from django.core.management.base import BaseCommand, CommandError
 from tqdm import tqdm
@@ -168,7 +169,9 @@ class Command(BaseCommand):
             profiler = cProfile.Profile()
             profiler.enable()
             
-            results, timing_stats = self.process_qa_entries(qa_data, context_sizes, article_cache, token_cache)
+            processing_start = time.perf_counter()
+            results, timing_stats, stats = self.process_qa_entries(qa_data, context_sizes, article_cache, token_cache)
+            processing_time = time.perf_counter() - processing_start
             
             profiler.disable()
             
@@ -179,14 +182,31 @@ class Command(BaseCommand):
             
             # Print profile statistics
             self.stdout.write("\nTop 30 time-consuming functions:")
-            stats = pstats.Stats(profiler, stream=self.stdout)
-            stats.sort_stats('cumulative')
-            stats.print_stats(30)
+            profile_stats = pstats.Stats(profiler, stream=self.stdout)
+            profile_stats.sort_stats('cumulative')
+            profile_stats.print_stats(30)
         else:
-            results, timing_stats = self.process_qa_entries(qa_data, context_sizes, article_cache, token_cache)
+            processing_start = time.perf_counter()
+            results, timing_stats, stats = self.process_qa_entries(qa_data, context_sizes, article_cache, token_cache)
+            processing_time = time.perf_counter() - processing_start
 
         # Print timing statistics
+        timing_stats.setdefault('preprocessing', []).append(preprocessing_time)
         self._print_timing_stats(timing_stats)
+
+        # Throughput summary and ETA
+        processed = stats.get('processed', 0)
+        if processing_time > 0:
+            eps = processed / processing_time
+        else:
+            eps = 0.0
+        self.stdout.write(f"\nProcessing time (entries loop): {processing_time:.2f}s")
+        self.stdout.write(f"Throughput: {eps:.2f} entries/sec")
+        if limit:
+            remaining = max(0, len(qa_data) - processed)
+            eta_s = (remaining / eps) if eps > 0 else float('inf')
+            if eta_s != float('inf'):
+                self.stdout.write(f"ETA for remaining {remaining} entries: {eta_s/60:.2f} min")
 
         # Generate output files
         self.generate_output_files(results, output_dir, context_sizes)
@@ -262,7 +282,7 @@ class Command(BaseCommand):
         self.stdout.write(f"Pre-computed token counts for {len(token_cache)} articles")
         return token_cache
 
-    def process_qa_entries(self, qa_data: List[Dict], context_sizes: List[int], article_cache: Dict[str, Article], token_cache: Dict[int, int]) -> Tuple[Dict[int, List[Dict]], Dict]:
+    def process_qa_entries(self, qa_data: List[Dict], context_sizes: List[int], article_cache: Dict[str, Article], token_cache: Dict[int, int]) -> Tuple[Dict[int, List[Dict]], Dict, Dict]:
         """Process QA entries in single-threaded manner with timing instrumentation."""
         results = {size: [] for size in context_sizes}
         
@@ -276,6 +296,19 @@ class Command(BaseCommand):
         
         timing_stats = defaultdict(list)
         
+        # Cached search wrapper to avoid repeated DB work for identical queries
+        @lru_cache(maxsize=4096)
+        def _cached_search(query: str, limit: int) -> tuple:
+            return tuple(search_hybrid(query, limit=limit))
+
+        # Token lookup for fast context size calculation
+        def _token_lookup(doc: Dict[str, str]) -> int:
+            title_lower = doc['title'].lower()
+            article = article_cache.get(title_lower)
+            if not article:
+                return 0
+            return token_cache.get(article.id, 0)
+
         # Process entries with progress bar
         for entry_data in tqdm(qa_data, desc="Processing QA entries"):
             entry_start = time.perf_counter()
@@ -331,10 +364,11 @@ class Command(BaseCommand):
                 # Get distractor documents using round-robin selection
                 distractor_docs = []
                 supporting_titles = {doc['title'] for doc in supporting_docs}
+                distractor_titles = set()
                 
                 # Use supporting fact titles as search queries
                 search_start = time.perf_counter()
-                search_results = [search_hybrid(fact[0], limit=20) for fact in supporting_facts if len(fact) > 0]
+                search_results = [list(_cached_search(fact[0], 20)) for fact in supporting_facts if len(fact) > 0]
                 timing_stats['search_operations'].append(time.perf_counter() - search_start)
                 
                 # Round-robin through search results to collect distractors up to max TARGET size
@@ -349,6 +383,7 @@ class Command(BaseCommand):
                     logger.info(f"Skipping {qa_id}: supporting docs exceed max context ({supporting_tokens} > {max_context_tokens})")
                     continue
                 
+                distractor_start = time.perf_counter()
                 while supporting_tokens + current_distractor_tokens < max_context_tokens:
                     found_article = False
                     
@@ -362,7 +397,7 @@ class Command(BaseCommand):
                                 continue
                                 
                             # Skip if already in distractors
-                            if any(doc['title'] == article.title for doc in distractor_docs):
+                            if article.title in distractor_titles:
                                 continue
                             
                             # Check if adding this article would exceed the limit
@@ -383,6 +418,7 @@ class Command(BaseCommand):
                             
                             # Add the distractor
                             distractor_docs.append(format_article_for_qa(article))
+                            distractor_titles.add(article.title)
                             current_distractor_tokens += article_tokens
                             found_article = True
                             logger.debug(f"Added distractor: {article.title} (score: {score:.4f}, tokens: {article_tokens})")
@@ -391,11 +427,13 @@ class Command(BaseCommand):
                     # If no more articles available from any search result, break
                     if not found_article:
                         break
+                timing_stats['distractor_selection'].append(time.perf_counter() - distractor_start)
 
                 # Calculate context size mapping for different target sizes
                 context_sizes_map = {}
                 target_sizes = TARGET_SIZES
                 
+                estimation_start = time.perf_counter()
                 for target_size in target_sizes:
                     # Calculate how many distractor docs fit within this target size
                     distractor_tokens_used = 0
@@ -423,6 +461,7 @@ class Command(BaseCommand):
                     # Store the estimated context size from cache and number of distractor docs
                     actual_context_size = supporting_tokens + distractor_tokens_used
                     context_sizes_map[target_size] = (actual_context_size, num_distractor_docs)
+                timing_stats['context_finalize_estimation'].append(time.perf_counter() - estimation_start)
 
                 # Create _QAEntry dataclass
                 qa_entry = _QAEntry(
@@ -441,16 +480,19 @@ class Command(BaseCommand):
                 context_entries = qa_entry.get_all_context_sizes()
                 
                 # Add to appropriate context size buckets
+                exact_start = time.perf_counter()
                 for context_size in context_sizes:
                     if context_size in context_entries:
                         entry_dict = asdict(context_entries[context_size])
-                        # Recompute exact context size using final serialized docs (includes separators)
+                        # Recompute exact context size using token cache fast path
                         exact_tokens = calculate_context_size(
                             supporting_docs=entry_dict['supporting_docs'],
-                            distractor_docs=entry_dict['distractor_docs']
+                            distractor_docs=entry_dict['distractor_docs'],
+                            token_lookup=_token_lookup,
                         )
                         entry_dict['context_size'] = exact_tokens
                         results[context_size].append(entry_dict)
+                timing_stats['context_finalize_exact'].append(time.perf_counter() - exact_start)
 
             except Exception as e:
                 stats['errors'] += 1
@@ -469,7 +511,7 @@ class Command(BaseCommand):
         self.stdout.write(f"  Skipped (context overflow): {stats['skipped_context_overflow']}")
         self.stdout.write(f"  Errors: {stats['errors']}")
 
-        return results, timing_stats
+        return results, timing_stats, stats
 
     def _print_timing_stats(self, timing_stats: Dict[str, List[float]]):
         """Print timing statistics summary."""
@@ -496,11 +538,13 @@ class Command(BaseCommand):
             self.stdout.write(f"\nWriting {len(results[context_size])} entries to {output_file}")
             
             try:
+                io_start = time.perf_counter()
                 with open(output_file, 'w', encoding='utf-8') as f:
                     json.dump(results[context_size], f, indent=2, ensure_ascii=False)
                 
                 self.stdout.write(f"  Context size: {context_size} tokens")
                 self.stdout.write(f"  Entries: {len(results[context_size])}")
+                self.stdout.write(f"  Write time: {time.perf_counter() - io_start:.2f}s")
                 
             except Exception as e:
                 raise CommandError(f"Failed to write output file {output_file}: {e}")
