@@ -7,6 +7,7 @@ from django.test import TestCase
 from .models import Article, InvertedIndex, PageRank, Vocabulary
 from .search import search_by_title_exact, search_hybrid
 from .tokenizer import tokenize
+from .qa_helpers import calculate_context_size
 
 
 class TokenizationTests(TestCase):
@@ -183,3 +184,58 @@ class QADatasetDedupTests(TestCase):
         titles = [d["title"] for d in entry["supporting_docs"]]
         self.assertEqual(len(titles), 1)
         self.assertEqual(titles[0], "Alpha")
+
+
+class QADatasetContextCapTests(TestCase):
+    def setUp(self):
+        # Create supporting articles with multiple paragraphs
+        Article.objects.create(
+            page_id=20,
+            title="DocOne",
+            plain_text_paragraphs=[
+                "Para one.",
+                "Para two with more text.",
+            ],
+        )
+        Article.objects.create(
+            page_id=21,
+            title="DocTwo",
+            plain_text_paragraphs=[
+                "Another paragraph.",
+                "Second paragraph here.",
+            ],
+        )
+
+    def test_context_size_includes_separators_and_caps(self):
+        from .management.commands.generate_qa_dataset import Command
+
+        qa_data = [{
+            "_id": "q2",
+            "question": "Q?",
+            "answer": "A",
+            "supporting_facts": [["DocOne", 0], ["DocTwo", 0]],
+        }]
+
+        cmd = Command()
+        titles = cmd.collect_article_titles(qa_data)
+        article_cache = cmd.batch_fetch_articles(titles)
+        token_cache = cmd.precompute_token_counts(article_cache)
+
+        results, _timing = cmd.process_qa_entries(
+            qa_data=qa_data,
+            context_sizes=[8000, 32000],
+            article_cache=article_cache,
+            token_cache=token_cache,
+        )
+
+        # Ensure entries exist and context_size equals recomputed value
+        for size in [8000, 32000]:
+            self.assertIn(size, results)
+            self.assertEqual(len(results[size]), 1)
+            entry = results[size][0]
+            recomputed = calculate_context_size(
+                supporting_docs=entry["supporting_docs"],
+                distractor_docs=entry["distractor_docs"],
+            )
+            self.assertEqual(entry["context_size"], recomputed)
+            self.assertLessEqual(entry["context_size"], size)
