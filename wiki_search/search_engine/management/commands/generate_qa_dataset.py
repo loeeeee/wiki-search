@@ -84,7 +84,7 @@ class Command(BaseCommand):
         parser.add_argument(
             '--limit',
             type=int,
-            default=100,
+            default=None,
             help='Limit number of QA entries to process (default: 100)'
         )
         parser.add_argument(
