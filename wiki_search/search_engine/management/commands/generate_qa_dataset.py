@@ -296,18 +296,35 @@ class Command(BaseCommand):
                 answer = entry_data.get('answer', '')
                 supporting_facts = entry_data.get('supporting_facts', [])
 
-                # Get supporting documents using article cache
+                # Get supporting documents using article cache (dedupe by title)
                 supporting_docs = []
                 missing_articles = []
                 
+                # Deduplicate supporting titles (case-insensitive)
+                raw_titles = []
+                seen_titles_lower = set()
                 for fact in supporting_facts:
                     if len(fact) >= 1:
-                        title = fact[0]
-                        article = article_cache.get(title.lower())
-                        if article:
-                            supporting_docs.append(format_article_for_qa(article))
-                        else:
-                            missing_articles.append(title)
+                        t = fact[0]
+                        tl = t.lower()
+                        raw_titles.append(t)
+                        if tl not in seen_titles_lower:
+                            seen_titles_lower.add(tl)
+                
+                # Optionally log if duplicates were present
+                if logger.isEnabledFor(logging.DEBUG) and len(seen_titles_lower) < len(raw_titles):
+                    logger.debug(
+                        f"QA {qa_id}: deduped supporting titles from {len(raw_titles)} to {len(seen_titles_lower)}"
+                    )
+                
+                for title_lower in seen_titles_lower:
+                    article = article_cache.get(title_lower)
+                    if article:
+                        supporting_docs.append(format_article_for_qa(article))
+                    else:
+                        # Keep original-cased title if available in raw_titles for better logging
+                        missing_title = next((t for t in raw_titles if t.lower() == title_lower), title_lower)
+                        missing_articles.append(missing_title)
 
                 if missing_articles:
                     stats['skipped_missing_articles'] += 1
