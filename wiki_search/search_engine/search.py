@@ -8,6 +8,8 @@ import logging
 import math
 import statistics
 from collections import defaultdict
+import time
+import math as _math
 from typing import Dict, List, Set, Tuple
 
 from django.db.models import Q
@@ -24,7 +26,9 @@ def search_hybrid(
     alpha: float = 0.85,
     max_candidates: int = 500,
     coverage_bonus_weight: float = 0.1,
-    strict_and_filter: bool = False
+    strict_and_filter: bool = False,
+    min_term_match_policy: str = "balanced",
+    enable_partial_title_boost: bool = False
 ) -> List[Tuple[Article, float]]:
     """
     Hybrid search combining TF-IDF relevance with PageRank authority.
@@ -42,17 +46,21 @@ def search_hybrid(
         List of (Article, hybrid_score) tuples sorted by score descending
     """
     # Tokenize query
+    t0 = time.perf_counter()
     query_terms = tokenize(query)
+    t_tokenize = time.perf_counter() - t0
     
     if not query_terms:
         logger.debug("Empty query after tokenization")
         return []
     
     # Fetch vocabulary IDs for query terms
+    t1 = time.perf_counter()
     vocab_lookup = {
         v.term: v.id 
         for v in Vocabulary.objects.filter(term__in=query_terms)
     }
+    t_vocab = time.perf_counter() - t1
     
     if not vocab_lookup:
         logger.debug(f"No vocabulary matches for query terms: {query_terms}")
@@ -67,7 +75,7 @@ def search_hybrid(
     
     # Dynamic per-term limit based on max_candidates
     per_term_limit = math.ceil(max_candidates / max(1, len(vocab_ids)))
-    
+    t2 = time.perf_counter()
     for vocab_id in vocab_ids:
         # This query uses the (term_id, tf_idf_score) index efficiently
         entries = list(
@@ -80,6 +88,7 @@ def search_hybrid(
         for article_id, score in entries:
             article_tfidf_scores[article_id] += score
             article_term_coverage[article_id] += 1
+    t_postings = time.perf_counter() - t2
     
     if not article_tfidf_scores:
         logger.debug("No articles found in InvertedIndex")
@@ -89,13 +98,16 @@ def search_hybrid(
     num_query_terms = len(query_terms)
     if num_query_terms == 1:
         min_term_match = 1
-    elif strict_and_filter and num_query_terms <= 5:
-        min_term_match = num_query_terms
-    elif num_query_terms >= 3:
-        min_term_match = 2
     else:
-        # For 2-term queries, accept any single term match for better recall
-        min_term_match = 1
+        if strict_and_filter and num_query_terms <= 5:
+            min_term_match = num_query_terms
+        elif min_term_match_policy == "strict":
+            min_term_match = num_query_terms
+        elif min_term_match_policy == "len2_strict" and num_query_terms == 2:
+            min_term_match = 2
+        else:
+            # balanced default: require 2 for any multi-term
+            min_term_match = 2
     
     # Filter candidates by coverage
     filtered_article_ids = [
@@ -107,25 +119,31 @@ def search_hybrid(
         logger.debug(f"No articles matched min_term_match={min_term_match}")
         return []
     
-    logger.debug(
-        f"Filtered {len(article_tfidf_scores)} candidates to {len(filtered_article_ids)} "
-        f"with min_term_match={min_term_match}"
-    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"Filtered {len(article_tfidf_scores)} candidates to {len(filtered_article_ids)} "
+            f"with min_term_match={min_term_match}"
+        )
     
     # Apply coverage bonus to TF-IDF scores
-    for article_id in filtered_article_ids:
-        coverage = article_term_coverage[article_id]
-        coverage_bonus = coverage_bonus_weight * (coverage - 1)
-        article_tfidf_scores[article_id] += coverage_bonus
+    # Concave via log1p for diminishing returns
+    if coverage_bonus_weight != 0.0:
+        for article_id in filtered_article_ids:
+            coverage = article_term_coverage[article_id]
+            if coverage > 1:
+                coverage_bonus = coverage_bonus_weight * _math.log1p(coverage - 1)
+                article_tfidf_scores[article_id] += coverage_bonus
     
     # Get candidate article IDs (only filtered ones)
     candidate_ids = filtered_article_ids
     
     # Bulk fetch PageRank scores
+    t3 = time.perf_counter()
     pagerank_lookup = {
         pr.article_id: pr.score
         for pr in PageRank.objects.filter(article_id__in=candidate_ids)
     }
+    t_pagerank = time.perf_counter() - t3
     
     # Max-normalize TF-IDF scores to [0, 1]
     tfidf_scores_for_candidates = [article_tfidf_scores[aid] for aid in candidate_ids]
@@ -183,10 +201,12 @@ def search_hybrid(
     fetch_ids = [article_id for article_id, _ in hybrid_scores[:limit + 10]]
     
     # Bulk fetch articles
+    t4 = time.perf_counter()
     articles = {
         article.id: article
         for article in Article.objects.filter(id__in=fetch_ids)
     }
+    t_articles = time.perf_counter() - t4
     
     # Build results maintaining score order, applying title boost
     results = []
@@ -201,6 +221,15 @@ def search_hybrid(
                 score = score * 1.5
                 boosted_scores[article_id] = True
                 logger.debug(f"Applied title boost to: {article.title}")
+            elif enable_partial_title_boost:
+                # Light boosts for prefix/contains when unique to avoid noise
+                title_lower = article.title.lower()
+                if title_lower.startswith(query_lower):
+                    score = score * 1.1
+                    boosted_scores[article_id] = True
+                elif len(query_lower) >= 4 and query_lower in title_lower:
+                    score = score * 1.05
+                    boosted_scores[article_id] = True
             results.append((article, score, article_id))
             if len(results) >= limit:
                 break
@@ -217,7 +246,18 @@ def search_hybrid(
     else:
         results = [(article, score) for article, score, _ in results[:limit]]
     
-    logger.debug(f"Hybrid search returned {len(results)} results for query: {query}")
+    if logger.isEnabledFor(logging.DEBUG):
+        t_total = t_tokenize + t_vocab + t_postings + t_pagerank + t_articles
+        logger.debug(
+            "search_hybrid timings ms="
+            f"tokenize={t_tokenize*1000:.2f}, "
+            f"vocab={t_vocab*1000:.2f}, "
+            f"postings={t_postings*1000:.2f}, "
+            f"pagerank={t_pagerank*1000:.2f}, "
+            f"articles={t_articles*1000:.2f}, "
+            f"total_approx={t_total*1000:.2f}"
+        )
+        logger.debug(f"Hybrid search returned {len(results)} results for query: {query}")
     return results
 
 
