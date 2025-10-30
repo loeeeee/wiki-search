@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from search_engine.models import Article, InvertedIndex, Vocabulary
 from search_engine.search import search_hybrid
-from search_engine.qa_helpers import format_article_for_qa
+from search_engine.qa_helpers import format_article_for_qa, calculate_context_size
 from search_engine.tokenizer import tokenize_gpt
 
 logger = logging.getLogger(__name__)
@@ -254,19 +254,10 @@ class Command(BaseCommand):
         for article in tqdm(article_cache.values(), desc="Computing token counts"):
             # Count tokens in title
             title_tokens = len(tokenize_gpt(article.title))
-            
-            # Check if paragraph_token_counts is populated
-            if article.paragraph_token_counts and len(article.paragraph_token_counts) == len(article.plain_text_paragraphs):
-                # Use pre-computed paragraph token counts
-                paragraph_tokens = sum(article.paragraph_token_counts)
-            else:
-                # Compute paragraph tokens
-                paragraph_tokens = sum(
-                    len(tokenize_gpt(paragraph)) 
-                    for paragraph in article.plain_text_paragraphs
-                )
-            
-            token_cache[article.id] = title_tokens + paragraph_tokens
+            # Serialize paragraphs with separators to match final text layout
+            serialized_text = "\n\n".join(article.plain_text_paragraphs)
+            text_tokens = len(tokenize_gpt(serialized_text))
+            token_cache[article.id] = title_tokens + text_tokens
         
         self.stdout.write(f"Pre-computed token counts for {len(token_cache)} articles")
         return token_cache
@@ -346,10 +337,17 @@ class Command(BaseCommand):
                 search_results = [search_hybrid(fact[0], limit=20) for fact in supporting_facts if len(fact) > 0]
                 timing_stats['search_operations'].append(time.perf_counter() - search_start)
                 
-                # Round-robin through search results to collect distractors up to 128k limit
+                # Round-robin through search results to collect distractors up to max TARGET size
+                TARGET_SIZES = [8000, 32000, 128000]
                 current_distractor_tokens = 0
-                max_context_tokens = 128000
+                max_context_tokens = max(TARGET_SIZES)
                 search_result_indices = [0] * len(search_results)
+
+                # If supporting docs alone exceed max context, skip entry
+                if supporting_tokens > max_context_tokens:
+                    stats['skipped_context_overflow'] += 1
+                    logger.info(f"Skipping {qa_id}: supporting docs exceed max context ({supporting_tokens} > {max_context_tokens})")
+                    continue
                 
                 while supporting_tokens + current_distractor_tokens < max_context_tokens:
                     found_article = False
@@ -374,11 +372,9 @@ class Command(BaseCommand):
                             else:
                                 # Compute token count on the fly for articles from search results
                                 title_tokens = len(tokenize_gpt(article.title))
-                                if article.paragraph_token_counts and len(article.paragraph_token_counts) == len(article.plain_text_paragraphs):
-                                    paragraph_tokens = sum(article.paragraph_token_counts)
-                                else:
-                                    paragraph_tokens = sum(len(tokenize_gpt(p)) for p in article.plain_text_paragraphs)
-                                article_tokens = title_tokens + paragraph_tokens
+                                serialized_text = "\n\n".join(article.plain_text_paragraphs)
+                                text_tokens = len(tokenize_gpt(serialized_text))
+                                article_tokens = title_tokens + text_tokens
                                 token_cache[article.id] = article_tokens  # Cache for future use
                                 article_cache[article.title.lower()] = article  # Also cache the article object
                             
@@ -398,7 +394,7 @@ class Command(BaseCommand):
 
                 # Calculate context size mapping for different target sizes
                 context_sizes_map = {}
-                target_sizes = [8000, 32000, 128000]
+                target_sizes = TARGET_SIZES
                 
                 for target_size in target_sizes:
                     # Calculate how many distractor docs fit within this target size
@@ -424,7 +420,7 @@ class Command(BaseCommand):
                         else:
                             break
                     
-                    # Store the actual context size and number of distractor docs
+                    # Store the estimated context size from cache and number of distractor docs
                     actual_context_size = supporting_tokens + distractor_tokens_used
                     context_sizes_map[target_size] = (actual_context_size, num_distractor_docs)
 
@@ -448,6 +444,12 @@ class Command(BaseCommand):
                 for context_size in context_sizes:
                     if context_size in context_entries:
                         entry_dict = asdict(context_entries[context_size])
+                        # Recompute exact context size using final serialized docs (includes separators)
+                        exact_tokens = calculate_context_size(
+                            supporting_docs=entry_dict['supporting_docs'],
+                            distractor_docs=entry_dict['distractor_docs']
+                        )
+                        entry_dict['context_size'] = exact_tokens
                         results[context_size].append(entry_dict)
 
             except Exception as e:
