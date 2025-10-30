@@ -484,14 +484,25 @@ class Command(BaseCommand):
                 for context_size in context_sizes:
                     if context_size in context_entries:
                         entry_dict = asdict(context_entries[context_size])
-                        # Recompute exact context size using token cache fast path
-                        exact_tokens = calculate_context_size(
-                            supporting_docs=entry_dict['supporting_docs'],
-                            distractor_docs=entry_dict['distractor_docs'],
-                            token_lookup=_token_lookup,
-                        )
-                        entry_dict['context_size'] = exact_tokens
-                        results[context_size].append(entry_dict)
+                        supporting = entry_dict['supporting_docs']
+                        distractors = entry_dict['distractor_docs']
+                        max_fit_distractors = []
+                        for i in range(len(distractors) + 1):
+                            candidate_distractors = distractors[:i]
+                            tok_count = calculate_context_size(supporting_docs=supporting, distractor_docs=candidate_distractors)
+                            if tok_count <= context_size:
+                                max_fit_distractors = candidate_distractors
+                            else:
+                                break
+                        # If supporting docs by themselves overflow the cap, skip this entry for this file
+                        base_tok_count = calculate_context_size(supporting_docs=supporting, distractor_docs=[])
+                        if base_tok_count > context_size:
+                            logger.info(f"Skipping {qa_id}: supporting docs exceed context_size cap {context_size} [tokens={base_tok_count}]")
+                            continue
+                        entry_dict_capped = dict(entry_dict)
+                        entry_dict_capped['distractor_docs'] = max_fit_distractors
+                        entry_dict_capped['context_size'] = calculate_context_size(supporting_docs=supporting, distractor_docs=max_fit_distractors)
+                        results[context_size].append(entry_dict_capped)
                 timing_stats['context_finalize_exact'].append(time.perf_counter() - exact_start)
 
             except Exception as e:

@@ -49,8 +49,11 @@ def format_article_for_qa(article: Article) -> Dict[str, str]:
     }
 
 
-def calculate_context_size(supporting_docs: List[Dict[str, str]], 
-                          distractor_docs: List[Dict[str, str]]) -> int:
+def calculate_context_size(
+    supporting_docs: List[Dict[str, str]],
+    distractor_docs: List[Dict[str, str]],
+    token_lookup=None,
+) -> int:
     """Calculate total context size in tokens.
     
     Args:
@@ -60,18 +63,25 @@ def calculate_context_size(supporting_docs: List[Dict[str, str]],
     Returns:
         Total token count for all documents
     """
+    # Fast path: use provided token_lookup to avoid re-tokenization
+    if token_lookup is not None:
+        return sum(
+            token_lookup(doc) for doc in supporting_docs
+        ) + sum(
+            token_lookup(doc) for doc in distractor_docs
+        )
+
     total_tokens = 0
-    
-    # Count supporting docs tokens
+
+    # Fallback: precise tokenization on serialized docs
     for doc in supporting_docs:
         title_tokens = len(tokenize_gpt(doc['title']))
         text_tokens = len(tokenize_gpt(doc['text']))
         total_tokens += title_tokens + text_tokens
-    
-    # Count distractor docs tokens
+
     for doc in distractor_docs:
         title_tokens = len(tokenize_gpt(doc['title']))
         text_tokens = len(tokenize_gpt(doc['text']))
         total_tokens += title_tokens + text_tokens
-    
+
     return total_tokens
