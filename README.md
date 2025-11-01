@@ -286,6 +286,7 @@ python wiki_search/manage.py load_wiki_dump --workers 8 --db-workers 8  # 8-core
 - Internal link resolution happens automatically at the end
 - Uses persistent database connections and parallel link resolution for 2-3x faster processing
 - I/O-optimized concurrent processing with configurable producer threads
+- Computes paragraph token counts during ingestion for schema compliance with Article.paragraph_token_counts
 
 ### Resolve Links
 
