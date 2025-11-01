@@ -1,5 +1,12 @@
 # Wiki Search
 
+## Benchmark DB
+
+```bash
+pgbench -i -U wiki -h 172.22.0.133 -s 1000 wiki
+pgbench -c 40 -j 4 -T 300 wiki
+```
+
 ## Hybrid Search (TF-IDF + PageRank)
 
 Single-threaded hybrid search combines inverted index TF-IDF relevance with PageRank authority and returns the top 20 results by default.
@@ -51,7 +58,7 @@ Get up and running in 5 minutes:
    POSTGRES_PASSWORD=your_password
    POSTGRES_HOST=172.22.0.133
    POSTGRES_PORT=5432" > .env
-   
+
    # Load environment and migrate
    set -a; source .env; set +a
    python wiki_search/manage.py migrate
@@ -61,7 +68,7 @@ Get up and running in 5 minutes:
    ```bash
    # Load limited dataset for testing
    python wiki_search/manage.py load_wiki_dump --limit 10000
-   
+
    # Start web server
    cd wiki_search
    python manage.py runserver 0.0.0.0:8000
@@ -507,6 +514,36 @@ nix-shell --run "uv sync && python wiki_search/manage.py benchmark_search --num-
 For detailed documentation, see [docs-vibe/0106-search-benchmark.md](docs-vibe/0106-search-benchmark.md).
 
 ## QA Dataset Commands
+
+### Build QA Dataset (New)
+
+Generate the hybrid QA dataset using the new management command that consolidates supporting-document retrieval, hybrid distractor selection, and multi-cap context assembly.
+
+```bash
+# Smoke test (5 entries, profiling optional)
+nix-shell --command "uv run python wiki_search/manage.py build_qa_dataset \
+  --limit 5 \
+  --no-evaluation-report"
+
+# Recommended profiling sample (20 entries)
+nix-shell --command "uv run python wiki_search/manage.py build_qa_dataset \
+  --limit 20 \
+  --profile \
+  --profile-name build_qa_dataset_profile"
+
+# Full run across default caps (8k/32k/128k tokens)
+nix-shell --command "uv run python wiki_search/manage.py build_qa_dataset"
+```
+
+**Notable options:**
+- `--context-sizes ...` – customise GPT token caps (default: 8000 32000 128000)
+- `--search-limit`, `--max-candidates` – tune hybrid search breadth
+- `--max-fallback-queries` – control adaptive fallback expansion
+- `--min-distractor-tokens` – enforce distractor length floor (default: 64 tokens)
+- `--profile` / `--profile-name` – persist cProfile artifacts to `data/profiling/`
+- `--evaluation-report` / `--no-evaluation-report` – emit manual review payloads
+
+The command prints per-stage timing (search, selection, context finalisation), throughput, and will warn when the single-threaded speed falls below the 20 entries/sec target on sufficiently large runs.
 
 ### Generate QA Dataset
 
