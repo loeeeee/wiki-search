@@ -4,7 +4,45 @@
 
 ```bash
 pgbench -i -U wiki -h 172.22.0.133 -s 1000 wiki
-pgbench -c 40 -j 4 -T 300 wiki
+pgbench -c 40 -j 4 -T 300 -h 172.22.0.133 wiki
+```
+
+Without recordsize=128k,
+
+```
+pgbench (17.6, server 18.0)
+starting vacuum...end.
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1000
+query mode: simple
+number of clients: 40
+number of threads: 4
+maximum number of tries: 1
+duration: 300 s
+number of transactions actually processed: 5224025
+number of failed transactions: 0 (0.000%)
+latency average = 2.296 ms
+initial connection time = 150.681 ms
+tps = 17422.041913 (without initial connection time)
+```
+
+Without recordsize=8k,
+
+```
+pgbench (17.6, server 18.0)
+starting vacuum...end.
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1000
+query mode: simple
+number of clients: 40
+number of threads: 4
+maximum number of tries: 1
+duration: 300 s
+number of transactions actually processed: 8045565
+number of failed transactions: 0 (0.000%)
+latency average = 1.491 ms
+initial connection time = 148.944 ms
+tps = 26831.746837 (without initial connection time)
 ```
 
 ## Hybrid Search (TF-IDF + PageRank)
